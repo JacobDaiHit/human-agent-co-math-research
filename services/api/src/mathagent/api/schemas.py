@@ -113,6 +113,7 @@ class RunCreate(Command):
     request_timeout_seconds: int = Field(default=180, ge=1, le=600)
     thinking_mode: ThinkingMode = "provider_default"
     reasoning_effort: ReasoningEffort = "provider_default"
+    completion_policy: Literal["draft", "reviewed_answer"] = "draft"
 
 
 class CompleteAttempt(Command):

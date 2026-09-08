@@ -244,6 +244,7 @@ class RemoteProvider:
                         mode=task["mode"],
                         read_set=task["read_set"],
                         context_revision_ids=task.get("context_revision_ids", []),
+                        autonomous=bool(task.get("autonomous")),
                     )
                 except (ValueError, TypeError):
                     raise ProviderFailure("invalid_structured_output", outcome="spent") from None

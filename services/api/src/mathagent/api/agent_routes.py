@@ -1,5 +1,7 @@
 """Human control/read APIs and worker-only durable research proposal endpoints."""
 
+from typing import Literal
+
 from fastapi import Depends
 from mathagent.api.schemas import Command, Id
 from mathagent.application.errors import DomainError
@@ -24,6 +26,7 @@ class RunUpdate(Command):
     request_timeout_seconds: int = Field(ge=1, le=600)
     thinking_mode: ThinkingMode = "provider_default"
     reasoning_effort: ReasoningEffort = "provider_default"
+    completion_policy: Literal["draft", "reviewed_answer"] = "draft"
 
 
 class BranchBudget(Command):

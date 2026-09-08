@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 
 from mathagent.application.errors import DomainError
 from mathagent.persistence.agent_models import AgentRun, AgentStep, BranchRuntime, ProviderCall
@@ -18,6 +19,7 @@ from mathagent.persistence.models import (
 from mathagent.persistence.runtime_models import ProviderRequest, RunOptions
 from mathagent.providers.actions import OPERATION_MODELS, operation_schemas
 from mathagent.providers.protocol import validate_result
+from mathagent.runtime.completion import boxed_answers, delivered_review_ranges
 from pydantic import ValidationError
 from sqlalchemy import func, select
 
@@ -25,6 +27,7 @@ DEFAULT_OPTIONS = {
     "max_steps": 8, "max_review_rounds": 2, "max_children": 4, "max_depth": 2,
     "max_output_tokens": 4096, "request_timeout_seconds": 180,
     "thinking_mode": "provider_default", "reasoning_effort": "provider_default",
+    "completion_policy": "draft",
 }
 TERMINAL = {"completed", "cancelled", "failed", "interrupted", "budget_exhausted", "step_limit"}
 
@@ -131,21 +134,78 @@ class AgentRuntime:
             found.update(children)
 
     def additional_budget_exhausted(self, session, run, requests):
+        return self.request_budget_status(session, run, requests)["remaining"] <= 0
+
+    def request_budget_status(self, session, run, requests=None):
+        project_id = self.state.require_branch(session, run.branch_id).project_id
+        if requests is None:
+            requests = session.scalars(select(ProviderRequest).where(ProviderRequest.project_id == project_id)).all()
+        scopes = []
+
+        def scope(kind, limit, selected):
+            counts = self.runtime._counts(selected)
+            scopes.append({"scope": kind, "limit": limit, "occupied": counts["occupied"],
+                           "unknown": counts["unknown"], "remaining": max(0, limit - counts["occupied"])})
+
+        scope("project", self.runtime._settings(session, project_id).request_budget, requests)
+        own = session.get(RunOptions, run.id)
+        scope("run", own.request_budget if own else 5, [r for r in requests if r.run_id == run.id])
         row = session.get(AgentRun, run.id)
         root = session.get(Run, row.root_run_id) if row else run
-        for branch_id in {run.branch_id, root.branch_id}:
+        for branch_id in sorted({run.branch_id, root.branch_id}):
             branch_roots = set(session.scalars(select(Run.id).where(Run.branch_id == branch_id)))
             branch_ids = branch_roots | set(session.scalars(select(AgentRun.run_id).where(AgentRun.root_run_id.in_(branch_roots))))
             limit = self.branch_settings(session, branch_id)["request_budget"]
-            if self.runtime._counts([r for r in requests if r.run_id in branch_ids])["occupied"] >= limit:
-                return True
+            scope("branch", limit, [r for r in requests if r.run_id in branch_ids])
         while row:
             family = self.subtree_ids(session, row.run_id)
             options = session.get(RunOptions, row.run_id)
-            if self.runtime._counts([r for r in requests if r.run_id in family])["occupied"] >= options.request_budget:
-                return True
+            scope("subtree", options.request_budget, [r for r in requests if r.run_id in family])
             row = session.get(AgentRun, row.parent_run_id) if row.parent_run_id else None
-        return False
+        remaining = min(s["remaining"] for s in scopes)
+        return {"unit": "requests", "remaining": remaining, "after_this_request": max(0, remaining - 1),
+                "snapshot": "before_request_reservation", "scopes": scopes,
+                "shared_with_descendants": True, "includes_format_repairs": True}
+
+    def completion_issues(self, session, run, result):
+        issues = []
+        final_answers = boxed_answers(result.body)
+        if len(final_answers) != 1:
+            issues.append("exactly_one_final_boxed_answer_in_body_required")
+        targets = set()
+        parent_attempt = session.get(Attempt, run.current_attempt_id) if run.current_attempt_id else None
+        visible = set(parent_attempt.checkpoint.get("fully_delivered_review_ids", [])) if parent_attempt else set()
+        for child in session.scalars(select(AgentRun).where(AgentRun.parent_run_id == run.id)):
+            child_run = session.get(Run, child.run_id)
+            child_attempt = session.get(Attempt, child_run.current_attempt_id) if child_run.current_attempt_id else None
+            if not child.target_revision_id or child_run.state != "completed" or not child_attempt:
+                continue
+            output = session.get(Revision, child_attempt.output_revision_id) if child_attempt.output_revision_id else None
+            review_id = child_attempt.checkpoint.get("completion", {}).get("review_id")
+            review = session.get(Review, review_id) if review_id else None
+            if not output or output.id not in visible or not review or review.kind != "llm_review" or review.verdict != "passed":
+                continue
+            if review.target_revision_id != child.target_revision_id:
+                continue
+            target = session.get(Revision, child.target_revision_id)
+            if not target:
+                continue
+            candidate_answers = boxed_answers(target.body)
+            if (len(candidate_answers) != 1 or len(final_answers) != 1
+                    or re.sub(r"\s+", "", candidate_answers[0]) != re.sub(r"\s+", "", final_answers[0])):
+                continue
+            head = session.get(Head, (run.branch_id, target.object_id))
+            if not head or head.revision_id != target.id:
+                continue
+            dependencies = {**child_attempt.read_set, **review.dependency_snapshot}
+            if not all((h := session.get(Head, (run.branch_id, oid))) and h.revision_id == rid
+                       for oid, rid in dependencies.items()):
+                continue
+            if target.id in result.cited_revision_ids:
+                targets.add(target.id)
+        if not targets:
+            issues.append("cite_current_passed_review_candidate_with_same_boxed_answer_required")
+        return issues
 
     def initial_read_set(self, session, run, all_heads):
         from mathagent.persistence.models import ProofPlan
@@ -294,10 +354,18 @@ class AgentRuntime:
             refreshed.append(item)
         task["previous_steps"] = refreshed[-6:]
         task["remaining_steps"] = max(0, options["max_steps"] - len(rows))
+        task["request_budget_status"] = self.request_budget_status(session, self.runtime._run(session, task["run_id"]))
+        task["completion_requirements"] = {"policy": options["completion_policy"]}
+        if options["completion_policy"] == "reviewed_answer":
+            task["completion_requirements"].update(
+                final_body="Exactly one final boxed answer with justification; never invent an answer to satisfy formatting.",
+                review="Save the complete candidate with exactly one boxed answer, obtain an independent passed review of its current revision, read that review completely (read_object section=body with continuation pages if excerpted), then cite the candidate revision in cited_revision_ids and copy its boxed answer unchanged. The reviewed candidate is the proof artifact; do not add new mathematical claims only in the final summary. If issues remain, continue investigating within the budget; an unresolved draft is not a completed answer.",
+            )
         task["operation_results"] = refreshed[-1]["actions"] if refreshed else []
         config = session.get(AgentRun, task["run_id"])
         children = session.scalars(select(AgentRun).where(AgentRun.parent_run_id == config.run_id)).all()
         child_results = []
+        review_bodies, review_refs = {}, {}
         for child in children:
             run = session.get(Run, child.run_id)
             attempt = session.get(Attempt, run.current_attempt_id) if run.current_attempt_id else None
@@ -309,6 +377,9 @@ class AgentRuntime:
                 item.update(object_id=output.object_id, revision_id=output.id, branch_id=run.branch_id)
                 item["read_ref"] = read_ref(item)
                 task["context_revision_ids"].append(output.id)
+                if child.target_revision_id:
+                    review_bodies[output.id] = output.body
+                    review_refs[output.id] = {**item["read_ref"], "section": "body"}
             child_results.append(item)
         task["child_results"] = child_results
         discussions = []
@@ -332,7 +403,18 @@ class AgentRuntime:
         task["context_revision_ids"] = sorted(set(task["context_revision_ids"] + extra_ids))
         attempt.checkpoint = {**attempt.checkpoint, "context_revision_ids": task["context_revision_ids"],
                               "external_read_set": list(external_heads.values()), "autonomous": True}
-        return compact_task(task)
+        task = compact_task(task)
+        previous_ranges = {}
+        for step in rows:
+            prior = session.get(Attempt, step.attempt_id)
+            if prior and prior.state == "completed":
+                for rid, intervals in prior.checkpoint.get("delivered_review_ranges", {}).items():
+                    previous_ranges.setdefault(rid, []).extend(intervals)
+        ranges, delivered = delivered_review_ranges(task, review_bodies, previous_ranges)
+        attempt.checkpoint = {**attempt.checkpoint, "delivered_review_ranges": ranges,
+            "fully_delivered_review_ids": delivered,
+            "incomplete_review_read_refs": [ref for rid, ref in review_refs.items() if rid not in delivered]}
+        return task
 
     def wake_waiting(self, session):
         for run in session.scalars(select(Run).where(Run.state == "waiting_children")):
@@ -384,6 +466,7 @@ class AgentRuntime:
                     mode=attempt.checkpoint.get("mode", "research"),
                     read_set=attempt.read_set,
                     context_revision_ids=attempt.checkpoint.get("context_revision_ids", []),
+                    autonomous=bool(attempt.checkpoint.get("autonomous", False)),
                 )
             except (ValueError, TypeError):
                 continue
@@ -507,7 +590,7 @@ class AgentRuntime:
         payload = {"branch_id": branch_id, "goal_object_id": goal_id, "provider": parent_run.provider,
                    "mode": "review" if review else "research", "instruction": arguments["instruction"],
                    "request_budget": 1 if review else arguments.get("request_budget", 3),
-                   "autonomous": not review, **config.options}
+                   "autonomous": not review, **config.options, "completion_policy": "draft"}
         _, created = self.runtime.create(session, payload)
         child = session.get(AgentRun, created["run_id"])
         child.parent_run_id = parent_run.id
@@ -647,13 +730,13 @@ class AgentRuntime:
         if not config or not config.autonomous:
             raise DomainError(409, "not_autonomous", "此任务未启用自主操作")
         result = validate_result(payload["result"], mode=attempt.checkpoint["mode"],
-                    read_set=attempt.read_set, context_revision_ids=attempt.checkpoint.get("context_revision_ids", []))
+                    read_set=attempt.read_set, context_revision_ids=attempt.checkpoint.get("context_revision_ids", []), autonomous=True)
         attempt.checkpoint = {**attempt.checkpoint, "agent_result_sha256": hashlib.sha256(
             json.dumps(payload["result"], sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
         number = (session.scalar(select(func.max(AgentStep.number)).where(AgentStep.run_id == run.id)) or 0) + 1
         # Save the model's immutable draft before any proposal changes its inputs.
         _, completion = self.runtime.complete(session, {"attempt_id": attempt.id, "token": payload["token"],
-                                                        "body": result.body, "result": result.model_dump()})
+                                                        "body": result.body, "result": result.model_dump()}, agent_step=True)
         outcomes = []
         if not completion["quarantined"] and number <= config.options["max_steps"]:
             for action in result.actions:
@@ -672,11 +755,18 @@ class AgentRuntime:
             session.flush()
             children = session.scalars(select(Run).join(AgentRun, AgentRun.run_id == Run.id).where(AgentRun.parent_run_id == run.id)).all()
             waiting = any(child.state not in TERMINAL for child in children)
+            completion_issues = []
+            if result.next_action == "finish" and config.options.get("completion_policy") == "reviewed_answer":
+                completion_issues = self.completion_issues(session, run, result)
+                if completion_issues:
+                    outcomes.append({"type": "finish", "status": "rejected", "error": "completion_requirements_unmet",
+                                     "issues": completion_issues,
+                                     "unread_review_refs": attempt.checkpoint.get("incomplete_review_read_refs", [])})
             if waiting:
                 run.state = "waiting_children"
-            elif result.next_action != "finish" and number < config.options["max_steps"]:
+            elif (result.next_action != "finish" or completion_issues) and number < config.options["max_steps"]:
                 run.state = "queued"
-            elif result.next_action != "finish":
+            elif result.next_action != "finish" or completion_issues:
                 run.state = "step_limit"
             else:
                 run.state = "completed"
@@ -684,6 +774,14 @@ class AgentRuntime:
                 run.current_attempt_id = None
         receipt = {"run_id": run.id, "state": run.state, "continue": run.state == "queued", "number": number,
                    "output_revision_id": completion["output_revision_id"], "quarantined": completion["quarantined"]}
+        if config.options.get("completion_policy") == "reviewed_answer":
+            receipt["completion_checks"] = {
+                "policy": "reviewed_answer", "passed": run.state == "completed" and not completion["quarantined"],
+                "cited_revision_ids": result.cited_revision_ids,
+                "delivered_review_output_revision_ids": attempt.checkpoint.get("fully_delivered_review_ids", []),
+                "proof_artifact": "cited_reviewed_candidate", "final_body_role": "summary",
+                "mathematical_correctness_verified": False,
+            }
         row = AgentStep(run_id=run.id, attempt_id=attempt.id, request_id=request.id, number=number,
                         state=run.state, body=result.body, actions=outcomes, receipt=receipt,
                         output_revision_id=completion["output_revision_id"])

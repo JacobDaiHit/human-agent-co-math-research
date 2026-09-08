@@ -4310,6 +4310,15 @@
             ],
             "title": "Reasoning Effort",
             "default": "provider_default"
+          },
+          "completion_policy": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "reviewed_answer"
+            ],
+            "title": "Completion Policy",
+            "default": "draft"
           }
         },
         "additionalProperties": false,
@@ -4388,6 +4397,15 @@
             ],
             "title": "Reasoning Effort",
             "default": "provider_default"
+          },
+          "completion_policy": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "reviewed_answer"
+            ],
+            "title": "Completion Policy",
+            "default": "draft"
           }
         },
         "additionalProperties": false,

@@ -9,6 +9,7 @@ import secrets
 from datetime import UTC, datetime, timedelta
 
 from mathagent.application.errors import DomainError
+from mathagent.persistence.agent_models import AgentRun
 from mathagent.persistence.models import (
     Attempt,
     Branch,
@@ -704,12 +705,15 @@ class Runtime:
         )
         return candidate
 
-    def complete(self, session, payload):
+    def complete(self, session, payload, *, agent_step=False):
         attempt = session.get(Attempt, payload["attempt_id"])
         if attempt is None:
             raise DomainError(404, "attempt_not_found", "执行记录不存在")
         if not secrets.compare_digest(attempt.token, payload["token"]):
             raise DomainError(409, "invalid_execution_token", "执行令牌已失效或不匹配")
+        config = session.get(AgentRun, attempt.run_id)
+        if config and config.autonomous and config.options.get("completion_policy") == "reviewed_answer" and not agent_step:
+            raise DomainError(422, "autonomous_step_required", "此任务必须经研究步骤端点检查完成条件")
         body = payload["body"]
         if not isinstance(body, str) or not body.strip() or len(body) > 200_000:
             raise DomainError(422, "invalid_output", "执行产物应为非空文本，且不超过 200000 字符")
@@ -727,6 +731,7 @@ class Runtime:
                     mode=attempt.checkpoint.get("mode", "research"),
                     read_set=attempt.read_set,
                     context_revision_ids=attempt.checkpoint.get("context_revision_ids", []),
+                    autonomous=bool(attempt.checkpoint.get("autonomous", False)),
                 ).model_dump()
             except (ValueError, TypeError):
                 raise DomainError(
@@ -800,7 +805,7 @@ class Runtime:
         review_id = None
         if run.provider != "fake" and result and result["mode"] == "review" and not quarantined:
             target_revision_id = attempt.checkpoint["target_revision_id"]
-            refs = {run.goal_object_id: target_revision_id}
+            refs = {**attempt.read_set, run.goal_object_id: target_revision_id}
             for plan in attempt.checkpoint.get("proof_plans", []):
                 if plan["revision_id"] != target_revision_id:
                     continue

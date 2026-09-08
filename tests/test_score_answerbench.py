@@ -97,7 +97,39 @@ def test_incomplete_run_cannot_be_marked_correct():
 def test_missing_final_answer_is_incorrect():
     report = {"problem_id": "sample", "final_body": "I am still working.", "completed": True}
     key = {"id": "sample", "short_answer": "58", "answer_type": "integer"}
-    assert grader.score_report(report, key)["reason"] == "no_clear_final_answer"
+    result = grader.score_report(report, key)
+    assert result["reason"] == "missing_final_answer"
+    assert result["answer_status"] == "missing_final_answer"
+    assert result["grade"] == "incorrect"
+
+
+def test_scope_draft_cannot_supply_a_missing_final_answer():
+    report = {"problem_id": "sample", "final_answer": None,
+              "final_body": "This is a draft awaiting review.",
+              "scope": r"Tentatively \boxed{58}.", "completed": False,
+              "state": "completed", "independent_reviews": 1}
+    key = {"id": "sample", "short_answer": "58", "answer_type": "integer"}
+    result = grader.score_report(report, key)
+    assert result["answer_status"] == "missing_final_answer"
+    assert result["runtime_completed"] is True
+    assert result["runtime_terminal"] is True
+    assert result["final_answer_present"] is False
+    assert result["completed"] is False
+    assert result["review_completed"] is None
+    assert result["workflow_completed"] is None
+
+
+def test_mathematical_error_has_a_distinct_answer_status(monkeypatch):
+    monkeypatch.setattr(grader, "compare", grader.compare_worker)
+    report = {"problem_id": "sample", "final_answer": "59", "completed": True,
+              "state": "completed", "review_completed": True, "workflow_completed": True}
+    key = {"id": "sample", "short_answer": "58", "answer_type": "integer"}
+    result = grader.score_report(report, key)
+    assert result["grade"] == "incorrect"
+    assert result["answer_status"] == "mathematically_incorrect"
+    assert result["reason"] == "exact_numeric_inequality"
+    assert result["review_completed"] is True
+    assert result["workflow_completed"] is True
 
 
 def test_timeout_is_ungraded(monkeypatch):
@@ -191,10 +223,29 @@ def test_full_batch_keeps_failures_and_ungraded_in_denominator(tmp_path, monkeyp
     monkeypatch.setattr(grader, "compare", grader.compare_worker)
     result = grader.score_batch(tmp_path, key_path)
     assert result["official_answer_autograder"] is False
+    assert result["scorer_revision"] == grader.SCORER_REVISION
+    assert result["scorer_sha256"] == hashlib.sha256(Path(grader.__file__).read_bytes()).hexdigest()
     assert result["summary"] == {
         "total": 4, "correct": 1, "incorrect": 2, "ungraded": 1, "completed": 3,
+        "mathematically_incorrect": 1, "missing_final_answer": 0,
+        "missing_case_report": 1, "invalid_case_report": 0,
         "completed_without_interventions": 3, "verified_correct_fraction_all_cases": 0.25,
+        "runtime_completed": 0, "final_answers_present": 3,
+        "review_completed_reported": 0, "review_completion_unknown": 4,
     }
+
+
+def test_rescoring_uses_a_new_artifact_and_preserves_original(tmp_path):
+    original = tmp_path / "scores.json"
+    original.write_bytes(b'{"original": true}\n')
+    destination = grader.default_score_output(tmp_path)
+    assert destination == tmp_path / f"scores.v{grader.SCORER_REVISION}.json"
+    grader.write_score_output(destination, {"scorer_revision": grader.SCORER_REVISION})
+    assert original.read_bytes() == b'{"original": true}\n'
+    with pytest.raises(FileExistsError):
+        grader.write_score_output(original, {"overwrite": True})
+    assert original.read_bytes() == b'{"original": true}\n'
+    assert grader.default_score_output(tmp_path) not in {original, destination}
 
 
 def test_fixture_selection_and_problem_answer_separation():

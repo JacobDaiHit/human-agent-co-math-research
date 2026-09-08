@@ -25,6 +25,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 from mathagent.providers.remote import DEFAULT_URLS, RemoteProvider
+from mathagent.runtime.completion import boxed_answers
 from mathagent.runtime.worker import HTTPWorker
 
 OPERATIONS = [
@@ -36,7 +37,8 @@ INSTRUCTION = r"""Solve the given short-answer Olympiad problem autonomously wit
 No internet search, external references, hidden answer key, or solution hints are available.
 Choose your own mathematical approach. Use the permitted operations when useful.
 Before finalizing, obtain an independent review of your proposed solution: first save the
-full proposed solution as a claim or artifact with write_draft, then request_review using
+full proposed solution including exactly one boxed answer as a claim or artifact with
+write_draft, then request_review using
 the actual revision_id returned in the next step. A review is advice, not an oracle.
 Read the review, correct any demonstrated issues, and give your own final conclusion.
 Do not repeatedly request the same review or invent IDs. Budget includes all descendants
@@ -44,7 +46,12 @@ and any format repair. A completed task is not an automatically adopted theorem.
 Use LaTeX for all mathematical expressions. In the final research body give a concise
 complete justification and exactly one final answer in \boxed{...}. For no solution use
 \boxed{\varnothing}. If unresolved, explicitly say so and do not invent an answer.
-Set next_action=finish only when delivering your final answer or unresolved conclusion;
+Always explicitly provide next_action. Set it to finish only for a reviewed final answer;
+an unresolved draft needs further investigation within the available budget. Cite the
+reviewed candidate revision in cited_revision_ids and copy that candidate's boxed answer
+unchanged. The reviewed candidate is the proof artifact; the final body is its summary,
+not a place for unreviewed new mathematical claims. Claims resting on an unproved or
+unverified remembered theorem must retain that gap; do not call the claim established.
 research verdict must remain null, even if the independent review passed.
 """
 TERMINAL = {
@@ -87,23 +94,6 @@ def load_problems(path):
     return value
 
 
-def last_boxed(body):
-    """Extract balanced LaTeX braces, never guess an answer from intermediate prose."""
-    if not body:
-        return None
-    start = body.rfind(r"\boxed{")
-    if start < 0:
-        return None
-    start += len(r"\boxed{")
-    depth = 1
-    for index in range(start, len(body)):
-        if body[index] in "{}" and (index == 0 or body[index - 1] != "\\"):
-            depth += 1 if body[index] == "{" else -1
-        if depth == 0:
-            return body[start:index].strip() or None
-    return None
-
-
 @dataclass(frozen=True)
 class Limits:
     request_budget: int = 12
@@ -117,6 +107,7 @@ class Limits:
     parallel_cases: int = 2
     thinking_mode: str = "enabled"
     reasoning_effort: str = "max"
+    completion_policy: str = "reviewed_answer"
 
     def validate(self):
         if not 1 <= self.request_budget <= 100 or not 1 <= self.max_steps <= 40:
@@ -127,6 +118,8 @@ class Limits:
             raise ValueError("Invalid provider budget/deadline")
         if self.thinking_mode != "enabled" or self.reasoning_effort not in {"high", "max"}:
             raise ValueError("This pilot requires an explicit high/max thinking setting")
+        if self.completion_policy != "reviewed_answer":
+            raise ValueError("This pilot requires reviewed final answers")
 
 
 class CompletionOnlyTransport(httpx.AsyncBaseTransport):
@@ -327,10 +320,22 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
         final_body = steps[-1]["body"] if steps else None
         budget = await read(f"/projects/{project_id}/budget")
         reviews = [review for review in all_reviews.values() if review["kind"] == "llm_review"]
-        answer = last_boxed(final_body) if root["state"] == "completed" and not timed_out else None
+        answers = boxed_answers(final_body)
+        answer = answers[0] if len(answers) == 1 and root["state"] == "completed" and not timed_out else None
+        final_citations = set(next((call.get("result", {}).get("cited_revision_ids", [])
+            for call in calls if steps and call["request_id"] == steps[-1]["request_id"] and call.get("result")), []))
+        reviewed_targets = {review["target_revision_id"] for review in reviews if review["verdict"] == "passed"}
+        review_completed = bool(reviewed_targets & final_citations)
+        completion_checks = steps[-1]["receipt"].get("completion_checks", {}) if steps else {}
+        finalized_after_review = completion_checks.get("policy") == "reviewed_answer" and completion_checks.get("passed") is True
+        workflow_completed = root["state"] == "completed" and answer is not None and review_completed and finalized_after_review and not timed_out
         report = {**base, "state": root["state"],
-            "terminal_reason": "case_timeout" if timed_out else root["state"],
-            "completed": root["state"] == "completed" and answer is not None and not timed_out,
+            "terminal_reason": "case_timeout" if timed_out else "missing_final_answer" if root["state"] == "completed" and answer is None else "review_missing" if root["state"] == "completed" and not review_completed else root["state"],
+            "runtime_terminal": root["state"] in TERMINAL, "runtime_completed": root["state"] == "completed",
+            "final_answer_present": answer is not None, "review_completed": review_completed,
+            "finalized_after_review": finalized_after_review, "completion_checks": completion_checks,
+            "reviewed_candidate_revision_ids": sorted(reviewed_targets & final_citations),
+            "workflow_completed": workflow_completed, "completed": workflow_completed,
             "final_answer": answer, "final_body": final_body, "requests": budget["occupied"],
             "budget": budget, "project_id": project_id, "root_run_id": run_id,
             "steps": steps, "calls": calls, "reviews": reviews, "runs": list(all_runs.values()),

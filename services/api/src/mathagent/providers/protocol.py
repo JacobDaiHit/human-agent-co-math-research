@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-PROMPT_VERSION = "research-operations-v3"
+PROMPT_VERSION = "research-operations-v4"
 
 
 class AgentAction(BaseModel):
@@ -42,10 +42,12 @@ class ResearchResult(BaseModel):
         return self
 
 
-def validate_result(value, *, mode, read_set, context_revision_ids=()):
+def validate_result(value, *, mode, read_set, context_revision_ids=(), autonomous=False):
     result = ResearchResult.model_validate(value)
     if result.mode != mode:
         raise ValueError("Output mode differs from the assigned task")
+    if autonomous and mode == "research" and "next_action" not in result.model_fields_set:
+        raise ValueError("Autonomous research must explicitly provide next_action")
     if not set(result.cited_revision_ids).issubset(
         set(read_set.values()) | set(context_revision_ids)
     ):
@@ -53,13 +55,16 @@ def validate_result(value, *, mode, read_set, context_revision_ids=()):
     return result
 
 
-def result_schema(mode):
+def result_schema(mode, *, autonomous=False):
     """Describe the assigned role's constraints before the model generates output."""
     if mode not in {"research", "review"}:
         raise ValueError("Unknown research mode")
     schema = ResearchResult.model_json_schema()
     schema["properties"]["mode"] = {"type": "string", "const": mode}
     if mode == "research":
+        if autonomous:
+            schema["required"].append("next_action")
+            schema["properties"]["next_action"].pop("default", None)
         schema["properties"]["verdict"] = {
             "type": "null", "const": None,
             "description": "Research output must use null, including summaries of an independent review. "
@@ -89,12 +94,15 @@ def messages_for(task):
         "对目标版本给出 passed/issues/inconclusive；局部审查不宣称覆盖全部证明。"
         "scope 字段必须说明实际检查范围、未覆盖内容和局限。"
     )
-    if task.get("autonomous"):
+    if task.get("autonomous") and mode == "research":
         instruction += (
             "\n你可以自由选择研究步骤，在预算内提出 actions；服务端逐项校验并保存回执。"
             "不要把操作意图当作已经执行；下一步读回执，使用返回的实际 ID。"
+            "自主研究必须显式提供 next_action，不得省略，也不应依赖默认值。"
             "需要进一步读取、计算或修改时 next_action=continue；等待子任务/审查时为 wait；"
             "有完整可交付论证或明确未解决总结时为 finish。最多两轮独立审查后的修订。"
+            "收尾须满足 completion_requirements；读取 request_budget_status 中的动态请求余量，"
+            "为必要审查和最终汇总安排额度。未解决时如实说明，不得编造答案。"
             "现有证据有状态和范围；未采用或未审查材料不能默认为可靠前提。"
             "计算工具的 inputs 必须严格使用该工具的字段和表达式语法，不能猜测字段名。"
             "下列是可用操作参数（不包含 branch_id 的操作默认当前分支）：\n"
@@ -118,7 +126,7 @@ def messages_for(task):
             "引用仅能使用输入中的 revision_id。\n"
             "以下仅演示正确的格式和转义，与当前题目无关，不要照抄："
             + json.dumps(example, ensure_ascii=False) + "\n"
-            + json.dumps(result_schema(mode), ensure_ascii=False),
+            + json.dumps(result_schema(mode, autonomous=bool(task.get("autonomous"))), ensure_ascii=False),
         },
         {
             "role": "user",
@@ -133,6 +141,8 @@ def messages_for(task):
                     "previous_steps": task.get("previous_steps", []),
                     "child_results": task.get("child_results", []),
                     "remaining_steps": task.get("remaining_steps"),
+                    "completion_requirements": task.get("completion_requirements"),
+                    "request_budget_status": task.get("request_budget_status"),
                     "operation_results": task.get("operation_results", []),
                     "repair_output": task.get("repair_output"),
                     "discussions": task.get("discussions", []),

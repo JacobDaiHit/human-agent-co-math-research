@@ -23,12 +23,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KEY = ROOT / "fixtures" / "imo_answerbench" / "answer-key.json"
 METHOD = "local_conservative_answer_equivalence"
+SCORER_REVISION = "2"
 MAX_ANSWER_LENGTH = 512
 MAX_AST_NODES = 96
 MAX_AST_DEPTH = 14
 MAX_INTEGER_DIGITS = 32
 MAX_POWER = 64
 CASE_TIMEOUT_SECONDS = 3.0
+RUNTIME_TERMINAL_STATES = {
+    "completed", "failed", "cancelled", "paused", "interrupted", "budget_exhausted",
+    "step_limit", "reconciliation_required", "runner_error",
+}
 
 
 class UnsupportedAnswer(ValueError):
@@ -307,6 +312,20 @@ def compare(candidate: str, golden: str, answer_type: str, timeout: float = CASE
         return {"grade": "ungraded", "reason": "grader_worker_failed"}
 
 
+def classify_result(result: dict) -> dict:
+    """Separate the benchmark's no-credit label from mathematical disproof."""
+    reason = result["reason"]
+    if reason in {"missing_final_answer", "missing_case_report", "invalid_case_report"}:
+        answer_status = reason
+    elif result["grade"] == "correct":
+        answer_status = "correct"
+    elif reason in {"exact_numeric_inequality", "exact_parameter_counterexample"}:
+        answer_status = "mathematically_incorrect"
+    else:
+        answer_status = "ungraded"
+    return {**result, "answer_status": answer_status}
+
+
 def score_report(report: dict, key: dict) -> dict:
     common = {
         "problem_id": key["id"],
@@ -315,19 +334,28 @@ def score_report(report: dict, key: dict) -> dict:
         "terminal_reason": report.get("terminal_reason"),
         "completed": report.get("completed") is True,
         "interventions": report.get("interventions", []),
+        "runtime_terminal": report.get("state") in RUNTIME_TERMINAL_STATES,
+        "runtime_completed": report.get("state") == "completed",
+        "final_answer_present": None,
+        # An old report's review count cannot establish a completed review workflow.
+        "review_completed": report.get("review_completed")
+        if type(report.get("review_completed")) is bool else None,
+        "workflow_completed": report.get("workflow_completed")
+        if type(report.get("workflow_completed")) is bool else None,
     }
     if report.get("problem_id") != key["id"]:
-        return {**common, "grade": "ungraded", "reason": "report_problem_id_mismatch"}
+        return classify_result({**common, "grade": "ungraded", "reason": "report_problem_id_mismatch"})
     try:
         candidate, extraction = final_from_report(report)
     except UnsupportedAnswer:
-        return {**common, "grade": "ungraded", "reason": "unsupported_answer_extraction"}
-    common.update({"extraction": extraction, "extracted_answer": candidate})
+        return classify_result({**common, "grade": "ungraded", "reason": "unsupported_answer_extraction"})
+    common.update({"extraction": extraction, "extracted_answer": candidate,
+                   "final_answer_present": candidate is not None})
     if candidate is None:
-        return {**common, "grade": "incorrect", "reason": "no_clear_final_answer"}
+        return classify_result({**common, "grade": "incorrect", "reason": "missing_final_answer"})
     if not common["completed"]:
-        return {**common, "grade": "ungraded", "reason": "run_not_completed"}
-    return {**common, **compare(candidate, key["short_answer"], key["answer_type"])}
+        return classify_result({**common, "grade": "ungraded", "reason": "run_not_completed"})
+    return classify_result({**common, **compare(candidate, key["short_answer"], key["answer_type"])})
 
 
 def score_batch(batch_dir: Path, answer_key: Path = DEFAULT_KEY) -> dict:
@@ -347,16 +375,24 @@ def score_batch(batch_dir: Path, answer_key: Path = DEFAULT_KEY) -> dict:
         except (ValueError, TypeError, KeyError, AttributeError):
             result = {"problem_id": key["id"], "grade": "ungraded",
                       "reason": "invalid_case_report", "completed": False}
-        results.append({**result, "report_path": str(report_path.resolve())})
+        results.append({**classify_result(result), "report_path": str(report_path.resolve())})
     counts = Counter(result["grade"] for result in results)
+    statuses = Counter(result["answer_status"] for result in results)
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "benchmark": "IMO-AnswerBench four-case integration sample",
         "grading_method": METHOD,
+        "scorer_revision": SCORER_REVISION,
+        "scorer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "scorer_revision_note": "Revision 2 separates missing final answers from mathematically "
+        "incorrect answers. Answer extraction and equivalence rules are unchanged.",
         "official_answer_autograder": False,
         "method_notice": "Local conservative offline check, not official Gemini AnswerAutoGrader. "
         "Only final-answer equivalence is assessed; proofs are not graded. "
-        "Unsupported answers are ungraded. Four samples are not full-benchmark accuracy.",
+        "Unsupported answers are ungraded. Binary incorrect includes missing answers or reports; "
+        "it does not imply mathematical disproof. Runtime completion, final-answer presence, "
+        "review completion and mathematical correctness are separate. "
+        "Four samples are not full-benchmark accuracy.",
         "scored_at": datetime.now(UTC).isoformat(),
         "batch_dir": str(batch_dir.resolve()),
         "answer_key_sha256": hashlib.sha256(raw_key).hexdigest(),
@@ -364,13 +400,39 @@ def score_batch(batch_dir: Path, answer_key: Path = DEFAULT_KEY) -> dict:
         "summary": {
             "total": len(results), "correct": counts["correct"], "incorrect": counts["incorrect"],
             "ungraded": counts["ungraded"],
+            "mathematically_incorrect": statuses["mathematically_incorrect"],
+            "missing_final_answer": statuses["missing_final_answer"],
+            "missing_case_report": statuses["missing_case_report"],
+            "invalid_case_report": statuses["invalid_case_report"],
             "completed": sum(result["completed"] for result in results),
             "completed_without_interventions": sum(result["completed"] and
                                                      not result.get("interventions") for result in results),
+            "runtime_completed": sum(result.get("runtime_completed") is True for result in results),
+            "final_answers_present": sum(result.get("final_answer_present") is True for result in results),
+            "review_completed_reported": sum(result.get("review_completed") is True for result in results),
+            "review_completion_unknown": sum(result.get("review_completed") is None for result in results),
             "verified_correct_fraction_all_cases": counts["correct"] / len(results) if results else None,
         },
         "cases": results,
     }
+
+
+def default_score_output(batch_dir: Path) -> Path:
+    original = batch_dir / "scores.json"
+    if not original.exists():
+        return original
+    revised = batch_dir / f"scores.v{SCORER_REVISION}.json"
+    if not revised.exists():
+        return revised
+    suffix = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return batch_dir / f"scores.v{SCORER_REVISION}.{suffix}.json"
+
+
+def write_score_output(output: Path, result: dict) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Preserve historical scoring artifacts, including an explicitly named output.
+    with output.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
 
 
 def main() -> None:
@@ -387,9 +449,11 @@ def main() -> None:
     if args.batch_dir is None:
         parser.error("--batch-dir is required")
     result = score_batch(args.batch_dir, args.answer_key)
-    output = args.output or args.batch_dir / "scores.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    output = args.output or default_score_output(args.batch_dir)
+    try:
+        write_score_output(output, result)
+    except FileExistsError:
+        parser.error("Output already exists; choose a new --output path to preserve prior scores")
     print(json.dumps({"grading_method": METHOD, "summary": result["summary"], "output": str(output)}))
 
 

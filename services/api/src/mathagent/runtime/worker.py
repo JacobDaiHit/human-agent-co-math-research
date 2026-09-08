@@ -134,6 +134,7 @@ class HTTPWorker:
                             "findings": ["模拟测试输出，未进行数学验证"],
                             "cited_revision_ids": list(task["read_set"].values())[:500],
                             "verdict": "inconclusive" if task["mode"] == "review" else None,
+                            "next_action": "finish",
                         }
                         if task["mode"] == "review":
                             result["scope"] = "仅验证执行流程；未检查任何数学论证。"
@@ -162,6 +163,20 @@ class HTTPWorker:
                         from mathagent.runtime.context import compact_task
 
                         task = compact_task({**task, "repair_output": observation.get("raw_text", "")[:30000]})
+                        budget = task.get("request_budget_status")
+                        if budget:
+                            # Every listed scope includes this run. The failed
+                            # response was settled as spent before this repair;
+                            # concurrent activity may have consumed more, so this
+                            # adjustment must not claim to be a fresh snapshot.
+                            for scope in budget["scopes"]:
+                                scope["occupied"] += 1
+                                scope["remaining"] = max(0, scope["limit"] - scope["occupied"])
+                            budget["remaining"] = min(scope["remaining"] for scope in budget["scopes"])
+                            budget["after_this_request"] = max(0, budget["remaining"] - 1)
+                            budget["snapshot"] = "adjusted_after_format_failure"
+                            budget["stale"] = True
+                            budget["known_consumed_since_snapshot"] = 1
                         continue
                     await self._safe_fail(task, error.code)
                     return

@@ -78,11 +78,11 @@ def limits(**changes):
         request_timeout_seconds=10, case_timeout_seconds=30, parallel_cases=2), **changes)
 
 
-def completion(body, *, actions=(), mode="research", next_action="finish"):
+def completion(body, *, actions=(), mode="research", next_action="finish", citations=()):
     result = {"mode": mode, "body": body, "findings": ["Synthetic engineering fixture."],
-              "cited_revision_ids": [], "actions": list(actions), "next_action": next_action}
+              "cited_revision_ids": list(citations), "actions": list(actions), "next_action": next_action}
     if mode == "review":
-        result.update(verdict="inconclusive", scope="Synthetic independent review of one proposal.")
+        result.update(verdict="passed", scope="Synthetic independent review of one proposal.")
     return httpx.Response(200, json={"id": "synthetic-receipt", "usage": {"total_tokens": 12},
         "choices": [{"message": {"content": json.dumps(result)}, "finish_reason": "stop"}]})
 
@@ -112,7 +112,7 @@ class ScriptedInference:
                 return completion("The saved proposal has been independently inspected.", mode="review")
             if not task["previous_steps"]:
                 return completion("Save the proposed proof before requesting review.", actions=[{
-                    "type": "write_draft", "arguments": {"kind": "claim", "body": r"$1+1=2$."},
+                    "type": "write_draft", "arguments": {"kind": "claim", "body": r"$1+1=\boxed{2}$."},
                 }], next_action="continue")
             if len(task["previous_steps"]) == 1:
                 receipt = task["previous_steps"][0]["actions"][0]["result"]
@@ -120,7 +120,8 @@ class ScriptedInference:
                     "type": "request_review", "arguments": {"target_revision_id": receipt["revision_id"]},
                 }], next_action="wait")
             assert task["child_results"] and task["child_results"][0]["state"] == "completed"
-            return completion(r"Adding one and one gives $\boxed{2}$.")
+            return completion(r"Adding one and one gives $\boxed{2}$.",
+                              citations=[task["child_results"][0]["target_revision_id"]])
         return httpx.MockTransport(handle)
 
 
