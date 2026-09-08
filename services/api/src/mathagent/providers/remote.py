@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 import httpx
 from mathagent.providers import protocol
 from mathagent.providers.observability import MAX_WIRE_BYTES, RequestObservation, empty_observation
+from mathagent.providers.options import MAX_OUTPUT_TOKENS
 
 DEFAULT_URLS = {
     "deepseek": "https://api.deepseek.com",
@@ -115,14 +116,18 @@ class RemoteProvider:
         if not isinstance(options, dict) or set(options) - {
             "max_output_tokens",
             "request_timeout_seconds",
+            "thinking_mode",
+            "reasoning_effort",
         }:
             raise ProviderFailure("invalid_provider_options", outcome="unaccepted")
         max_tokens = options.get("max_output_tokens", task.get("max_output_tokens", 4096))
         deadline = options.get("request_timeout_seconds", task.get("request_timeout_seconds", 180))
+        thinking = options.get("thinking_mode", task.get("thinking_mode", "provider_default"))
+        effort = options.get("reasoning_effort", task.get("reasoning_effort", "provider_default"))
         if (
             isinstance(max_tokens, bool)
             or not isinstance(max_tokens, int)
-            or not 256 <= max_tokens <= 16384
+            or not 256 <= max_tokens <= MAX_OUTPUT_TOKENS
         ):
             raise ProviderFailure("invalid_max_output_tokens", outcome="unaccepted")
         if (
@@ -132,12 +137,26 @@ class RemoteProvider:
             or not 1 <= deadline <= 600
         ):
             raise ProviderFailure("invalid_request_timeout", outcome="unaccepted")
+        if thinking not in ("provider_default", "enabled", "disabled"):
+            raise ProviderFailure("invalid_thinking_mode", outcome="unaccepted")
+        if effort not in ("provider_default", "low", "high", "max"):
+            raise ProviderFailure("invalid_reasoning_effort", outcome="unaccepted")
+        if thinking == "disabled" and effort != "provider_default":
+            raise ProviderFailure("incompatible_thinking_options", outcome="unaccepted")
+        if config.name != "deepseek" and (thinking != "provider_default" or effort != "provider_default"):
+            raise ProviderFailure("unsupported_thinking_options", outcome="unaccepted")
         messages = protocol.messages_for(task)
         parameters = {
             "stream": True,
             "response_format": {"type": "json_object"},
             "max_tokens": max_tokens,
         }
+        if thinking != "provider_default":
+            parameters["thinking"] = {"type": thinking}
+        if effort != "provider_default":
+            # An explicit effort always requests thinking, independent of server defaults.
+            parameters["thinking"] = {"type": "enabled"}
+            parameters["reasoning_effort"] = effort
         canonical = json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         template = "\n".join(m["content"] for m in messages if m["role"] == "system")
         call_config = {
@@ -215,7 +234,10 @@ class RemoteProvider:
                                 retryable=status == 429,
                             )
                         raise ProviderFailure(f"http_{status}")
-                    content = await self._decode(response, observation)
+                    content = await self._decode(
+                        response, observation,
+                        wire_limit=max(MAX_WIRE_BYTES, payload["max_tokens"] * 1024),
+                    )
                 try:
                     result = protocol.validate_result(
                         json.loads(observation.redact(content)),
@@ -259,11 +281,11 @@ class RemoteProvider:
                     await asyncio.wait_for(client.aclose(), timeout=5)
 
     @staticmethod
-    async def _read_body(response, observation):
+    async def _read_body(response, observation, *, wire_limit=MAX_WIRE_BYTES):
         body = bytearray()
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         async for chunk in response.aiter_bytes():
-            available = MAX_WIRE_BYTES - len(body)
+            available = wire_limit - len(body)
             body.extend(chunk[:available])
             observation.append_raw(decoder.decode(chunk[:available]))
             if len(chunk) > available:
@@ -273,17 +295,17 @@ class RemoteProvider:
         return bytes(body), False
 
     @staticmethod
-    async def _lines(response, observation):
+    async def _lines(response, observation, *, wire_limit=MAX_WIRE_BYTES):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         buffer, size = "", 0
         async for chunk in response.aiter_bytes():
-            available = MAX_WIRE_BYTES - size
+            available = wire_limit - size
             size += len(chunk)
             buffer += decoder.decode(chunk[:available])
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
                 yield line.rstrip("\r")
-            if size > MAX_WIRE_BYTES:
+            if size > wire_limit:
                 if not observation.raw_text:
                     observation.set_raw(buffer)
                 observation.raw_text_truncated = True
@@ -293,10 +315,10 @@ class RemoteProvider:
             yield buffer.rstrip("\r")
 
     @staticmethod
-    async def _decode(response, observation):
+    async def _decode(response, observation, *, wire_limit=MAX_WIRE_BYTES):
         content_type = response.headers.get("content-type", "")
         if "text/event-stream" not in content_type:
-            raw, overflow = await RemoteProvider._read_body(response, observation)
+            raw, overflow = await RemoteProvider._read_body(response, observation, wire_limit=wire_limit)
             observation.set_raw(raw.decode("utf-8", errors="replace"))
             if overflow:
                 observation.raw_text_truncated = True
@@ -322,7 +344,7 @@ class RemoteProvider:
                 raise ProviderFailure("invalid_provider_response", outcome="spent") from None
         parts, finished, done = [], False, False
         try:
-            async for line in RemoteProvider._lines(response, observation):
+            async for line in RemoteProvider._lines(response, observation, wire_limit=wire_limit):
                 if not line.startswith("data:"):
                     continue
                 raw = line[5:].strip()

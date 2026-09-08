@@ -8,6 +8,7 @@ from mathagent.persistence.agent_models import AgentStep, ProviderCall
 from mathagent.persistence.models import Project
 from mathagent.persistence.runtime_models import ProviderRequest
 from mathagent.providers.actions import operation_schemas
+from mathagent.providers.options import MAX_OUTPUT_TOKENS, ReasoningEffort, ThinkingMode
 from pydantic import Field
 from sqlalchemy import select
 
@@ -19,8 +20,10 @@ class RunUpdate(Command):
     max_review_rounds: int = Field(ge=0, le=2)
     max_children: int = Field(ge=0, le=12)
     max_depth: int = Field(ge=0, le=4)
-    max_output_tokens: int = Field(ge=256, le=16384)
+    max_output_tokens: int = Field(ge=256, le=MAX_OUTPUT_TOKENS)
     request_timeout_seconds: int = Field(ge=1, le=600)
+    thinking_mode: ThinkingMode = "provider_default"
+    reasoning_effort: ReasoningEffort = "provider_default"
 
 
 class BranchBudget(Command):

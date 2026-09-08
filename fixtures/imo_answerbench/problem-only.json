@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "benchmark": "IMO-AnswerBench",
+  "problems": [
+    {
+      "id": "imo-bench-algebra-004",
+      "category": "Algebra",
+      "problem": "Let $u \\ge 2$ be a given positive integer. Find the smallest real number $C$ such that for all real numbers $t$, $\\frac{t^{2^u}+1}{2} \\le (C(t-1)^2+t)^{2^{u-1}}$.\n"
+    },
+    {
+      "id": "imo-bench-combinatorics-037",
+      "category": "Combinatorics",
+      "problem": "Lê Bá Khánh Trình is a famous Vietnamese IMO contestant who won Vietnam's only Special Prize. He enjoys solving mathematics problems and dancing. As the IMO is coming soon, he is studying the following mathematical problem:\n\nA subset $S$ of $\\{0, 1, 2, \\ldots \\}$ is called Bachata if $0 \\in S$ and for each element $n \\in S,$ the integers $n + 11$ and $n + 20$ belong to $S.$\n\nPlease determine the number of Bachata subsets of $\\{0, 1, 2, \\ldots \\}.$\n"
+    },
+    {
+      "id": "imo-bench-geometry-055",
+      "category": "Geometry",
+      "problem": "Let $DEF$ be an acute triangle with circumcircle $\\Omega$ and orthocenter $O$. Suppose the tangent to the circumcircle of $\\triangle OFE$ at $O$ intersects $\\Omega$ at points $P$ and $Q$ with $OD=3$, $OP=2$, $OQ=6$. The area of $\\triangle DEF$ can be written as $a\\sqrt b$, where $a$ and $b$ are positive integers, and $b$ is not divisible by the square of any prime. Find $a+b$.\n"
+    },
+    {
+      "id": "imo-bench-number_theory-081",
+      "category": "Number theory",
+      "problem": "Find all pairs of positive integers $(M, N)$ that satisfy $M \\ge 2014$, $N \\ge 4028$, and $\\binom{M}{2014} = \\binom{N}{4028} \\times \\frac{4028!}{2014!}$.\n"
+    }
+  ]
+}

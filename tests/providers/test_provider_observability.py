@@ -285,12 +285,17 @@ def test_total_deadline_interrupts_a_stream_that_keeps_sending_heartbeats():
     "changes,code",
     [
         ({"max_output_tokens": 255}, "invalid_max_output_tokens"),
-        ({"max_output_tokens": 16385}, "invalid_max_output_tokens"),
+        ({"max_output_tokens": 65537}, "invalid_max_output_tokens"),
         ({"max_output_tokens": True}, "invalid_max_output_tokens"),
         ({"request_timeout_seconds": 0}, "invalid_request_timeout"),
         ({"request_timeout_seconds": 601}, "invalid_request_timeout"),
         ({"request_timeout_seconds": float("nan")}, "invalid_request_timeout"),
         ({"provider_options": {"model": "untrusted-override"}}, "invalid_provider_options"),
+        ({"thinking_mode": "auto"}, "invalid_thinking_mode"),
+        ({"thinking_mode": {}}, "invalid_thinking_mode"),
+        ({"reasoning_effort": "xhigh"}, "invalid_reasoning_effort"),
+        ({"reasoning_effort": True}, "invalid_reasoning_effort"),
+        ({"thinking_mode": "disabled", "reasoning_effort": "max"}, "incompatible_thinking_options"),
     ],
 )
 def test_invalid_options_never_dispatch(changes, code):
@@ -336,11 +341,86 @@ def test_invalid_urls_remain_unaccepted_without_leaking_credentials(url):
 
 def test_raw_observation_and_wire_buffer_are_bounded():
     with pytest.raises(ProviderFailure) as caught:
-        call(lambda _: httpx.Response(200, stream=Chunks([b"x" * (MAX_WIRE_BYTES + 100)])))
+        call(
+            lambda _: httpx.Response(200, stream=Chunks([b"x" * (MAX_WIRE_BYTES + 100)])),
+            task(max_output_tokens=256),
+        )
     assert str(caught.value) == "response_too_large"
     assert len(caught.value.observation["raw_text"]) == MAX_RAW_TEXT
     assert caught.value.observation["raw_text_truncated"] is True
     assert caught.value.observation["complete"] is False
+
+
+@pytest.mark.parametrize("effort", ["low", "high", "max"])
+def test_explicit_thinking_effort_is_frozen_on_wire_without_changing_model(effort):
+    assigned = task(provider_options={
+        "thinking_mode": "enabled", "reasoning_effort": effort,
+        "max_output_tokens": 65536, "request_timeout_seconds": 600,
+    })
+
+    async def run():
+        captured = {}
+
+        def transport(request):
+            captured.update(json.loads(request.content))
+            assigned["provider_options"]["reasoning_effort"] = "low"
+            return httpx.Response(200, json=envelope(json.dumps(result())))
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+            provider = DeepSeekProvider(ProviderConfig(
+                "deepseek", SECRET, "deepseek-v4-flash-vision-exp", "https://mock.invalid", True,
+            ), client)
+            description = provider.describe(assigned)
+            output = await provider.generate(assigned)
+        assert output["observation"]["call_config"] == description
+        assert captured["thinking"] == description["parameters"]["thinking"] == {"type": "enabled"}
+        assert captured["reasoning_effort"] == description["parameters"]["reasoning_effort"] == effort
+        assert captured["max_tokens"] == 65536
+        assert captured["model"] == description["model"] == "deepseek-v4-flash-vision-exp"
+        assert description["request_timeout_seconds"] == 600
+
+    asyncio.run(run())
+
+
+def test_effort_enables_thinking_and_explicit_disabled_omits_effort():
+    provider = DeepSeekProvider(ProviderConfig(
+        "deepseek", SECRET, "deepseek-v4-flash", "https://mock.invalid", True,
+    ))
+    parameters = provider.describe(task(reasoning_effort="max"))["parameters"]
+    assert parameters["thinking"] == {"type": "enabled"}
+    assert parameters["reasoning_effort"] == "max"
+    parameters = provider.describe(task(thinking_mode="disabled"))["parameters"]
+    assert parameters["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in parameters
+
+
+def test_deepseek_thinking_options_are_not_silently_ignored_by_other_providers():
+    provider = remote.GLMProvider(ProviderConfig(
+        "glm", SECRET, "synthetic-model", "https://mock.invalid", True,
+    ))
+    with pytest.raises(ProviderFailure, match="unsupported_thinking_options"):
+        provider.describe(task(thinking_mode="enabled", reasoning_effort="high"))
+
+
+def test_large_thinking_stream_uses_explicit_budget_and_does_not_save_reasoning():
+    reasoning = ("data: " + json.dumps({"choices": [{
+        "delta": {"reasoning_content": "synthetic-private-reasoning-" * 64},
+        "finish_reason": None,
+    }]}) + "\n\n").encode()
+    reasoning_chunks = [reasoning] * (MAX_WIRE_BYTES // len(reasoning) + 1)
+    assert sum(map(len, reasoning_chunks)) > MAX_WIRE_BYTES
+    output = call(
+        lambda _: httpx.Response(200, stream=Chunks([
+            *reasoning_chunks, frame(json.dumps(result())),
+            frame(finish="stop", usage={"completion_tokens": 20000}), b"data: [DONE]\n\n",
+        ]), headers={"content-type": "text/event-stream"}),
+        task(max_output_tokens=65536, thinking_mode="enabled", reasoning_effort="max"),
+    )
+    observation = output["observation"]
+    assert observation["complete"] is True
+    assert observation["raw_text"] == json.dumps(result())
+    assert observation["usage"]["completion_tokens"] == 20000
+    assert "synthetic-private-reasoning" not in json.dumps(output)
 
 
 def test_tool_calls_are_rejected_after_retaining_available_text_and_usage():

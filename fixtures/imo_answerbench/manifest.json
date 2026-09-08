@@ -1,0 +1,95 @@
+{
+  "schema_version": "1.0",
+  "benchmark": "IMO-AnswerBench",
+  "retrieved_on": "2026-09-08",
+  "repository": "https://github.com/google-deepmind/superhuman",
+  "source_commit": "80b2527a0b4e4bfc6a8b28825fadbdcfdd6048a1",
+  "source_path": "imobench/answerbench_v2.csv",
+  "source_url": "https://raw.githubusercontent.com/google-deepmind/superhuman/80b2527a0b4e4bfc6a8b28825fadbdcfdd6048a1/imobench/answerbench_v2.csv",
+  "source_sha256": "275877a9d988d85278fad3a5f8a41d7f83393a60bf259531ec0a5161e6b21cf9",
+  "license": "CC-BY-4.0",
+  "copyright": "Copyright 2025 Google LLC",
+  "paper": "https://aclanthology.org/2025.emnlp-main.1794/",
+  "columns": [
+    "Problem ID",
+    "Problem",
+    "Short Answer",
+    "Category",
+    "Subcategory",
+    "Source"
+  ],
+  "official_problem_count": 400,
+  "category_counts_by_id_family": {
+    "Algebra": 100,
+    "Combinatorics": 100,
+    "Geometry": 100,
+    "Number theory": 100
+  },
+  "well_formed_category_counts": {
+    "Algebra": 99,
+    "Combinatorics": 100,
+    "Geometry": 100,
+    "Number theory": 100
+  },
+  "selection_rule_file": "selection-rule.json",
+  "selection_seed": "mathagent-imo-answerbench-four-v1",
+  "source_anomalies": [
+    {
+      "id": "imo-bench-algebra-036",
+      "parsed_field_count": 5,
+      "expected_field_count": 6,
+      "category": "Algebra",
+      "handling": "Kept ID in category pool using ID family and trailing category; not selected; no statement or answer repair.",
+      "affects_selected_ids": false
+    }
+  ],
+  "selected": [
+    {
+      "id": "imo-bench-algebra-004",
+      "category": "Algebra",
+      "subcategory": "Inequality",
+      "original_source": "IMO Shortlist 2021",
+      "selection_sha256": "056333daae7cf99f49f505836afca5b0b955ba6bd9a5a104afeea3e99fca9758",
+      "problem_sha256": "7c2cbad3f48238bd3a241cf2294a8718ef4cccbe8f0702eb81373a3b54812733",
+      "source_field_count": 6
+    },
+    {
+      "id": "imo-bench-combinatorics-037",
+      "category": "Combinatorics",
+      "subcategory": "Extremal Combinatorics",
+      "original_source": "IMO Shortlist 2000",
+      "selection_sha256": "00b0229fc51400f6ab8163569144fcce1fd096273cb07e3614abf39ae936b9f3",
+      "problem_sha256": "a10149f008ca1334e84c67522a3fcd75e204d203d8ad261cc29d278f6f46c711",
+      "source_field_count": 6
+    },
+    {
+      "id": "imo-bench-geometry-055",
+      "category": "Geometry",
+      "subcategory": "computation",
+      "original_source": "AIME 2020",
+      "selection_sha256": "047c98951c8e4075bbcf4186d4a1dbe7b5ac94f865c1a450b68b3a97532961ee",
+      "problem_sha256": "d3fef3263827c0ef28d387e26e1ee4631efce82af21760b456b6b0635cc51cd8",
+      "source_field_count": 6
+    },
+    {
+      "id": "imo-bench-number_theory-081",
+      "category": "Number theory",
+      "subcategory": "Binomial",
+      "original_source": "China TST 2014 ( modified)",
+      "selection_sha256": "011b9cedbf5cf314d86872f15f916854549f6145c8585e1668c73648515f1da2",
+      "problem_sha256": "2d1671ec6145ed2ca0b4d3770ea1eb311edb385b1db44674ef561cb60ffbc7e2",
+      "source_field_count": 6
+    }
+  ],
+  "artifact_sha256": {
+    "problem-only.json": "445da8394d69634419f12477a5c78407dd3449a824f60fa18d4b190937ae7906",
+    "answer-key.json": "d3c34c41aa19bbc7c6c0d9f0037e5e24d347f4530cbf15321d7a944c509494ef"
+  },
+  "transformations": [
+    "Selected one ID per official category using the predeclared SHA-256 rule.",
+    "Decoded UTF-8 CSV and serialized selected fields as UTF-8 JSON.",
+    "Retained selected Problem and Short Answer strings verbatim after CSV decoding.",
+    "Added local schema, metadata and answer form labels; no mathematical edits.",
+    "Separated problem statements from answer key and source metadata."
+  ]
+}

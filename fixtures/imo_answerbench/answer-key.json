@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "benchmark": "IMO-AnswerBench",
+  "answers": [
+    {
+      "id": "imo-bench-algebra-004",
+      "short_answer": "$2^{u-2}$",
+      "answer_type": "symbolic_exponential"
+    },
+    {
+      "id": "imo-bench-combinatorics-037",
+      "short_answer": "2731365",
+      "answer_type": "integer"
+    },
+    {
+      "id": "imo-bench-geometry-055",
+      "short_answer": "58",
+      "answer_type": "integer"
+    },
+    {
+      "id": "imo-bench-number_theory-081",
+      "short_answer": "no solutions",
+      "answer_type": "empty_solution_set"
+    }
+  ]
+}

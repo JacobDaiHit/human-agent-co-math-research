@@ -4,6 +4,8 @@
 
 最初缺口见 [蓝图落实审计](docs/acceptance/blueprint-audit-2026-09-08.md)，最新结果见 [一期补齐、研究地图与 IMO 准入评估](docs/acceptance/completion-assessment-2026-09-08.md)。功能与浏览器回归已完成；真实主任务收尾仍有协议失败记录，未宣称整个阶段已放行。
 
+当前工作：[IMO-AnswerBench 四题无人试测](docs/evaluation/imo-answerbench-pilot.md)。固定四领域各一题，解题时不读取答案、不开放网页检索；结果和独立离线评分分别保存。自动文献检索已列入蓝图后续范围，本轮不实现。
+
 ## 启动工作台
 
 需要 Python 3.13、uv、Node.js 22 或更新版本。在项目根目录运行 PowerShell：
@@ -61,6 +63,19 @@ GLM 对应变量为 `MATHAGENT_GLM_API_KEY` 和 `MATHAGENT_GLM_MODEL`，启动�
 打开运行页的“运行设置”，显式允许当前项目使用所选真实提供方。首次联调建议新建一个不含私有资料的项目，项目上限设为 2 次、单任务上限 1 次：先验证候选研究输出，再对明确的论证版本发起独立审查。检查调用编号、实际 usage、输入版本与结果，不把预置示例冒充模型自主发现。
 
 账本的额度单位是**请求次数**，并不保证人民币/美元费用上限。预留、已发出、已使用和结果不明都会占用额度。连接中断后的结果不明请求不会盲目重发；核对提供方记录后，在界面登记对账依据，再手动恢复任务。
+
+## IMO-AnswerBench 无人试测
+
+这会调用真实模型；默认四题、每题最多 12 次请求、两题并行、Think Max、每请求最多 65,536 输出 tokens / 600 秒、每题最多 1,800 秒。子任务、审查和格式修复共享每题额度。模型名显式使用 `deepseek-v4-flash`，不改 `.env`。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 scripts\imo_answerbench.py --execute --output data\benchmarks\answerbench-four-run-01
+.\.venv\Scripts\python.exe -X utf8 scripts\score_answerbench.py --batch-dir data\benchmarks\answerbench-four-run-01
+```
+
+第一条只打开题面文件；第二条在解题全部结束后读取独立答案键，以保守符号等价规则评分。它不是官方 Gemini AnswerAutoGrader，也不对证明质量评分。四题成绩不能代表完整题集准确率。
+
+中断后对同目录加 `--resume`，保持模型、参数、题面、源码及依赖锁不变。已完成题不会重复调用；已经发送但结果不明的请求不会盲重试。源码/参数变更后的复测必须用新目录，保留原批次。每题目录包含独立数据库、步骤、调用参数与可见输出、实际请求 payload（不含鉴权头）、导出和最终状态。
 
 ## 备份与恢复
 

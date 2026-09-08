@@ -3,6 +3,7 @@
 from enum import StrEnum
 from typing import Annotated, Literal
 
+from mathagent.providers.options import MAX_OUTPUT_TOKENS, ReasoningEffort, ThinkingMode
 from pydantic import BaseModel, ConfigDict, Field
 
 Id = Annotated[str, Field(min_length=1, max_length=100)]
@@ -108,8 +109,10 @@ class RunCreate(Command):
     max_review_rounds: int = Field(default=2, ge=0, le=2)
     max_children: int = Field(default=4, ge=0, le=12)
     max_depth: int = Field(default=2, ge=0, le=4)
-    max_output_tokens: int = Field(default=4096, ge=256, le=16384)
+    max_output_tokens: int = Field(default=4096, ge=256, le=MAX_OUTPUT_TOKENS)
     request_timeout_seconds: int = Field(default=180, ge=1, le=600)
+    thinking_mode: ThinkingMode = "provider_default"
+    reasoning_effort: ReasoningEffort = "provider_default"
 
 
 class CompleteAttempt(Command):

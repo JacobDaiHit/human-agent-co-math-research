@@ -24,6 +24,7 @@ from sqlalchemy import func, select
 DEFAULT_OPTIONS = {
     "max_steps": 8, "max_review_rounds": 2, "max_children": 4, "max_depth": 2,
     "max_output_tokens": 4096, "request_timeout_seconds": 180,
+    "thinking_mode": "provider_default", "reasoning_effort": "provider_default",
 }
 TERMINAL = {"completed", "cancelled", "failed", "interrupted", "budget_exhausted", "step_limit"}
 

@@ -4278,7 +4278,7 @@
           },
           "max_output_tokens": {
             "type": "integer",
-            "maximum": 16384.0,
+            "maximum": 65536.0,
             "minimum": 256.0,
             "title": "Max Output Tokens",
             "default": 4096
@@ -4289,6 +4289,27 @@
             "minimum": 1.0,
             "title": "Request Timeout Seconds",
             "default": 180
+          },
+          "thinking_mode": {
+            "type": "string",
+            "enum": [
+              "provider_default",
+              "enabled",
+              "disabled"
+            ],
+            "title": "Thinking Mode",
+            "default": "provider_default"
+          },
+          "reasoning_effort": {
+            "type": "string",
+            "enum": [
+              "provider_default",
+              "low",
+              "high",
+              "max"
+            ],
+            "title": "Reasoning Effort",
+            "default": "provider_default"
           }
         },
         "additionalProperties": false,
@@ -4337,7 +4358,7 @@
           },
           "max_output_tokens": {
             "type": "integer",
-            "maximum": 16384.0,
+            "maximum": 65536.0,
             "minimum": 256.0,
             "title": "Max Output Tokens"
           },
@@ -4346,6 +4367,27 @@
             "maximum": 600.0,
             "minimum": 1.0,
             "title": "Request Timeout Seconds"
+          },
+          "thinking_mode": {
+            "type": "string",
+            "enum": [
+              "provider_default",
+              "enabled",
+              "disabled"
+            ],
+            "title": "Thinking Mode",
+            "default": "provider_default"
+          },
+          "reasoning_effort": {
+            "type": "string",
+            "enum": [
+              "provider_default",
+              "low",
+              "high",
+              "max"
+            ],
+            "title": "Reasoning Effort",
+            "default": "provider_default"
           }
         },
         "additionalProperties": false,

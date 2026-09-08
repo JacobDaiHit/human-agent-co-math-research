@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "benchmark": "IMO-AnswerBench",
+  "source_commit": "80b2527a0b4e4bfc6a8b28825fadbdcfdd6048a1",
+  "source_path": "imobench/answerbench_v2.csv",
+  "rule_fixed_on": "2026-09-08",
+  "seed": "mathagent-imo-answerbench-four-v1",
+  "algorithm": "For each official category, choose the Problem ID with the lexicographically smallest lowercase hexadecimal SHA-256 of UTF-8(seed + '|' + Problem ID). Break a hash tie by Problem ID. Use neither problem text, answer, difficulty nor solver outcomes.",
+  "categories": ["Algebra", "Combinatorics", "Geometry", "Number theory"],
+  "sample_size": 4,
+  "replacement_policy": "Do not replace selected problems after inspecting statements, answers, failures, scores or solve duration. Report upstream defects if a selected row is unusable."
+}
