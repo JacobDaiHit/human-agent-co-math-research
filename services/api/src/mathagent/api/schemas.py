@@ -114,6 +114,7 @@ class RunCreate(Command):
     thinking_mode: ThinkingMode = "provider_default"
     reasoning_effort: ReasoningEffort = "provider_default"
     completion_policy: Literal["draft", "reviewed_answer"] = "draft"
+    length_recovery: Literal["none", "high"] = "none"
 
 
 class CompleteAttempt(Command):

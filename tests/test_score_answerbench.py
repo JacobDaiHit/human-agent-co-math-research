@@ -248,6 +248,21 @@ def test_rescoring_uses_a_new_artifact_and_preserves_original(tmp_path):
     assert grader.default_score_output(tmp_path) not in {original, destination}
 
 
+def test_explicit_targeted_scoring_does_not_count_unselected_reports(tmp_path):
+    keys = tmp_path / "key.json"
+    keys.write_text(json.dumps({"answers": [
+        {"id": "a", "short_answer": "2", "answer_type": "integer"},
+        {"id": "b", "short_answer": "3", "answer_type": "integer"},
+    ]}), encoding="utf-8")
+    result = grader.score_batch(tmp_path, keys, case_ids=["b"])
+    assert result["scope"] == "targeted_retest"
+    assert result["case_ids"] == ["b"]
+    assert result["summary"]["total"] == result["summary"]["missing_case_report"] == 1
+    for ids in ([], ["b", "b"], ["c"]):
+        with pytest.raises(ValueError, match="case IDs"):
+            grader.score_batch(tmp_path, keys, case_ids=ids)
+
+
 def test_fixture_selection_and_problem_answer_separation():
     directory = ROOT / "fixtures" / "imo_answerbench"
     problems = json.loads((directory / "problem-only.json").read_text(encoding="utf-8"))

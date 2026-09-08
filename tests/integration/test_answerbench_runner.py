@@ -325,3 +325,29 @@ def test_expired_checkpoint_cannot_start_a_new_paid_dispatch(workspace, tmp_path
     assert not dispatched
     assert report["completed"] is False and report["final_answer"] is None
     assert report["terminal_reason"] == "case_timeout"
+
+
+def test_explicit_target_only_dispatches_selected_case(workspace, tmp_path):
+    problems, source, _ = workspace
+    output = tmp_path / "targeted"
+    inference = ScriptedInference()
+    result = asyncio.run(answerbench.run_batch(problems, output, CONFIG, limits(), source,
+        case_ids=["case-3"], transport_factory=inference.factory))
+    assert result["all_completed"]
+    assert set(case for case, _ in inference.dispatches) == {"case-3"}
+    plan = read_json(output / "plan.json")
+    assert plan["max_requests_total"] == 5
+    assert plan["configuration"]["scope"] == "targeted_retest"
+    assert [case["id"] for case in read_json(output / "problem-only.json")["problems"]] == ["case-3"]
+    for ids in (["absent"], ["case-3", "case-3"], []):
+        with pytest.raises(ValueError, match="case IDs"):
+            asyncio.run(answerbench.run_batch(problems, tmp_path / "invalid", CONFIG, limits(), source, case_ids=ids))
+
+
+def test_intervention_audit_excludes_only_receipted_scheduler_controls():
+    receipt = {"affected_runs": [{"intervention_id": "automatic"}]}
+    events = [{"id": identifier, "type": "run.intervention", "payload": {"action": "pause"}}
+              for identifier in ("automatic", "manual")]
+    audit = answerbench.intervention_audit(events, receipt)
+    assert audit["human_interventions"] == 1 and not audit["unattended_eligible"]
+    assert [event["actor"] for event in audit["interventions"]] == ["benchmark_scheduler", "human"]

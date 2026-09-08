@@ -1,24 +1,30 @@
 """Mechanical delivery checks; these do not establish mathematical correctness."""
 
 import re
-from itertools import islice
 
 
 def boxed_answers(body):
-    answers = []
-    # Two boxes already fail the single-answer contract; bound rescanning even
-    # for a long malformed response containing thousands of opening boxes.
-    for match in islice(re.finditer(r"(?<!\\)\\boxed\s*\{", body or ""), 2):
+    body = body or ""
+    answers, offset = [], 0
+    pattern = re.compile(r"(?<!\\)\\boxed\s*\{")
+    while match := pattern.search(body, offset):
         depth = 1
         for index in range(match.end(), len(body)):
-            if body[index] in "{}" and body[index - 1] != "\\":
+            if body[index] in "{}":
+                before, slashes = index - 1, 0
+                while before >= 0 and body[before] == "\\":
+                    slashes += 1
+                    before -= 1
+                if slashes % 2:
+                    continue
                 depth += 1 if body[index] == "{" else -1
             if depth == 0:
                 value = body[match.end():index].strip()
-                if value:
+                if value and not pattern.search(value):
                     answers.append(value)
                 else:
                     return []
+                offset = index + 1
                 break
         else:
             return []

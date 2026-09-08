@@ -102,6 +102,7 @@ class HTTPWorker:
         attempt_path = f"/attempts/{task['attempt_id']}"
         execution = {"token": task["token"]}
         repaired = False
+        length_recovered = False
         try:
             provider = self.provider_factory(task["provider"]) if task["provider"] != "fake" or self.custom_provider else None
             for retry in range(3):
@@ -158,11 +159,28 @@ class HTTPWorker:
                     if error.outcome == "unaccepted" and error.retryable and retry < 2:
                         await asyncio.sleep(0.5 * 2**retry)
                         continue
-                    if error.code == "invalid_structured_output" and not repaired and retry < 2:
-                        repaired = True
+                    recover_length = (
+                        task["provider"] == "deepseek" and task.get("length_recovery") == "high"
+                        and error.code == "incomplete_output" and error.outcome == "spent"
+                        and observation.get("finish_reason") == "length" and not length_recovered
+                    )
+                    repair_format = error.code == "invalid_structured_output" and error.outcome == "spent" and not repaired
+                    if (recover_length or repair_format) and retry < 2:
                         from mathagent.runtime.context import compact_task
 
-                        task = compact_task({**task, "repair_output": observation.get("raw_text", "")[:30000]})
+                        if recover_length:
+                            length_recovered = True
+                            task = {**task, "thinking_mode": "enabled", "reasoning_effort": "high",
+                                "output_limit_recovery": {"reason": "length", "attempt": 1,
+                                    "visible_fragment": observation.get("raw_text", "")[:30000]}}
+                            if "provider_options" in task:
+                                task["provider_options"] = {**task["provider_options"],
+                                    "thinking_mode": "enabled", "reasoning_effort": "high"}
+                            task.pop("repair_output", None)
+                        else:
+                            repaired = True
+                            task = {**task, "repair_output": observation.get("raw_text", "")[:30000]}
+                        task = compact_task(task)
                         budget = task.get("request_budget_status")
                         if budget:
                             # Every listed scope includes this run. The failed
@@ -174,9 +192,9 @@ class HTTPWorker:
                                 scope["remaining"] = max(0, scope["limit"] - scope["occupied"])
                             budget["remaining"] = min(scope["remaining"] for scope in budget["scopes"])
                             budget["after_this_request"] = max(0, budget["remaining"] - 1)
-                            budget["snapshot"] = "adjusted_after_format_failure"
+                            budget["snapshot"] = "adjusted_after_length_failure" if recover_length else "adjusted_after_format_failure"
                             budget["stale"] = True
-                            budget["known_consumed_since_snapshot"] = 1
+                            budget["known_consumed_since_snapshot"] = budget.get("known_consumed_since_snapshot", 0) + 1
                         continue
                     await self._safe_fail(task, error.code)
                     return

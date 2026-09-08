@@ -21,6 +21,8 @@ def main():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--model", default="deepseek-v4-flash")
     parser.add_argument("--effort", choices=["high", "max"], default="max")
+    parser.add_argument("--length-recovery", choices=["none", "high"], default="none")
+    parser.add_argument("--case-id", action="append", help="Run only this exact frozen case; repeatable")
     parser.add_argument("--request-budget", type=int, default=12)
     parser.add_argument("--max-steps", type=int, default=6)
     parser.add_argument("--max-output-tokens", type=int, default=65536)
@@ -35,10 +37,11 @@ def main():
     limits = Limits(request_budget=args.request_budget, max_steps=args.max_steps,
         max_output_tokens=args.max_output_tokens, request_timeout_seconds=args.request_timeout,
         case_timeout_seconds=args.case_timeout, parallel_cases=args.parallel_cases,
-        reasoning_effort=args.effort)
+        reasoning_effort=args.effort, length_recovery=args.length_recovery)
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
     try:
-        result = asyncio.run(run_batch(args.problems, args.output, config, limits, root, resume=args.resume))
+        result = asyncio.run(run_batch(args.problems, args.output, config, limits, root,
+                                      resume=args.resume, case_ids=args.case_id))
     except Exception as error:
         print(json.dumps({"error_type": type(error).__name__}))
         return 2

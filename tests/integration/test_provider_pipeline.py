@@ -55,3 +55,60 @@ def test_actual_adapter_metadata_is_accepted_and_repair_obeys_budget(app, monkey
             assert calls[0]["call_config"]["prompt_sha256"] != calls[1]["call_config"]["prompt_sha256"]
             assert calls[0]["result"] is None and calls[1]["result"]
     exercise(app, scenario)
+
+
+@pytest.mark.parametrize("policy,budget,failure,repeated,expected", [
+    ("high", 3, "length", False, 2),
+    ("high", 3, "length", True, 2),
+    ("high", 1, "length", False, 1),
+    ("none", 3, "length", False, 1),
+    ("high", 3, "timeout", False, 1),
+])
+def test_output_limit_recovery_is_opt_in_bounded_and_preserves_ledger(app, monkeypatch,
+        policy, budget, failure, repeated, expected):
+    monkeypatch.setenv("MATHAGENT_ENABLE_REAL_API", "1")
+    monkeypatch.setenv("MATHAGENT_DEEPSEEK_API_KEY", "synthetic-key")
+    monkeypatch.setenv("MATHAGENT_DEEPSEEK_MODEL", "synthetic-model")
+
+    async def scenario(api, client):
+        p, _ = await project_and_run(api, autonomous=False)
+        await api.write(f"/projects/{p['project_id']}/runtime-settings", {
+            "request_budget": budget, "allow_real_api": True, "allowed_providers": ["deepseek"]}, method="PUT")
+        run = await api.write("/runs", {"branch_id": p["branch_id"], "goal_object_id": p["object_id"],
+            "autonomous": True, "provider": "deepseek", "request_budget": budget,
+            "thinking_mode": "enabled", "reasoning_effort": "max", "length_recovery": policy,
+            "max_output_tokens": 256})
+        captured = []
+
+        def transport(request):
+            payload = json.loads(request.content)
+            captured.append(payload)
+            user = json.loads(payload["messages"][1]["content"])
+            assert payload["max_tokens"] == 256
+            assert payload["reasoning_effort"] == ("max" if len(captured) == 1 else "high")
+            if len(captured) > 1:
+                assert user["output_limit_recovery"]["visible_fragment"] == ""
+                assert user["request_budget_status"]["remaining"] == budget - 1
+                assert "HIDDEN_REASONING" not in json.dumps(payload)
+            if failure == "timeout":
+                raise httpx.ReadTimeout("synthetic timeout", request=request)
+            if len(captured) == 1 or repeated:
+                content, finish = "", "length"
+            else:
+                content, finish = json.dumps(result("Useful bounded progress.", next_action="finish")["result"]), "stop"
+            return httpx.Response(200, json={"usage": {"completion_tokens": 256},
+                "choices": [{"message": {"content": content, "reasoning_content": "HIDDEN_REASONING"},
+                             "finish_reason": finish}]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as wire:
+            config = ProviderConfig("deepseek", "synthetic-key", "synthetic-model", "https://mock.invalid", True)
+            await HTTPWorker(client, providers=["deepseek"], provider_factory=lambda _: RemoteProvider(config, wire)).run(once=True)
+        assert len(captured) == expected
+        budget_result = await api.get(f"/runs/{run['run_id']}/budget")
+        assert budget_result["occupied"] == expected
+        assert budget_result["unknown"] == (1 if failure == "timeout" else 0)
+        steps = (await api.get(f"/runs/{run['run_id']}/steps"))["steps"]
+        assert len(steps) == (1 if expected == 2 and not repeated else 0)
+        calls = (await api.get(f"/runs/{run['run_id']}/calls"))["calls"]
+        assert all(call["result"] is None for call in calls if not call["complete"])
+    exercise(app, scenario)

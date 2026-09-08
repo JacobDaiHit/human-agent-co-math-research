@@ -108,6 +108,7 @@ class Limits:
     thinking_mode: str = "enabled"
     reasoning_effort: str = "max"
     completion_policy: str = "reviewed_answer"
+    length_recovery: str = "none"
 
     def validate(self):
         if not 1 <= self.request_budget <= 100 or not 1 <= self.max_steps <= 40:
@@ -120,6 +121,8 @@ class Limits:
             raise ValueError("This pilot requires an explicit high/max thinking setting")
         if self.completion_policy != "reviewed_answer":
             raise ValueError("This pilot requires reviewed final answers")
+        if self.length_recovery not in {"none", "high"}:
+            raise ValueError("Invalid output limit recovery policy")
 
 
 class CompletionOnlyTransport(httpx.AsyncBaseTransport):
@@ -233,7 +236,7 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
     write_json(journal_path, journal)
     base = {"case_id": case["id"], "problem_id": case["id"], "category": case["category"],
             "problem_sha256": digest(case["problem"].encode()), "started_at": journal["started_at"],
-            "interventions": [], "human_interventions": 0, "model_web_tools": False,
+            "interventions": [], "human_interventions": None, "unattended_eligible": None, "model_web_tools": False,
             "completed": False, "state": "starting", "final_answer": None, "final_body": None}
     write_json(report_path, base)
     print(json.dumps({"case": case["id"], "state": "starting"}), flush=True)
@@ -254,6 +257,11 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
                 raise RuntimeError(f"Benchmark command HTTP {response.status_code}")
             return response.json()
 
+        async def cancel_at_deadline():
+            receipt = await write(f"/branches/{branch_id}/interventions", {"action": "cancel"}, label="deadline")
+            journal["scheduler_cancel_receipt"] = receipt
+            write_json(journal_path, journal)
+
         project = await write("/projects", {"title": case["id"], "body": case["problem"]})
         project_id, branch_id = project["project_id"], project["branch_id"]
         await write(f"/projects/{project_id}/runtime-settings", {
@@ -269,8 +277,7 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
         write_json(journal_path, journal)
         timed_out = time.time() >= journal["deadline_epoch"]
         if timed_out:
-            base["interventions"].append({"actor": "benchmark_scheduler", "kind": "deadline_cancel", "at": stamp()})
-            await write(f"/branches/{branch_id}/interventions", {"action": "cancel"}, label="deadline")
+            await cancel_at_deadline()
         transport = CompletionOnlyTransport(DEFAULT_URLS[config.name] + "/chat/completions", directory,
             inner=transport_factory(case) if transport_factory else None)
         async with httpx.AsyncClient(transport=transport, follow_redirects=False, trust_env=False) as external:
@@ -290,8 +297,7 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
                         "updated_at": stamp(), "budget": budget})
                     if time.time() >= journal["deadline_epoch"]:
                         timed_out = True
-                        base["interventions"].append({"actor": "benchmark_scheduler", "kind": "deadline_cancel", "at": stamp()})
-                        await write(f"/branches/{branch_id}/interventions", {"action": "cancel"}, label="deadline")
+                        await cancel_at_deadline()
                         work.cancel()
                         break
                     await asyncio.sleep(1)
@@ -329,7 +335,15 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
         completion_checks = steps[-1]["receipt"].get("completion_checks", {}) if steps else {}
         finalized_after_review = completion_checks.get("policy") == "reviewed_answer" and completion_checks.get("passed") is True
         workflow_completed = root["state"] == "completed" and answer is not None and review_completed and finalized_after_review and not timed_out
-        report = {**base, "state": root["state"],
+        events, cursor = [], 0
+        while True:
+            page = await read(f"/projects/{project_id}/events?after_seq={cursor}")
+            events.extend(page["events"])
+            cursor = page["last_seq"]
+            if cursor >= page["project_seq"] or not page["events"]:
+                break
+        audit = intervention_audit(events, journal.get("scheduler_cancel_receipt"))
+        report = {**base, **audit, "state": root["state"],
             "terminal_reason": "case_timeout" if timed_out else "missing_final_answer" if root["state"] == "completed" and answer is None else "review_missing" if root["state"] == "completed" and not review_completed else root["state"],
             "runtime_terminal": root["state"] in TERMINAL, "runtime_completed": root["state"] == "completed",
             "final_answer_present": answer is not None, "review_completed": review_completed,
@@ -342,7 +356,7 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
             "independent_reviews": len(reviews),
             "network_dispatches": len(list(directory.glob("dispatch-*.json"))),
             "network_dispatches_this_process": transport.number,
-            "evaluation_kind": "unattended_agent_short_answer", "scored": False}
+            "evaluation_kind": "unattended_agent_short_answer" if audit["unattended_eligible"] else "intervened_agent_short_answer", "scored": False}
         write_json(report_path, report)
         export = await write("/exports", {"project_id": project_id, "branch_id": branch_id})
         response = await client.get(f"/exports/{export['export_id']}/download", headers=headers)
@@ -362,12 +376,41 @@ def source_fingerprint(root):
     return {"sha256": digest(json.dumps(entries, sort_keys=True).encode()), "files": entries}
 
 
+def intervention_audit(events, scheduler_receipt=None):
+    """Read durable controls; a scheduler receipt exempts only its exact events."""
+    scheduler_receipt = scheduler_receipt or {}
+    scheduler_ids = {row["intervention_id"] for row in scheduler_receipt.get("affected_runs", [])
+                     if row.get("intervention_id")}
+    controls = []
+    for event in events:
+        kind, payload = event["type"], event["payload"]
+        if kind == "run.intervention":
+            scheduler = event["id"] in scheduler_ids
+        elif kind == "branch.intervention" and not payload.get("affected_runs"):
+            scheduler = bool(scheduler_receipt) and payload == scheduler_receipt
+        elif kind in {"run.resumed", "run.options_changed"}:
+            scheduler = False
+        else:
+            continue
+        controls.append({"event_id": event["id"], "kind": kind,
+            "actor": "benchmark_scheduler" if scheduler else "human",
+            "payload": payload, "created_at": event.get("created_at")})
+    human_count = sum(control["actor"] == "human" for control in controls)
+    return {"interventions": controls, "human_interventions": human_count,
+            "unattended_eligible": human_count == 0}
+
+
 async def run_batch(problems_file, directory, config, limits, root, *, resume=False,
-                    api_factory=local_api, transport_factory=None):
+                    api_factory=local_api, transport_factory=None, case_ids=None):
     limits.validate()
     if config.name not in DEFAULT_URLS or config.base_url != DEFAULT_URLS[config.name] or not config.ready():
         raise ValueError("Benchmark requires a configured official inference endpoint")
     problems = load_problems(problems_file)
+    if case_ids is not None:
+        known = {case["id"] for case in problems["problems"]}
+        if not case_ids or len(set(case_ids)) != len(case_ids) or not set(case_ids) <= known:
+            raise ValueError("Select nonempty, unique, known case IDs")
+        problems = {**problems, "problems": [case for case in problems["problems"] if case["id"] in case_ids]}
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=resume)
     with batch_lock(directory):
@@ -375,6 +418,7 @@ async def run_batch(problems_file, directory, config, limits, root, *, resume=Fa
         stable = {"problems_sha256": digest(Path(problems_file).read_bytes()),
             "provider": config.name, "requested_model": config.model, "limits": asdict(limits),
             "source": fingerprint, "instruction_sha256": digest(INSTRUCTION.encode()),
+            "scope": "targeted_retest" if case_ids is not None else "full_fixture",
             "case_ids": [case["id"] for case in problems["problems"]]}
         plan_file = directory / "plan.json"
         if plan_file.exists():
@@ -412,9 +456,11 @@ async def run_batch(problems_file, directory, config, limits, root, *, resume=Fa
 
         reports = await asyncio.gather(*(bounded(case) for case in problems["problems"]))
         summary = {"batch_id": plan["batch_id"], "finished_at": stamp(),
-            "cases": [{k: report.get(k) for k in ("case_id", "state", "completed", "requests", "independent_reviews", "terminal_reason")} for report in reports],
+            "scope": stable["scope"],
+            "cases": [{k: report.get(k) for k in ("case_id", "state", "completed", "requests", "independent_reviews", "terminal_reason", "human_interventions", "unattended_eligible")} for report in reports],
             "case_reports": [f"{case['id']}/report.json" for case in problems["problems"]],
             "all_completed": all(report["completed"] for report in reports),
+            "all_unattended": all(report.get("unattended_eligible") is True for report in reports),
             "source_unchanged": source_fingerprint(Path(root)) == fingerprint,
             "answer_key_loaded": False, "scored": False}
         write_json(directory / "report.json", summary)

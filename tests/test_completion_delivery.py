@@ -11,6 +11,10 @@ def test_single_box_handles_nested_braces_and_rejects_malformed_or_multiple_boxe
     assert boxed_answers(r"\boxed{" * 20000) == []
 
 
+def test_all_candidate_boxes_are_seen_so_a_later_conflicting_answer_is_not_hidden():
+    assert boxed_answers(r"$\boxed{2}$, $\boxed{2}$, $\boxed{3}$") == ["2", "2", "3"]
+
+
 def test_reference_or_excerpt_does_not_count_as_delivered_review():
     text = "Important review prefix. " * 1000 + "Critical concluding limitation."
     ranges, complete = delivered_review_ranges({"context_revision_ids": ["r"],

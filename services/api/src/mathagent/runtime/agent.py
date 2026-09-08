@@ -28,6 +28,7 @@ DEFAULT_OPTIONS = {
     "max_output_tokens": 4096, "request_timeout_seconds": 180,
     "thinking_mode": "provider_default", "reasoning_effort": "provider_default",
     "completion_policy": "draft",
+    "length_recovery": "none",
 }
 TERMINAL = {"completed", "cancelled", "failed", "interrupted", "budget_exhausted", "step_limit"}
 
@@ -173,6 +174,7 @@ class AgentRuntime:
         if len(final_answers) != 1:
             issues.append("exactly_one_final_boxed_answer_in_body_required")
         targets = set()
+        reasons = set()
         parent_attempt = session.get(Attempt, run.current_attempt_id) if run.current_attempt_id else None
         visible = set(parent_attempt.checkpoint.get("fully_delivered_review_ids", [])) if parent_attempt else set()
         for child in session.scalars(select(AgentRun).where(AgentRun.parent_run_id == run.id)):
@@ -183,7 +185,11 @@ class AgentRuntime:
             output = session.get(Revision, child_attempt.output_revision_id) if child_attempt.output_revision_id else None
             review_id = child_attempt.checkpoint.get("completion", {}).get("review_id")
             review = session.get(Review, review_id) if review_id else None
-            if not output or output.id not in visible or not review or review.kind != "llm_review" or review.verdict != "passed":
+            if not output or not review or review.kind != "llm_review" or review.verdict != "passed":
+                reasons.add("independent_passed_review_required")
+                continue
+            if output.id not in visible:
+                reasons.add("complete_review_body_must_be_read")
                 continue
             if review.target_revision_id != child.target_revision_id:
                 continue
@@ -191,20 +197,29 @@ class AgentRuntime:
             if not target:
                 continue
             candidate_answers = boxed_answers(target.body)
-            if (len(candidate_answers) != 1 or len(final_answers) != 1
-                    or re.sub(r"\s+", "", candidate_answers[0]) != re.sub(r"\s+", "", final_answers[0])):
+            unique_answers = {re.sub(r"\s+", "", value) for value in candidate_answers}
+            if len(unique_answers) != 1:
+                reasons.add("candidate_boxed_answer_missing_or_conflicting")
+                continue
+            if len(final_answers) != 1 or re.sub(r"\s+", "", final_answers[0]) not in unique_answers:
+                reasons.add("final_boxed_answer_must_match_reviewed_candidate")
                 continue
             head = session.get(Head, (run.branch_id, target.object_id))
             if not head or head.revision_id != target.id:
+                reasons.add("reviewed_candidate_revision_is_stale")
                 continue
             dependencies = {**child_attempt.read_set, **review.dependency_snapshot}
             if not all((h := session.get(Head, (run.branch_id, oid))) and h.revision_id == rid
                        for oid, rid in dependencies.items()):
+                reasons.add("review_input_revision_is_stale")
                 continue
             if target.id in result.cited_revision_ids:
                 targets.add(target.id)
+            else:
+                reasons.add("reviewed_candidate_revision_must_be_cited")
         if not targets:
             issues.append("cite_current_passed_review_candidate_with_same_boxed_answer_required")
+            issues.extend(sorted(reasons or {"independent_passed_review_required"}))
         return issues
 
     def initial_read_set(self, session, run, all_heads):
@@ -359,7 +374,7 @@ class AgentRuntime:
         if options["completion_policy"] == "reviewed_answer":
             task["completion_requirements"].update(
                 final_body="Exactly one final boxed answer with justification; never invent an answer to satisfy formatting.",
-                review="Save the complete candidate with exactly one boxed answer, obtain an independent passed review of its current revision, read that review completely (read_object section=body with continuation pages if excerpted), then cite the candidate revision in cited_revision_ids and copy its boxed answer unchanged. The reviewed candidate is the proof artifact; do not add new mathematical claims only in the final summary. If issues remain, continue investigating within the budget; an unresolved draft is not a completed answer.",
+                review="Save the complete candidate with an unambiguous boxed answer (identical repetitions are allowed), obtain an independent passed review of its current revision, read that review completely (read_object section=body with continuation pages if excerpted), then cite the candidate revision in cited_revision_ids and copy its boxed answer unchanged. The reviewed candidate is the proof artifact; do not add new mathematical claims only in the final summary. If issues remain, continue investigating within the budget; an unresolved draft is not a completed answer.",
             )
         task["operation_results"] = refreshed[-1]["actions"] if refreshed else []
         config = session.get(AgentRun, task["run_id"])

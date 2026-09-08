@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-PROMPT_VERSION = "research-operations-v4"
+PROMPT_VERSION = "research-operations-v5"
 
 
 class AgentAction(BaseModel):
@@ -110,6 +110,13 @@ def messages_for(task):
         )
     if task.get("repair_output") is not None:
         instruction += "\n上次响应不符合结构协议。请修复 repair_output 中的 JSON，仅纠正格式和字段约束，保留数学内容及不确定性；不要声称上次 actions 已执行。"
+    if task.get("output_limit_recovery") is not None:
+        instruction += (
+            "\n上次响应耗尽输出上限，未执行其中任何操作。本次是原预算内唯一一次输出截断恢复。"
+            "选择一个能在本次输出内完成的有限子目标，及时返回有用的局部结果和明确下一步；"
+            "无须在一次响应中解决全部困难。可参考 visible_fragment，但它不是已保存或已验证的状态。"
+            "保留不确定性，不得为结束任务编造证明或答案。"
+        )
     example = {"body": r"公式示例：行内 $a\ge b$；独立公式 $$\frac{a+b}{2}$$。",
                "findings": [r"所有出现的数学符号，例如 $a,b$，均放入数学环境。"]}
     return [
@@ -145,6 +152,7 @@ def messages_for(task):
                     "request_budget_status": task.get("request_budget_status"),
                     "operation_results": task.get("operation_results", []),
                     "repair_output": task.get("repair_output"),
+                    "output_limit_recovery": task.get("output_limit_recovery"),
                     "discussions": task.get("discussions", []),
                     "context_summary": task.get("context_summary", {}),
                 },

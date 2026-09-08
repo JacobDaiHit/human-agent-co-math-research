@@ -4319,6 +4319,15 @@
             ],
             "title": "Completion Policy",
             "default": "draft"
+          },
+          "length_recovery": {
+            "type": "string",
+            "enum": [
+              "none",
+              "high"
+            ],
+            "title": "Length Recovery",
+            "default": "none"
           }
         },
         "additionalProperties": false,
@@ -4406,6 +4415,15 @@
             ],
             "title": "Completion Policy",
             "default": "draft"
+          },
+          "length_recovery": {
+            "type": "string",
+            "enum": [
+              "none",
+              "high"
+            ],
+            "title": "Length Recovery",
+            "default": "none"
           }
         },
         "additionalProperties": false,

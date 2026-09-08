@@ -358,9 +358,13 @@ def score_report(report: dict, key: dict) -> dict:
     return classify_result({**common, **compare(candidate, key["short_answer"], key["answer_type"])})
 
 
-def score_batch(batch_dir: Path, answer_key: Path = DEFAULT_KEY) -> dict:
+def score_batch(batch_dir: Path, answer_key: Path = DEFAULT_KEY, *, case_ids=None) -> dict:
     raw_key = answer_key.read_bytes()
     keys = json.loads(raw_key)["answers"]
+    if case_ids is not None:
+        if not case_ids or len(set(case_ids)) != len(case_ids) or not set(case_ids) <= {key["id"] for key in keys}:
+            raise ValueError("Select nonempty, unique, known case IDs")
+        keys = [key for key in keys if key["id"] in case_ids]
     results = []
     for key in keys:
         report_path = batch_dir / key["id"] / "report.json"
@@ -381,6 +385,8 @@ def score_batch(batch_dir: Path, answer_key: Path = DEFAULT_KEY) -> dict:
     return {
         "schema_version": "1.1",
         "benchmark": "IMO-AnswerBench four-case integration sample",
+        "scope": "targeted_retest" if case_ids is not None else "full_fixture",
+        "case_ids": [key["id"] for key in keys],
         "grading_method": METHOD,
         "scorer_revision": SCORER_REVISION,
         "scorer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -440,6 +446,7 @@ def main() -> None:
     parser.add_argument("--batch-dir", "--run-dir", type=Path)
     parser.add_argument("--answer-key", type=Path, default=DEFAULT_KEY)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--case-id", action="append", help="Score only this explicitly selected case")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.worker:
@@ -448,7 +455,7 @@ def main() -> None:
         return
     if args.batch_dir is None:
         parser.error("--batch-dir is required")
-    result = score_batch(args.batch_dir, args.answer_key)
+    result = score_batch(args.batch_dir, args.answer_key, case_ids=args.case_id)
     output = args.output or default_score_output(args.batch_dir)
     try:
         write_score_output(output, result)

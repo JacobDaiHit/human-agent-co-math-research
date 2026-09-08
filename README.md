@@ -123,3 +123,5 @@ npm.cmd --prefix apps/web run test:e2e
 施工依据：[施工方案](施工方案/数学科研多Agent工作台_施工方案_v0.1.md)；阶段证据：[M0—M1](docs/acceptance/m0-m1.md)。
 
 离线阶段和后续联调进展见 [验收记录](docs/acceptance/api-readiness.md)。
+
+IMO-AnswerBench 修复后真实模型复测应通过 `--case-id` 指定失败题，保留历史批次；代码回归使用本地模拟调用。定向执行、输出截断恢复及独立评分命令见 [试测记录](docs/evaluation/imo-answerbench-pilot.md)。

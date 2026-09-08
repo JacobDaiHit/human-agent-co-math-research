@@ -85,7 +85,7 @@ def test_legacy_completion_endpoint_cannot_bypass_reviewed_answer_checks(app):
 
 
 @pytest.mark.parametrize("condition", [
-    "passed", "issues", "candidate_stale", "dependency_stale", "not_cited", "candidate_no_box", "different_answer", "review_excerpt",
+    "passed", "repeated_same_answer", "issues", "candidate_stale", "dependency_stale", "not_cited", "candidate_no_box", "different_answer", "review_excerpt",
 ])
 def test_finish_requires_current_passed_visible_cited_candidate_and_matching_answer(app, condition, monkeypatch):
     monkeypatch.setenv("MATHAGENT_ENABLE_REAL_API", "1")
@@ -104,6 +104,8 @@ def test_finish_requires_current_passed_visible_cited_candidate_and_matching_ans
             history = task["previous_steps"]
             if not history:
                 candidate = "A candidate without any final box." if condition == "candidate_no_box" else r"The candidate concludes $\boxed{2}$."
+                if condition == "repeated_same_answer":
+                    candidate = r"The calculation gives $\boxed{2}$. Thus the answer is $\boxed{2}$."
                 return result("Save the candidate for independent review.", [
                     action("write_draft", kind="claim", body=candidate),
                 ], next_action="continue")
@@ -139,9 +141,10 @@ def test_finish_requires_current_passed_visible_cited_candidate_and_matching_ans
         await HTTPWorker(client, providers=["deepseek"], provider_factory=lambda _: Script(), fake_delay_seconds=0).run(once=True)
         steps = (await api.get(f"/runs/{run['run_id']}/steps"))["steps"]
         assert len(steps) == 3
-        assert steps[-1]["state"] == ("completed" if condition == "passed" else "step_limit"), steps[-1]["actions"]
+        succeeds = condition in {"passed", "repeated_same_answer"}
+        assert steps[-1]["state"] == ("completed" if succeeds else "step_limit"), steps[-1]["actions"]
         feedback = [entry for entry in steps[-1]["actions"] if entry["type"] == "finish"]
-        if condition == "passed":
+        if succeeds:
             assert feedback == []
         else:
             assert len(feedback) == 1 and feedback[0]["status"] == "rejected"
