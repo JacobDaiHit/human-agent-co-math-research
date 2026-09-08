@@ -109,3 +109,13 @@ DeepSeek 发布的 V4-Flash IMOAnswerBench Pass@1 为 High $85.1\%$、Max $88.4\
 定向计划冻结完整原题文件哈希及所选题号，求解目录只复制所选题面，最高总调用数相应缩为十二次。评分也显式指定相同题号，单题复测成绩不能与历史三题拼接成同一批无人运行或全量基准成绩。
 
 启动前本地验证：全量 Python 测试 472 项通过（两项上游弃用警告），[XML 证据](../acceptance/python-answerbench-targeted-2026-09-08.xml)；执行器七项测试另对最终报告字段再次通过。Ruff、API 契约导出和前端构建通过；Vite 保留已有的大包体积提醒。本地测试只使用模拟推理，不计入真实模型调用。
+
+### 第三次真实结果：未完成，保留未知请求
+
+`answerbench-number-theory-run-03` 于 2026-09-08 12:35:47 至 12:44:38 UTC 执行，仅有原数论题；代码提交为 `2dace92`，工作树源码指纹为 `7dc3e1016a0d81e6288416db71d8c698084e01bf59cfeabd6bd2fb4d3f011eff`。结束时 `source_unchanged=true`、`all_unattended=true`、`human_interventions=0`；代数、组合、几何没有新增调用。
+
+该题只派发一次 Max 请求，传输未正常结束，保存原因为 `transport_outcome_unknown`；可见正文为空，没有 `finish_reason` 或 usage，不能把缺失 usage 计为零费用。账本保留一笔 `unknown` 占用，剩余十一笔额度，运行状态为 `reconciliation_required`，没有自动重发或清除未知状态。它发生在单次十分钟总上限之前，不能据此断言是总时限超时或输出截断。High 恢复只对明确 `length` 响应生效，本次没有触发，真实服务上的恢复效果仍未验证。
+
+见本地 [执行报告](../../data/benchmarks/answerbench-number-theory-run-03/report.json)、[该题完整记录](../../data/benchmarks/answerbench-number-theory-run-03/imo-bench-number_theory-081/report.json) 和 [离线评分](../../data/benchmarks/answerbench-number-theory-run-03/scores.json)。评分仅针对所选一题：没有最终答案，未完成；数学不等价答案数为零，不能把此运行故障解释为模型已经给出错误数学答案。没有证明、审查或成功结果可用于补足首批成绩。
+
+当前可报告的是：首批三道题的明确最终答案通过本地等价检查，数论尚未完整跑通。通用流程缺陷已修复并通过本地回归，数论的真实复测又暴露了外部传输可靠性限制；没有得到同批四题全部成功或全量基准 $100\%$ 的证据。原失败、冗余回归成本及未知请求均保留，未再启动其他付费批次。
