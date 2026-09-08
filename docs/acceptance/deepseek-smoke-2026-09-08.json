@@ -1,0 +1,32 @@
+{
+  "checked_at": "2026-09-08T07:52:47.074032+00:00",
+  "provider": "deepseek",
+  "simulated": false,
+  "scenario": "Single public arithmetic task: 2 + 2",
+  "project_id": "49647f37-7d32-4543-8acb-10d6d692e7ca",
+  "run_id": "e5831acd-dc5a-409b-878d-b2089fd3f6b9",
+  "output_revision_id": "dd2ae54e-cbdd-4f41-bba4-1e22869638e4",
+  "run_state": "completed",
+  "body": "2 + 2 = 4。",
+  "adoption_state": "draft",
+  "budget": {
+    "request_budget": 1,
+    "spent": 1,
+    "unknown": 0,
+    "released": 0,
+    "remaining": 0
+  },
+  "request_count": 1,
+  "usage": {
+    "prompt_tokens": 678,
+    "completion_tokens": 83,
+    "total_tokens": 761,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 678
+  },
+  "limitations": [
+    "One successful research request only.",
+    "No GLM, independent review, timeout, cancellation, rate limit, or mathematical research quality validation.",
+    "No credentials or model configuration values recorded."
+  ]
+}

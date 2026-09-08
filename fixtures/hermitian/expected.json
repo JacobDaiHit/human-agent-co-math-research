@@ -1,0 +1,13 @@
+{
+  "source": "blueprint_section_12_pre_authored_example",
+  "matrix": [["0", "t"], ["t", "0"]],
+  "parameter_domain": "real",
+  "characteristic_polynomial": {"lambda^2": "1", "lambda*t": "0", "t^2": "-1"},
+  "sorted_eigenvalues": ["-|t|", "|t|"],
+  "one_sided_derivatives_at_zero": {"left": ["1", "-1"], "right": ["-1", "1"]},
+  "analytic_branches": ["t", "-t"],
+  "original_conjecture": "refuted_by_this_example",
+  "general_analytic_labelling_question": "open_in_this_project",
+  "model_discovery": false,
+  "real_model_calls": 0
+}

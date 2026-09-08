@@ -1,0 +1,515 @@
+{
+  "checked_at": "2026-09-08T09:22:04.487836+00:00",
+  "provider": "deepseek",
+  "simulated": false,
+  "request_cap": 6,
+  "model_web_tools": false,
+  "api_transport": "isolated ASGI HTTP; OS-process recovery tested separately",
+  "provider_status": {
+    "real_api_gate": true,
+    "providers": [
+      {
+        "provider": "fake",
+        "configured": true,
+        "enabled": true,
+        "simulated": true,
+        "key_configured": false,
+        "model_configured": true,
+        "capabilities": {
+          "streaming": false,
+          "json_output": true,
+          "native_json_schema": false,
+          "executable_tools": false,
+          "cancellation": false,
+          "request_retrieval": false,
+          "server_idempotency": false
+        }
+      },
+      {
+        "provider": "deepseek",
+        "configured": true,
+        "key_configured": true,
+        "model_configured": true,
+        "enabled": true,
+        "simulated": false,
+        "capabilities": {
+          "streaming": true,
+          "json_output": true,
+          "native_json_schema": false,
+          "executable_tools": false,
+          "cancellation": false,
+          "request_retrieval": false,
+          "server_idempotency": false
+        }
+      },
+      {
+        "provider": "glm",
+        "configured": false,
+        "key_configured": false,
+        "model_configured": false,
+        "enabled": false,
+        "simulated": false,
+        "capabilities": {
+          "streaming": true,
+          "json_output": true,
+          "native_json_schema": false,
+          "executable_tools": false,
+          "cancellation": false,
+          "request_retrieval": false,
+          "server_idempotency": false
+        }
+      }
+    ]
+  },
+  "checks": {
+    "actual_calculation": false,
+    "model_proof_saved": true,
+    "separate_review": false,
+    "research_completed": false,
+    "no_automatic_adoption": true,
+    "accepted_request_edit_quarantined": false,
+    "resume_reads_new_revision": false,
+    "six_request_cap": true,
+    "no_unknown_requests": true,
+    "frozen_config_and_usage": true
+  },
+  "project_id": "c32025b8-1106-41dd-b50c-6db39e19b7a0",
+  "research_run_id": "e01e9bdd-4acf-490a-bb6c-b0e0a9ddf740",
+  "research_steps": [
+    {
+      "id": "67fc03bd-9ca8-45fb-b0dc-dd3329a125a1",
+      "run_id": "e01e9bdd-4acf-490a-bb6c-b0e0a9ddf740",
+      "attempt_id": "47c58171-a4af-4a98-8a8a-80b7dc9e4753",
+      "request_id": "3400dc80-094f-45f9-a5a6-fd37fd29b1b9",
+      "number": 1,
+      "state": "queued",
+      "body": "按指示执行：先调用 polynomial_identity 验证恒等式，然后为输入命题提交简洁完整证明。",
+      "actions": [
+        {
+          "type": "calculate",
+          "status": "rejected",
+          "error": "invalid_calculation_input"
+        },
+        {
+          "type": "propose_proof",
+          "status": "completed",
+          "result": {
+            "object_id": "8cd94bf0-602d-4e59-8c1a-c7e3fb3cfbe4",
+            "revision_id": "174bd377-4de1-4e3d-aaf0-bf9bd320e3da"
+          }
+        }
+      ],
+      "receipt": {
+        "run_id": "e01e9bdd-4acf-490a-bb6c-b0e0a9ddf740",
+        "state": "queued",
+        "continue": true,
+        "number": 1,
+        "output_revision_id": "cc44d36b-2ede-494c-a531-5cc477488d4c",
+        "quarantined": false
+      },
+      "output_revision_id": "cc44d36b-2ede-494c-a531-5cc477488d4c",
+      "created_at": "2026-09-08T09:22:21.960038+00:00"
+    },
+    {
+      "id": "34deeb18-3c4b-4355-8695-bd0195f51493",
+      "run_id": "e01e9bdd-4acf-490a-bb6c-b0e0a9ddf740",
+      "attempt_id": "618bb250-72ad-44ab-8627-16c2a04c1796",
+      "request_id": "07732d49-1bbc-4832-bad5-546cd1d7f9dc",
+      "number": 2,
+      "state": "waiting_children",
+      "body": "本步执行情况：\n- 调用 `calculate` 的 `polynomial_identity` 验证恒等式 $2(a^2+b^2+c^2-ab-bc-ca)=(a-b)^2+(b-c)^2+(c-a)^2$，但工具返回 `invalid_calculation_input`，未完成该恒等式验证。\n- 随后通过 `propose_proof` 提交了命题 $(a+b+c)^2\\ge3(ab+bc+ca)$ 的证明，成功，得到论证 revision_id `174bd377-4de1-4e3d-aaf0-bf9bd320e3da`。\n\n该论证依赖上述恒等式；由于 `calculate` 失败，恒等式尚无机器验证，但它是标准代数展开，作为已提交证明的一部分。现请求独立审查。",
+      "actions": [
+        {
+          "type": "request_review",
+          "status": "completed",
+          "result": {
+            "run_id": "922bb34f-28b5-4079-940d-356cb557b0e2",
+            "state": "queued",
+            "provider": "deepseek",
+            "simulated": false,
+            "mode": "review",
+            "request_budget": 1
+          }
+        }
+      ],
+      "receipt": {
+        "run_id": "e01e9bdd-4acf-490a-bb6c-b0e0a9ddf740",
+        "state": "waiting_children",
+        "continue": false,
+        "number": 2,
+        "output_revision_id": "5d55310b-eb0a-4ead-836f-1078bbe8d56c",
+        "quarantined": false
+      },
+      "output_revision_id": "5d55310b-eb0a-4ead-836f-1078bbe8d56c",
+      "created_at": "2026-09-08T09:22:38.871855+00:00"
+    }
+  ],
+  "intervention_run_id": "0d781b73-ec8d-410a-ba27-46b71360ab58",
+  "budget": {
+    "project_id": "c32025b8-1106-41dd-b50c-6db39e19b7a0",
+    "run_id": null,
+    "request_budget": 6,
+    "reserved": 0,
+    "dispatched": 0,
+    "spent": 5,
+    "unknown": 0,
+    "released": 0,
+    "occupied": 5,
+    "remaining": 1,
+    "unit": "requests",
+    "requests": [
+      {
+        "request_id": "3400dc80-094f-45f9-a5a6-fd37fd29b1b9",
+        "run_id": "e01e9bdd-4acf-490a-bb6c-b0e0a9ddf740",
+        "attempt_id": "47c58171-a4af-4a98-8a8a-80b7dc9e4753",
+        "provider": "deepseek",
+        "state": "spent",
+        "usage": {
+          "prompt_tokens": 4787,
+          "completion_tokens": 1929,
+          "total_tokens": 6716,
+          "prompt_cache_hit_tokens": 0,
+          "prompt_cache_miss_tokens": 4787
+        },
+        "reason": "",
+        "provider_request_id": "f00fed35-bf7a-497e-b2cd-02049e98b331",
+        "created_at": "2026-09-08T09:22:04.605738+00:00",
+        "simulated": false
+      },
+      {
+        "request_id": "07732d49-1bbc-4832-bad5-546cd1d7f9dc",
+        "run_id": "e01e9bdd-4acf-490a-bb6c-b0e0a9ddf740",
+        "attempt_id": "618bb250-72ad-44ab-8627-16c2a04c1796",
+        "provider": "deepseek",
+        "state": "spent",
+        "usage": {
+          "prompt_tokens": 6530,
+          "completion_tokens": 1795,
+          "total_tokens": 8325,
+          "prompt_cache_hit_tokens": 0,
+          "prompt_cache_miss_tokens": 6530
+        },
+        "reason": "",
+        "provider_request_id": "a8c2fc35-b30f-45ae-a933-ce6d5a9ec715",
+        "created_at": "2026-09-08T09:22:22.112575+00:00",
+        "simulated": false
+      },
+      {
+        "request_id": "c2d65ff6-61ed-4514-9c62-24df5d599593",
+        "run_id": "922bb34f-28b5-4079-940d-356cb557b0e2",
+        "attempt_id": "d2e7b641-296d-4a14-b514-9e6e6a2e1089",
+        "provider": "deepseek",
+        "state": "spent",
+        "usage": {
+          "prompt_tokens": 2854,
+          "completion_tokens": 2048,
+          "total_tokens": 4902,
+          "prompt_cache_hit_tokens": 0,
+          "prompt_cache_miss_tokens": 2854
+        },
+        "reason": "incomplete_output",
+        "provider_request_id": "28bb1baa-661c-4d37-9af7-3dbd6622e861",
+        "created_at": "2026-09-08T09:22:39.001656+00:00",
+        "simulated": false
+      },
+      {
+        "request_id": "c7206625-d45d-4022-8847-ea05343f5fe8",
+        "run_id": "e01e9bdd-4acf-490a-bb6c-b0e0a9ddf740",
+        "attempt_id": "a033a6bc-cae1-42f8-ba79-4b90da862038",
+        "provider": "deepseek",
+        "state": "spent",
+        "usage": {
+          "prompt_tokens": 6914,
+          "completion_tokens": 2048,
+          "total_tokens": 8962,
+          "prompt_cache_hit_tokens": 3456,
+          "prompt_cache_miss_tokens": 3458
+        },
+        "reason": "incomplete_output",
+        "provider_request_id": "89c14042-bb4e-4a93-be91-da63ef89f380",
+        "created_at": "2026-09-08T09:22:57.897166+00:00",
+        "simulated": false
+      },
+      {
+        "request_id": "547d0015-5e78-48dd-952b-62b9f083b16f",
+        "run_id": "0d781b73-ec8d-410a-ba27-46b71360ab58",
+        "attempt_id": "61a938ba-0090-44c6-ac5b-a40475c8d595",
+        "provider": "deepseek",
+        "state": "spent",
+        "usage": {
+          "prompt_tokens": 6130,
+          "completion_tokens": 1024,
+          "total_tokens": 7154,
+          "prompt_cache_hit_tokens": 0,
+          "prompt_cache_miss_tokens": 6130
+        },
+        "reason": "incomplete_output",
+        "provider_request_id": "6803140e-1757-4e97-bbe6-62c2d3b861ee",
+        "created_at": "2026-09-08T09:23:18.473197+00:00",
+        "simulated": false
+      }
+    ]
+  },
+  "calls": [
+    {
+      "request_id": "3400dc80-094f-45f9-a5a6-fd37fd29b1b9",
+      "attempt_id": "47c58171-a4af-4a98-8a8a-80b7dc9e4753",
+      "call_config": {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash-vision-exp",
+        "parameters": {
+          "stream": true,
+          "response_format": {
+            "type": "json_object"
+          },
+          "max_tokens": 2048
+        },
+        "request_timeout_seconds": 180,
+        "transport_timeout_seconds": {
+          "connect": 10,
+          "read": 120,
+          "write": 120,
+          "pool": 120
+        },
+        "prompt_template_version": "research-operations-v1",
+        "prompt_template_sha256": "3ca8c399cecd3d33831b0c4d8a33026ff4d9db9db1c51c104ab1175d2cda7fce",
+        "prompt_sha256": "48aa0f7c1d6ea2191f5b03c2306208628af500e9b407551c7015b713609c0723"
+      },
+      "raw_text": "{\"mode\":\"research\",\"body\":\"按指示执行：先调用 polynomial_identity 验证恒等式，然后为输入命题提交简洁完整证明。\",\"findings\":[\"输入命题为：对任意实数 a,b,c，(a+b+c)^2 ≥ 3(ab+bc+ca)，等号当且仅当 a=b=c。\",\"已构造代数证明：差式等于二分之一平方和，故非负，等号条件明确。\",\"将提交 calculate 和 propose_proof 两个操作。\"],\"actions\":[{\"type\":\"calculate\",\"arguments\":{\"tool\":\"polynomial_identity\",\"inputs\":{\"lhs\":\"2*((a+b+c)^2 - 3*(a*b+b*c+c*a))\",\"rhs\":\"(a-b)^2 + (b-c)^2 + (c-a)^2\"}}},{\"type\":\"propose_proof\",\"arguments\":{\"conclusion_revision_id\":\"52ff0d53-ed76-47d8-8edb-2e1638f0dfc5\",\"body\":\"对任意实数 $a,b,c$，有\\n\\n$$(a+b+c)^2 - 3(ab+bc+ca) = a^2+b^2+c^2+2ab+2bc+2ca - 3ab-3bc-3ca = a^2+b^2+c^2 - ab - bc - ca.$$\\n\\n而\\n\\n$$2(a^2+b^2+c^2 - ab - bc - ca) = (a-b)^2 + (b-c)^2 + (c-a)^2,$$\\n\\n因此\\n\\n$$(a+b+c)^2 - 3(ab+bc+ca) = \\\\frac{1}{2}\\\\left[(a-b)^2 + (b-c)^2 + (c-a)^2\\\\right] \\\\ge 0.$$\\n\\n等号当且仅当 $a=b$、$b=c$、$c=a$，即 $a=b=c$。\",\"gaps\":[],\"rule\":\"direct\"}}],\"next_action\":\"continue\",\"cited_revision_ids\":[\"52ff0d53-ed76-47d8-8edb-2e1638f0dfc5\"],\"verdict\":null,\"scope\":null}",
+      "raw_text_truncated": false,
+      "raw_sha256": "7a63847c11a8b204f3b9b2f6313f6b9618d8e99fc6943b887c10ff99f9122138",
+      "finish_reason": "stop",
+      "complete": true,
+      "usage": {
+        "prompt_tokens": 4787,
+        "completion_tokens": 1929,
+        "total_tokens": 6716,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 4787
+      },
+      "provider_request_id": "f00fed35-bf7a-497e-b2cd-02049e98b331",
+      "result": {
+        "mode": "research",
+        "body": "按指示执行：先调用 polynomial_identity 验证恒等式，然后为输入命题提交简洁完整证明。",
+        "findings": [
+          "输入命题为：对任意实数 a,b,c，(a+b+c)^2 ≥ 3(ab+bc+ca)，等号当且仅当 a=b=c。",
+          "已构造代数证明：差式等于二分之一平方和，故非负，等号条件明确。",
+          "将提交 calculate 和 propose_proof 两个操作。"
+        ],
+        "cited_revision_ids": [
+          "52ff0d53-ed76-47d8-8edb-2e1638f0dfc5"
+        ],
+        "verdict": null,
+        "scope": null,
+        "actions": [
+          {
+            "type": "calculate",
+            "arguments": {
+              "tool": "polynomial_identity",
+              "inputs": {
+                "lhs": "2*((a+b+c)^2 - 3*(a*b+b*c+c*a))",
+                "rhs": "(a-b)^2 + (b-c)^2 + (c-a)^2"
+              }
+            }
+          },
+          {
+            "type": "propose_proof",
+            "arguments": {
+              "conclusion_revision_id": "52ff0d53-ed76-47d8-8edb-2e1638f0dfc5",
+              "body": "对任意实数 $a,b,c$，有\n\n$$(a+b+c)^2 - 3(ab+bc+ca) = a^2+b^2+c^2+2ab+2bc+2ca - 3ab-3bc-3ca = a^2+b^2+c^2 - ab - bc - ca.$$\n\n而\n\n$$2(a^2+b^2+c^2 - ab - bc - ca) = (a-b)^2 + (b-c)^2 + (c-a)^2,$$\n\n因此\n\n$$(a+b+c)^2 - 3(ab+bc+ca) = \\frac{1}{2}\\left[(a-b)^2 + (b-c)^2 + (c-a)^2\\right] \\ge 0.$$\n\n等号当且仅当 $a=b$、$b=c$、$c=a$，即 $a=b=c$。",
+              "gaps": [],
+              "rule": "direct"
+            }
+          }
+        ],
+        "next_action": "continue"
+      },
+      "created_at": "2026-09-08T09:22:04.618653+00:00"
+    },
+    {
+      "request_id": "07732d49-1bbc-4832-bad5-546cd1d7f9dc",
+      "attempt_id": "618bb250-72ad-44ab-8627-16c2a04c1796",
+      "call_config": {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash-vision-exp",
+        "parameters": {
+          "stream": true,
+          "response_format": {
+            "type": "json_object"
+          },
+          "max_tokens": 2048
+        },
+        "request_timeout_seconds": 180,
+        "transport_timeout_seconds": {
+          "connect": 10,
+          "read": 120,
+          "write": 120,
+          "pool": 120
+        },
+        "prompt_template_version": "research-operations-v1",
+        "prompt_template_sha256": "3ca8c399cecd3d33831b0c4d8a33026ff4d9db9db1c51c104ab1175d2cda7fce",
+        "prompt_sha256": "e87513ccd9ce5c14ae5445438ba908f49a75c0fa1b38fdb937e0c6429d9e8125"
+      },
+      "raw_text": "{\"mode\":\"research\",\"body\":\"本步执行情况：\\n- 调用 `calculate` 的 `polynomial_identity` 验证恒等式 $2(a^2+b^2+c^2-ab-bc-ca)=(a-b)^2+(b-c)^2+(c-a)^2$，但工具返回 `invalid_calculation_input`，未完成该恒等式验证。\\n- 随后通过 `propose_proof` 提交了命题 $(a+b+c)^2\\\\ge3(ab+bc+ca)$ 的证明，成功，得到论证 revision_id `174bd377-4de1-4e3d-aaf0-bf9bd320e3da`。\\n\\n该论证依赖上述恒等式；由于 `calculate` 失败，恒等式尚无机器验证，但它是标准代数展开，作为已提交证明的一部分。现请求独立审查。\",\"findings\":[\"calculate polynomial_identity 调用被拒绝（invalid_calculation_input），未完成恒等式验证。\",\"propose_proof 提交成功，得到论证 revision_id 174bd377-4de1-4e3d-aaf0-bf9bd320e3da。\",\"该论证使用恒等式 2(a^2+b^2+c^2-ab-bc-ca)=(a-b)^2+(b-c)^2+(c-a)^2，由于 calculate 失败，该恒等式尚未由工具验证，但属于标准代数展开。\"],\"cited_revision_ids\":[\"174bd377-4de1-4e3d-aaf0-bf9bd320e3da\",\"52ff0d53-ed76-47d8-8edb-2e1638f0dfc5\"],\"actions\":[{\"type\":\"request_review\",\"arguments\":{\"target_revision_id\":\"174bd377-4de1-4e3d-aaf0-bf9bd320e3da\",\"instruction\":\"请独立检查论证的前提、各步及可能的缺口，特别关注恒等式 2(a^2+b^2+c^2-ab-bc-ca)=(a-b)^2+(b-c)^2+(c-a)^2 的正确性。\"}}],\"next_action\":\"wait\"}",
+      "raw_text_truncated": false,
+      "raw_sha256": "4a7dfcf17cf262d89b8499655c3b5e18673511b9035429a77cc7ebb456658243",
+      "finish_reason": "stop",
+      "complete": true,
+      "usage": {
+        "prompt_tokens": 6530,
+        "completion_tokens": 1795,
+        "total_tokens": 8325,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 6530
+      },
+      "provider_request_id": "a8c2fc35-b30f-45ae-a933-ce6d5a9ec715",
+      "result": {
+        "mode": "research",
+        "body": "本步执行情况：\n- 调用 `calculate` 的 `polynomial_identity` 验证恒等式 $2(a^2+b^2+c^2-ab-bc-ca)=(a-b)^2+(b-c)^2+(c-a)^2$，但工具返回 `invalid_calculation_input`，未完成该恒等式验证。\n- 随后通过 `propose_proof` 提交了命题 $(a+b+c)^2\\ge3(ab+bc+ca)$ 的证明，成功，得到论证 revision_id `174bd377-4de1-4e3d-aaf0-bf9bd320e3da`。\n\n该论证依赖上述恒等式；由于 `calculate` 失败，恒等式尚无机器验证，但它是标准代数展开，作为已提交证明的一部分。现请求独立审查。",
+        "findings": [
+          "calculate polynomial_identity 调用被拒绝（invalid_calculation_input），未完成恒等式验证。",
+          "propose_proof 提交成功，得到论证 revision_id 174bd377-4de1-4e3d-aaf0-bf9bd320e3da。",
+          "该论证使用恒等式 2(a^2+b^2+c^2-ab-bc-ca)=(a-b)^2+(b-c)^2+(c-a)^2，由于 calculate 失败，该恒等式尚未由工具验证，但属于标准代数展开。"
+        ],
+        "cited_revision_ids": [
+          "174bd377-4de1-4e3d-aaf0-bf9bd320e3da",
+          "52ff0d53-ed76-47d8-8edb-2e1638f0dfc5"
+        ],
+        "verdict": null,
+        "scope": null,
+        "actions": [
+          {
+            "type": "request_review",
+            "arguments": {
+              "target_revision_id": "174bd377-4de1-4e3d-aaf0-bf9bd320e3da",
+              "instruction": "请独立检查论证的前提、各步及可能的缺口，特别关注恒等式 2(a^2+b^2+c^2-ab-bc-ca)=(a-b)^2+(b-c)^2+(c-a)^2 的正确性。"
+            }
+          }
+        ],
+        "next_action": "wait"
+      },
+      "created_at": "2026-09-08T09:22:22.134764+00:00"
+    },
+    {
+      "request_id": "c7206625-d45d-4022-8847-ea05343f5fe8",
+      "attempt_id": "a033a6bc-cae1-42f8-ba79-4b90da862038",
+      "call_config": {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash-vision-exp",
+        "parameters": {
+          "stream": true,
+          "response_format": {
+            "type": "json_object"
+          },
+          "max_tokens": 2048
+        },
+        "request_timeout_seconds": 180,
+        "transport_timeout_seconds": {
+          "connect": 10,
+          "read": 120,
+          "write": 120,
+          "pool": 120
+        },
+        "prompt_template_version": "research-operations-v1",
+        "prompt_template_sha256": "3ca8c399cecd3d33831b0c4d8a33026ff4d9db9db1c51c104ab1175d2cda7fce",
+        "prompt_sha256": "78a27fe2838ed62dd0159f9daff22135e6a36cf721dc0907204caf30d9bba99c"
+      },
+      "raw_text": "{\"mode\": \"research\", \"body\": \"已核对实际审查结果。输入命题为：对任意实数 $a,b,c$，证明 $(a+b+c)^2\\\\ge3(ab+bc+ca)$，并确定等号条件。已提交论证 revision_id `174bd377-4de1-4e3d-aaf0-bf9bd320e3da`，其核心是恒等式 $$2(a^2+b^2+c^2-ab-bc-ca)=(a-b)^2+(b-c)^2+(c-a)^2,$$ 并由此得出差值非负。然而，`calculate` 的 `polynomial_identity` 调用被拒绝（`invalid_calculation_input`），恒等式未获得机器验证；随后请求的独立审查运行 `922bb34f-28b5-4079-940d-356cb557b0e2` 状态为 `failed`，无实际审查返回。因此，该证明虽为标准代数展开，但未经过工具验证和独立审查，当前状态仅为草稿，未被独立确认。局限：本次仅依据输入中的文本和回执，未进行额外计算或验证；无法排除手工展开中的笔误。\", \"findings\": [\"证明文本已提交（revision_id `174bd377-4de1-4e3d-aaf0-bf9bd320e3da`），但恒等式验证的 `calculate` 调用失败，返回 `invalid_calculation_input`。\", \"独立审查运行 `922bb34f-28b5-4079-940d-356cb557b0e2` 状态为 `failed`，未产生任何审查结论。\", \"对于",
+      "raw_text_truncated": false,
+      "raw_sha256": "c5bcb132fb80428bc0f5e844feb4bc381c4958a64eb48711b0770b37db472b9f",
+      "finish_reason": "length",
+      "complete": false,
+      "usage": {
+        "prompt_tokens": 6914,
+        "completion_tokens": 2048,
+        "total_tokens": 8962,
+        "prompt_cache_hit_tokens": 3456,
+        "prompt_cache_miss_tokens": 3458
+      },
+      "provider_request_id": "89c14042-bb4e-4a93-be91-da63ef89f380",
+      "result": null,
+      "created_at": "2026-09-08T09:22:57.933136+00:00"
+    },
+    {
+      "request_id": "c2d65ff6-61ed-4514-9c62-24df5d599593",
+      "attempt_id": "d2e7b641-296d-4a14-b514-9e6e6a2e1089",
+      "call_config": {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash-vision-exp",
+        "parameters": {
+          "stream": true,
+          "response_format": {
+            "type": "json_object"
+          },
+          "max_tokens": 2048
+        },
+        "request_timeout_seconds": 180,
+        "transport_timeout_seconds": {
+          "connect": 10,
+          "read": 120,
+          "write": 120,
+          "pool": 120
+        },
+        "prompt_template_version": "research-operations-v1",
+        "prompt_template_sha256": "87ab6ac3e4e32e9728f6142380f9fdbf92f1139f81496f8aa8d131ff4ce4a34e",
+        "prompt_sha256": "b245666a9794f9ee13ce6476cf2e8c2c5ea3a16007ffe12ba8487ed5809a7407"
+      },
+      "raw_text": "",
+      "raw_text_truncated": false,
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "finish_reason": "length",
+      "complete": false,
+      "usage": {
+        "prompt_tokens": 2854,
+        "completion_tokens": 2048,
+        "total_tokens": 4902,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 2854
+      },
+      "provider_request_id": "28bb1baa-661c-4d37-9af7-3dbd6622e861",
+      "result": null,
+      "created_at": "2026-09-08T09:22:39.021952+00:00"
+    },
+    {
+      "request_id": "547d0015-5e78-48dd-952b-62b9f083b16f",
+      "attempt_id": "61a938ba-0090-44c6-ac5b-a40475c8d595",
+      "call_config": {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash-vision-exp",
+        "parameters": {
+          "stream": true,
+          "response_format": {
+            "type": "json_object"
+          },
+          "max_tokens": 1024
+        },
+        "request_timeout_seconds": 180,
+        "transport_timeout_seconds": {
+          "connect": 10,
+          "read": 120,
+          "write": 120,
+          "pool": 120
+        },
+        "prompt_template_version": "research-operations-v1",
+        "prompt_template_sha256": "08ac02108aaaea73fe1dadddaf4b9c472912906316e0c4f9f9ccdeb8390b7df9",
+        "prompt_sha256": "46d032ba7e435b6a2358398ce8e9947e3f282312660a5498b1c152bc0c126e46"
+      },
+      "raw_text": "",
+      "raw_text_truncated": false,
+      "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "finish_reason": "length",
+      "complete": false,
+      "usage": {
+        "prompt_tokens": 6130,
+        "completion_tokens": 1024,
+        "total_tokens": 7154,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 6130
+      },
+      "provider_request_id": "6803140e-1757-4e97-bbe6-62c2d3b861ee",
+      "result": null,
+      "created_at": "2026-09-08T09:23:18.494614+00:00"
+    }
+  ],
+  "passed": false
+}

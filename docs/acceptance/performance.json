@@ -1,0 +1,227 @@
+{
+  "benchmark": "synthetic_local_sqlite_http_scale",
+  "started_at_utc": "2026-09-08T07:04:48.958968+00:00",
+  "duration_seconds": 26.574,
+  "environment": {
+    "python": "3.13.5",
+    "implementation": "CPython",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "logical_cpu_count": 20,
+    "sqlite": "3.49.1",
+    "packages": {
+      "fastapi": "0.141.1",
+      "sqlalchemy": "2.0.52",
+      "uvicorn": "0.52.4",
+      "httpx": "0.28.1"
+    }
+  },
+  "method": {
+    "transport": "Real loopback HTTP to a separate uvicorn process; persistent real SQLite file in local temporary directory.",
+    "timing": "perf_counter_ns before HTTP request through full response body decode; excludes fixture setup and process startup.",
+    "p95_method": "Nearest rank: sorted_samples[ceil(0.95 * n) - 1].",
+    "command": "POST /objects/{id}/revisions with unique idempotency keys and current expected_revision_id.",
+    "concurrency": "Two independent HTTP clients start each mutation round at a barrier, updating different lemma objects on one branch.",
+    "snapshot": "GET /projects/{id}/snapshot on one client after mutations; 3 warmup snapshots excluded.",
+    "dataset": "1 problem, 20 definition contexts, 179 claims, 100 draft proof plans, 400 declared dependencies, 1000 research relations; all synthetic.",
+    "fixture_setup_seconds": 13.511,
+    "concurrent_command_clients": 2,
+    "real_model_calls": 0,
+    "model_workers_started": 0,
+    "synthetic_fixtures": true
+  },
+  "command_receipt_latency": {
+    "sample_count": 40,
+    "minimum_ms": 129.325,
+    "median_ms": 229.237,
+    "mean_ms": 248.323,
+    "p95_ms": 415.882,
+    "maximum_ms": 469.817,
+    "samples_ms": [
+      165.509,
+      370.181,
+      129.867,
+      136.928,
+      391.973,
+      338.243,
+      183.298,
+      451.782,
+      151.737,
+      162.484,
+      415.882,
+      149.361,
+      149.734,
+      136.786,
+      135.717,
+      129.325,
+      152.317,
+      143.324,
+      303.791,
+      145.982,
+      316.036,
+      138.771,
+      294.596,
+      295.355,
+      157.027,
+      160.248,
+      469.817,
+      178.927,
+      326.634,
+      331.258,
+      173.554,
+      319.233,
+      304.86,
+      343.031,
+      275.176,
+      283.311,
+      394.587,
+      287.458,
+      141.975,
+      396.853
+    ]
+  },
+  "command_clients": [
+    {
+      "client": 1,
+      "latency": {
+        "sample_count": 20,
+        "minimum_ms": 129.325,
+        "median_ms": 152.027,
+        "mean_ms": 217.211,
+        "p95_ms": 415.882,
+        "maximum_ms": 451.782,
+        "samples_ms": [
+          165.509,
+          370.181,
+          129.867,
+          136.928,
+          391.973,
+          338.243,
+          183.298,
+          451.782,
+          151.737,
+          162.484,
+          415.882,
+          149.361,
+          149.734,
+          136.786,
+          135.717,
+          129.325,
+          152.317,
+          143.324,
+          303.791,
+          145.982
+        ]
+      }
+    },
+    {
+      "client": 2,
+      "latency": {
+        "sample_count": 20,
+        "minimum_ms": 138.771,
+        "median_ms": 294.976,
+        "mean_ms": 279.435,
+        "p95_ms": 396.853,
+        "maximum_ms": 469.817,
+        "samples_ms": [
+          316.036,
+          138.771,
+          294.596,
+          295.355,
+          157.027,
+          160.248,
+          469.817,
+          178.927,
+          326.634,
+          331.258,
+          173.554,
+          319.233,
+          304.86,
+          343.031,
+          275.176,
+          283.311,
+          394.587,
+          287.458,
+          141.975,
+          396.853
+        ]
+      }
+    }
+  ],
+  "snapshot_latency": {
+    "sample_count": 20,
+    "minimum_ms": 98.707,
+    "median_ms": 111.809,
+    "mean_ms": 118.204,
+    "p95_ms": 140.234,
+    "maximum_ms": 185.493,
+    "samples_ms": [
+      106.26,
+      113.999,
+      101.862,
+      101.413,
+      121.427,
+      124.596,
+      125.398,
+      125.659,
+      108.483,
+      185.493,
+      125.321,
+      123.789,
+      124.518,
+      140.234,
+      107.389,
+      109.62,
+      107.014,
+      104.784,
+      98.707,
+      108.109
+    ],
+    "response_bytes_min": 819435,
+    "response_bytes_max": 819435
+  },
+  "budgets": {
+    "command_receipt": {
+      "target_p95_ms_exclusive": 1000,
+      "measured_p95_ms": 415.882,
+      "passed": true
+    },
+    "snapshot_diagnostic": {
+      "comparison_ms": 2000,
+      "measured_p95_ms": 140.234,
+      "under_comparison": true,
+      "ui_acceptance": false
+    },
+    "submission_to_ui_update": {
+      "target_ms": 2000,
+      "measured": false,
+      "passed": null
+    }
+  },
+  "persistence_verification": {
+    "counts": {
+      "objects": 300,
+      "revisions": 340,
+      "relations": 1000,
+      "proof_plans": 100,
+      "dependencies": 400,
+      "manuscript_blocks": 300,
+      "runs": 0,
+      "attempts": 0,
+      "conflicts": 0,
+      "command_receipts": 1340,
+      "events": 1340
+    },
+    "journal_mode": "wal",
+    "quick_check": "ok",
+    "all_measured_receipts_committed": true,
+    "final_heads_match_receipts": true
+  },
+  "limitations": [
+    "The 2-second plan target concerns submission-to-UI updates. This script does not measure SSE delivery, browser render, React Flow layout, or user interaction; snapshot latency alone cannot establish that target.",
+    "Two concurrent command clients exercise SQLite writer contention; they are not two model-executing workers.",
+    "Synthetic short draft bodies and unadopted proof plans do not represent large attachments, long histories, or worst-case adopted AND/OR proof analysis.",
+    "This is one warm local run on the recorded machine under its current load, not a universal performance guarantee or cold-start measurement."
+  ]
+}
