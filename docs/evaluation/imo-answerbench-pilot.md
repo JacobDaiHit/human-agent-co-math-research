@@ -145,3 +145,5 @@ DeepSeek 发布的 V4-Flash IMOAnswerBench Pass@1 为 High $85.1\%$、Max $88.4\
 第四批执行期间，用户要求“今天先暂停测试吧”。通过正常分支干预事务设置 `paused`；当时主任务有一笔在途请求，返回 `pause_requested`，在执行边界生效。已阻止后续派发、格式修复和新批次；不自动恢复测试。暂停回执保存在 `data/benchmarks/answerbench-number-theory-run-04/user-pause-testing-today.json`。
 
 暂停前第一笔 High 请求正常完成，输出用量为 47,047 tokens，产生一次项目内检索操作；第二笔已发出。此时尚无候选审查或最终答案。在途请求由原运行器按原上限结束并保存账本，未宣称已经停止外部推理或确认最终费用。第四批存在用户暂停干预，不能作为完整的无人基准成绩。
+
+2026-09-08 13:13:05 UTC 已确认在途调用收尾、运行器退出，最终状态为 `paused`。本轮仅两次请求，两次均正常收到 `finish_reason=stop`，账本为两次 `spent`、零次 `unknown`，没有第三次派发。输入/输出合计 124,362 tokens；没有独立审查或可评分最终答案。原报告、两份派发记录和 `research-export.zip` 均保存。暂停后只核对收尾与记录，不运行评分、回归测试或新模型请求；等待用户明确恢复。
