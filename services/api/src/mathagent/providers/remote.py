@@ -101,6 +101,25 @@ class ProviderFailure(Exception):
         )
 
 
+def transport_failure_code(error):
+    """Allowlisted categories, never exception text, URLs, headers or OS messages."""
+    for error_type, code in (
+        (httpx.ReadTimeout, "transport_read_timeout"),
+        (httpx.WriteTimeout, "transport_write_timeout"),
+        (httpx.ConnectTimeout, "transport_connect_timeout"),
+        (httpx.PoolTimeout, "transport_pool_timeout"),
+        (httpx.RemoteProtocolError, "transport_remote_protocol_error"),
+        (httpx.LocalProtocolError, "transport_local_protocol_error"),
+        (httpx.ReadError, "transport_read_error"),
+        (httpx.WriteError, "transport_write_error"),
+        (httpx.ConnectError, "transport_connect_error"),
+        (httpx.ProxyError, "transport_proxy_error"),
+    ):
+        if isinstance(error, error_type):
+            return code
+    return "transport_outcome_unknown"
+
+
 class RemoteProvider:
     capabilities = Capabilities()
     simulated = False
@@ -187,6 +206,7 @@ class RemoteProvider:
         observation = RequestObservation(config, {"provider": config.name, "model": config.model})
         own_client = self.client is None
         client = self.client
+        response_started = False
         try:
             task, payload, call_config = self._prepare(task, config)
             observation.call_config = call_config
@@ -221,6 +241,7 @@ class RemoteProvider:
                     timeout=timeout,
                     follow_redirects=False,
                 ) as response:
+                    response_started = True
                     if response.status_code != 200:
                         status = response.status_code
                         raw, _ = await self._read_body(response, observation)
@@ -257,20 +278,20 @@ class RemoteProvider:
         except ProviderFailure as error:
             error.observation = observation.snapshot()
             raise
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as error:
             raise ProviderFailure(
-                "connection_not_established",
-                outcome="unaccepted",
-                retryable=True,
+                transport_failure_code(error) if response_started else "connection_not_established",
+                outcome="unknown" if response_started else "unaccepted",
+                retryable=not response_started,
                 observation=observation.snapshot(),
             ) from None
         except TimeoutError:
             raise ProviderFailure(
                 "request_deadline_exceeded", observation=observation.snapshot()
             ) from None
-        except httpx.TransportError:
+        except httpx.TransportError as error:
             raise ProviderFailure(
-                "transport_outcome_unknown", observation=observation.snapshot()
+                transport_failure_code(error), observation=observation.snapshot()
             ) from None
         except (ValueError, TypeError, KeyError, AttributeError):
             raise ProviderFailure(

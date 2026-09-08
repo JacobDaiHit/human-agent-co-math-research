@@ -107,6 +107,8 @@ def test_output_limit_recovery_is_opt_in_bounded_and_preserves_ledger(app, monke
         budget_result = await api.get(f"/runs/{run['run_id']}/budget")
         assert budget_result["occupied"] == expected
         assert budget_result["unknown"] == (1 if failure == "timeout" else 0)
+        if failure == "timeout":
+            assert budget_result["requests"][0]["reason"] == "transport_read_timeout"
         steps = (await api.get(f"/runs/{run['run_id']}/steps"))["steps"]
         assert len(steps) == (1 if expected == 2 and not repeated else 0)
         calls = (await api.get(f"/runs/{run['run_id']}/calls"))["calls"]

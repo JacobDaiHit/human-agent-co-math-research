@@ -257,6 +257,37 @@ def test_partial_nonstream_response_is_retained_after_read_failure():
     assert caught.value.outcome == "unknown"
 
 
+@pytest.mark.parametrize("error_type,code", [
+    (httpx.ReadTimeout, "transport_read_timeout"),
+    (httpx.WriteTimeout, "transport_write_timeout"),
+    (httpx.RemoteProtocolError, "transport_remote_protocol_error"),
+    (httpx.ReadError, "transport_read_error"),
+    (httpx.WriteError, "transport_write_error"),
+    (httpx.TransportError, "transport_outcome_unknown"),
+    (httpx.ConnectError, "transport_connect_error"),
+])
+def test_post_response_transport_categories_are_safe_and_never_retryable(error_type, code):
+    error = error_type(f"Private URL https://user:{SECRET}@mock.invalid/?credential={SECRET}")
+    with pytest.raises(ProviderFailure) as caught:
+        call(lambda _: httpx.Response(200,
+            stream=Chunks([frame(), error]), headers={"content-type": "text/event-stream"}))
+    failure = caught.value
+    assert failure.code == code
+    assert failure.outcome == "unknown" and not failure.retryable
+    assert failure.observation["provider_request_id"] == "synthetic-request-id"
+    assert SECRET not in str(failure) + json.dumps(failure.observation)
+    assert "Private URL" not in str(failure) + json.dumps(failure.observation)
+
+
+def test_connection_failure_before_response_remains_confirmed_unaccepted():
+    def transport(_):
+        raise httpx.ConnectError("Synthetic connection failure")
+    with pytest.raises(ProviderFailure) as caught:
+        call(transport)
+    assert caught.value.code == "connection_not_established"
+    assert caught.value.outcome == "unaccepted" and caught.value.retryable
+
+
 def test_total_deadline_interrupts_a_stream_that_keeps_sending_heartbeats():
     class Endless(httpx.AsyncByteStream):
         async def __aiter__(self):

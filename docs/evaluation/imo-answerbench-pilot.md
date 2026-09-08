@@ -119,3 +119,23 @@ DeepSeek 发布的 V4-Flash IMOAnswerBench Pass@1 为 High $85.1\%$、Max $88.4\
 见本地 [执行报告](../../data/benchmarks/answerbench-number-theory-run-03/report.json)、[该题完整记录](../../data/benchmarks/answerbench-number-theory-run-03/imo-bench-number_theory-081/report.json) 和 [离线评分](../../data/benchmarks/answerbench-number-theory-run-03/scores.json)。评分仅针对所选一题：没有最终答案，未完成；数学不等价答案数为零，不能把此运行故障解释为模型已经给出错误数学答案。没有证明、审查或成功结果可用于补足首批成绩。
 
 当前可报告的是：首批三道题的明确最终答案通过本地等价检查，数论尚未完整跑通。通用流程缺陷已修复并通过本地回归，数论的真实复测又暴露了外部传输可靠性限制；没有得到同批四题全部成功或全量基准 $100\%$ 的证据。原失败、冗余回归成本及未知请求均保留，未再启动其他付费批次。
+
+### 传输故障诊断补全与待对账事项
+
+继续审计发现，适配器原先把读超时、读写失败、对端协议错误等全部压成 `transport_outcome_unknown`，无法据此区分本次故障。现增加固定白名单错误分类，只保存类别，不保存异常原文、地址或凭据。已经收到响应后出现的连接类异常也保持 `unknown`，不再当作未连接成功而自动重发。提供方及 worker 联调相关 115 项本地测试通过，见 [XML 证据](../acceptance/python-provider-transport-2026-09-08.xml)。这些改动不会追溯改写旧记录，也没有派发真实请求。
+
+已核对 [DeepSeek Chat Completions 官方文档](https://api-docs.deepseek.com/api/create-chat-completion/)：完整 usage 位于结束帧。公开接口目录及定向检索中未找到按该 Chat Completion ID 查询原调用状态的接口；不能用总余额变化推断这一笔的确定费用，也不能照搬其他厂商的取回接口。此处是对目前可用接口的审计结论，并非证明提供方内部不存在日志。
+
+待核对提供方请求为 `e5c80cf0-158c-4ec5-8cb9-d5de9edbaa62`，北京时间 2026-09-08 20:35:50；对应本地请求 `c55b1f6c-8306-4262-8b7f-da90482e4e09`。数据库复核仍为 `unknown`、任务仍为 `reconciliation_required`。已请求用户提供平台可确认的受理或计费状态，在此之前保持原占用及禁止自动重发。施工方案第 6 节对结果不明的对账要求未放宽；数论完整运行目标仍未完成。
+
+用户随后明确确认“已受理”。通过正常 `request.reconcile` 事务将该请求记为 `spent`，仅表示请求数额度已消耗，usage 和货币费用仍未知；原批次报告保留，确认回执单独保存于 `data/benchmarks/answerbench-number-theory-run-03/user-confirmed-accepted.json`。这项终止后的人工对账不补造答案，也不将旧任务伪装为已完成。
+
+### 第四次预设：原数论题，High，剩余十一笔额度
+
+为检验长推理期间的交付稳定性，此次正常推理与审查均显式改为 High，其他题目、完成门槛和隔离要求不变。它是单独的 High 定向运行，不能作为之前 Max 配置的复现成绩。原请求已占用一次，新的独立批次上限十一笔，两者合计最多十二笔；旧失败不覆盖，不读取旧草稿、答案键或人工解法。明确输出截断仍可在原额度内作一次 High 有限子目标恢复，未知结果仍停止待对账。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 scripts\imo_answerbench.py --execute --case-id imo-bench-number_theory-081 --effort high --length-recovery high --request-budget 11 --parallel-cases 1 --output data\benchmarks\answerbench-number-theory-run-04
+```
+
+启动前验证：提供方测试及真实 worker 模拟联调 115 项通过；增加错误码持久化断言后的五项定向测试另通过。未重跑其他题目的真实模型测试。
