@@ -28,6 +28,7 @@ class RunUpdate(Command):
     reasoning_effort: ReasoningEffort = "provider_default"
     completion_policy: Literal["draft", "reviewed_answer"] = "draft"
     length_recovery: Literal["none", "high"] = "none"
+    unknown_recovery: Literal["stop", "once"] = "stop"
 
 
 class BranchBudget(Command):

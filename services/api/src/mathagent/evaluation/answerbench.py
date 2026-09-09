@@ -109,6 +109,7 @@ class Limits:
     reasoning_effort: str = "max"
     completion_policy: str = "reviewed_answer"
     length_recovery: str = "none"
+    unknown_recovery: str = "stop"
 
     def validate(self):
         if not 1 <= self.request_budget <= 100 or not 1 <= self.max_steps <= 40:
@@ -123,6 +124,8 @@ class Limits:
             raise ValueError("This pilot requires reviewed final answers")
         if self.length_recovery not in {"none", "high"}:
             raise ValueError("Invalid output limit recovery policy")
+        if self.unknown_recovery not in {"stop", "once"}:
+            raise ValueError("Invalid unknown outcome recovery policy")
 
 
 class CompletionOnlyTransport(httpx.AsyncBaseTransport):
@@ -352,6 +355,8 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
             "workflow_completed": workflow_completed, "completed": workflow_completed,
             "final_answer": answer, "final_body": final_body, "requests": budget["occupied"],
             "budget": budget, "project_id": project_id, "root_run_id": run_id,
+            "financial_reconciliation_pending": budget["unknown"] > 0,
+            "unknown_retries_authorized": sum(event["type"] == "request.unknown_retry_authorized" for event in events),
             "steps": steps, "calls": calls, "reviews": reviews, "runs": list(all_runs.values()),
             "independent_reviews": len(reviews),
             "network_dispatches": len(list(directory.glob("dispatch-*.json"))),
@@ -457,7 +462,7 @@ async def run_batch(problems_file, directory, config, limits, root, *, resume=Fa
         reports = await asyncio.gather(*(bounded(case) for case in problems["problems"]))
         summary = {"batch_id": plan["batch_id"], "finished_at": stamp(),
             "scope": stable["scope"],
-            "cases": [{k: report.get(k) for k in ("case_id", "state", "completed", "requests", "independent_reviews", "terminal_reason", "human_interventions", "unattended_eligible")} for report in reports],
+            "cases": [{k: report.get(k) for k in ("case_id", "state", "completed", "requests", "independent_reviews", "terminal_reason", "human_interventions", "unattended_eligible", "financial_reconciliation_pending", "unknown_retries_authorized")} for report in reports],
             "case_reports": [f"{case['id']}/report.json" for case in problems["problems"]],
             "all_completed": all(report["completed"] for report in reports),
             "all_unattended": all(report.get("unattended_eligible") is True for report in reports),

@@ -1,7 +1,7 @@
 """Persisted worker lifecycle with leases, input fencing, and late-result isolation.
 
 The caller owns the transaction and command idempotency. No method performs network
-requests or commits. Unknown external outcomes require explicit human reconciliation.
+requests or commits. Unknown external outcomes retain their budget occupancy.
 """
 
 import hashlib
@@ -9,7 +9,7 @@ import secrets
 from datetime import UTC, datetime, timedelta
 
 from mathagent.application.errors import DomainError
-from mathagent.persistence.agent_models import AgentRun
+from mathagent.persistence.agent_models import AgentRun, ProviderCall
 from mathagent.persistence.models import (
     Attempt,
     Branch,
@@ -25,6 +25,7 @@ from mathagent.providers.fake import FakeProvider
 from mathagent.providers.protocol import validate_result
 from mathagent.providers.remote import ProviderConfig
 from mathagent.runtime.agent import AgentRuntime
+from mathagent.runtime.recovery import UNKNOWN_TRANSPORT_FAILURES
 from sqlalchemy import func, select
 
 
@@ -146,22 +147,40 @@ class Runtime:
             raise DomainError(409, "attempt_not_active", "执行租约已结束")
         return attempt, run
 
-    def _boundary(self, session, attempt, run):
+    def _inputs_stale(self, session, attempt, run):
         branch = self.service.require_branch(session, run.branch_id)
         current = self.service.read_set(session, branch.id)
-        stale = (
+        return (
             attempt.control_epoch != run.control_epoch
             or branch.control_epoch != attempt.checkpoint.get("branch_control_epoch")
             or any(current.get(k) != v for k, v in attempt.read_set.items())
             or any((head := session.get(Head, (item["branch_id"], item["object_id"]))) is None
                    or head.revision_id != item["revision_id"] for item in attempt.checkpoint.get("external_read_set", []))
         )
-        stopped = stale or run.state != "running"
+
+    @staticmethod
+    def _continued_unknown(row, attempt):
+        return row.state == "unknown" and row.id in attempt.checkpoint.get("continued_unknown_request_ids", [])
+
+    def _blocking_unknown(self, session, row):
+        attempt = session.get(Attempt, row.attempt_id)
+        # Later steps may proceed only after the authorized retry delivered an
+        # output. A crash/failure before delivery still requires reconciliation.
+        return row.state == "unknown" and not (
+            attempt.output_revision_id and self._continued_unknown(row, attempt)
+        )
+
+    def _boundary(self, session, attempt, run):
+        stopped = self._inputs_stale(session, attempt, run) or run.state != "running"
         if stopped:
             requests = session.scalars(
                 select(ProviderRequest).where(ProviderRequest.attempt_id == attempt.id)
             ).all()
-            if any(row.state in {"dispatched", "unknown"} for row in requests):
+            if any(
+                row.state == "dispatched"
+                or (row.state == "unknown" and not self._continued_unknown(row, attempt))
+                for row in requests
+            ):
                 return False
             for row in requests:
                 if row.state == "reserved":
@@ -231,13 +250,13 @@ class Runtime:
         branch = self.service.require_branch(session, run.branch_id)
         self.agent.branch_allowed(session, run)
         self._check_permission(session, branch.project_id, run.provider)
-        outstanding = session.scalar(
-            select(ProviderRequest.id).where(
+        outstanding = session.scalars(
+            select(ProviderRequest).where(
                 ProviderRequest.attempt_id == attempt.id,
                 ProviderRequest.state.in_(["reserved", "dispatched", "unknown"]),
             )
         )
-        if outstanding:
+        if any(not self._continued_unknown(row, attempt) for row in outstanding):
             raise DomainError(409, "request_unsettled", "当前执行已有未结算请求")
         settings = self._settings(session, branch.project_id)
         requests = session.scalars(
@@ -285,6 +304,45 @@ class Runtime:
         self._emit(session, run, "request.dispatched", self._request_record(row))
         return 200, {"continue": True, **self._request_record(row)}
 
+    def _authorize_unknown_retry(self, session, row, attempt, run, payload):
+        if (not payload.get("retry_unknown") or row.reason not in UNKNOWN_TRANSPORT_FAILURES
+                or run.provider == "fake" or run.state != "running" or attempt.state != "running"
+                or run.current_attempt_id != attempt.id or self._expired(attempt)
+                or self._inputs_stale(session, attempt, run)):
+            return False
+        config = session.get(AgentRun, run.id)
+        root = session.get(AgentRun, config.root_run_id) if config else None
+        if (not root or root.options.get("unknown_recovery", "stop") != "once"
+                or config.options.get("unknown_recovery", "stop") != "once"):
+            return False
+        root_run = session.get(Run, root.run_id)
+        if root_run.state not in {"running", "waiting_children", "queued"}:
+            return False
+        observation = session.get(ProviderCall, row.id)
+        if not observation or observation.complete or observation.result is not None:
+            return False
+        try:
+            self.agent.branch_allowed(session, run)
+            branch = self.service.require_branch(session, run.branch_id)
+            self._check_permission(session, branch.project_id, run.provider)
+        except DomainError:
+            return False
+        session.flush()
+        if self.agent.request_budget_status(session, run)["remaining"] <= 0:
+            return False
+        family = select(AgentRun.run_id).where(AgentRun.root_run_id == root.run_id)
+        attempts = session.scalars(select(Attempt).where(Attempt.run_id.in_(family)))
+        if any(item.checkpoint.get("continued_unknown_request_ids") for item in attempts):
+            return False
+        # The command transaction serializes this root-wide, durable allowance.
+        # Reconciliation, options updates and worker restarts never refund it.
+        attempt.checkpoint = {**attempt.checkpoint, "continued_unknown_request_ids": [row.id]}
+        self._emit(session, run, "request.unknown_retry_authorized", {
+            "request_id": row.id, "attempt_id": attempt.id, "root_run_id": root.run_id,
+            "unknown_remains_occupied": True, "retry_limit": 1,
+        })
+        return True
+
     def settle_request(self, session, payload):
         row, attempt, run = self._request(session, payload)
         state = {"spent": "spent", "unaccepted": "released", "unknown": "unknown"}[
@@ -298,7 +356,8 @@ class Runtime:
         row.reason = payload.get("reason", "")
         row.usage = payload.get("usage", {})
         row.provider_request_id = payload.get("provider_request_id")
-        if state == "unknown":
+        retry_allowed = state == "unknown" and self._authorize_unknown_retry(session, row, attempt, run, payload)
+        if state == "unknown" and not retry_allowed:
             attempt.checkpoint = {
                 **attempt.checkpoint,
                 "reconciliation_resume_state": "cancelled"
@@ -308,7 +367,8 @@ class Runtime:
             attempt.state = "reconciliation_required"
             run.state = "reconciliation_required"
         self._emit(session, run, "request.settled", self._request_record(row))
-        return 200, self._request_record(row)
+        return 200, {**self._request_record(row), "unknown_retry_allowed": retry_allowed,
+                     "request_budget_status": self.agent.request_budget_status(session, run) if retry_allowed else None}
 
     def fail(self, session, payload):
         attempt, run = self._attempt(session, payload)
@@ -509,11 +569,11 @@ class Runtime:
         self.agent.branch_allowed(session, run)
         before = run.state
         self._reconcile_expired(session, run)
-        if session.scalar(
-            select(ProviderRequest.id).where(
+        if any(self._blocking_unknown(session, row) for row in session.scalars(
+            select(ProviderRequest).where(
                 ProviderRequest.run_id == run.id, ProviderRequest.state == "unknown"
             )
-        ):
+        )):
             run.state = "reconciliation_required"
         if run.state == "reconciliation_required":
             return 200, {"run_id": run.id, "state": run.state, "effect": "blocked"}
@@ -742,7 +802,7 @@ class Runtime:
         requests = session.scalars(
             select(ProviderRequest).where(ProviderRequest.attempt_id == attempt.id)
         ).all()
-        if any(r.state in {"reserved", "dispatched", "unknown"} for r in requests):
+        if any(r.state in {"reserved", "dispatched", "unknown"} and not self._continued_unknown(r, attempt) for r in requests):
             raise DomainError(409, "request_unsettled", "先结算或对账请求后才能保存产物")
         if run.provider != "fake":
             if result is None:
@@ -928,13 +988,13 @@ class Runtime:
     def resume(self, session, payload):
         run = self._run(session, payload["run_id"])
         self._reconcile_expired(session, run)
-        unsettled = session.scalar(
-            select(ProviderRequest.id).where(
+        unsettled = session.scalars(
+            select(ProviderRequest).where(
                 ProviderRequest.run_id == run.id,
                 ProviderRequest.state.in_(["unknown", "dispatched"]),
             )
         )
-        if unsettled:
+        if any(row.state == "dispatched" or self._blocking_unknown(session, row) for row in unsettled):
             return 200, {"run_id": run.id, "state": "reconciliation_required", "effect": "blocked"}
         if run.state == "queued":
             return 200, {"run_id": run.id, "state": run.state}

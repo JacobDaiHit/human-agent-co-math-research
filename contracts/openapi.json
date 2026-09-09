@@ -4328,6 +4328,15 @@
             ],
             "title": "Length Recovery",
             "default": "none"
+          },
+          "unknown_recovery": {
+            "type": "string",
+            "enum": [
+              "stop",
+              "once"
+            ],
+            "title": "Unknown Recovery",
+            "default": "stop"
           }
         },
         "additionalProperties": false,
@@ -4424,6 +4433,15 @@
             ],
             "title": "Length Recovery",
             "default": "none"
+          },
+          "unknown_recovery": {
+            "type": "string",
+            "enum": [
+              "stop",
+              "once"
+            ],
+            "title": "Unknown Recovery",
+            "default": "stop"
           }
         },
         "additionalProperties": false,
@@ -4492,6 +4510,11 @@
               "unknown"
             ],
             "title": "Outcome"
+          },
+          "retry_unknown": {
+            "type": "boolean",
+            "title": "Retry Unknown",
+            "default": false
           },
           "usage": {
             "additionalProperties": {

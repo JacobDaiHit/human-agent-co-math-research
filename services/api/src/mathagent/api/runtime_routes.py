@@ -30,6 +30,7 @@ class Heartbeat(Execution):
 
 class Settlement(Execution):
     outcome: Literal["spent", "unaccepted", "unknown"]
+    retry_unknown: bool = False
     usage: dict[str, Annotated[int, Field(strict=True, ge=0)]] = Field(
         default_factory=dict, max_length=30
     )

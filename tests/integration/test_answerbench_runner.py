@@ -129,6 +129,39 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def test_unknown_retry_completes_reviewed_workflow_with_unresolved_cost(workspace, tmp_path):
+    problems, source, cases = workspace
+    output = tmp_path / "unknown-retry"
+    inference = ScriptedInference()
+    interrupted = []
+
+    def factory(case):
+        inner = inference.factory(case)
+
+        async def handle(request):
+            if not interrupted:
+                interrupted.append(case["id"])
+                raise httpx.ReadError("Synthetic transport interruption", request=request)
+            return await inner.handle_async_request(request)
+
+        return httpx.MockTransport(handle)
+
+    frozen_limits = limits(unknown_recovery="once", parallel_cases=1)
+    report = asyncio.run(answerbench.run_batch(problems, output, CONFIG, frozen_limits, source,
+        case_ids=[cases[0]["id"]], transport_factory=factory))
+    assert report["all_completed"] and report["all_unattended"] and report["source_unchanged"]
+    case_report = read_json(output / cases[0]["id"] / "report.json")
+    assert case_report["workflow_completed"] and case_report["finalized_after_review"]
+    assert case_report["financial_reconciliation_pending"] is True
+    assert case_report["unknown_retries_authorized"] == 1
+    assert case_report["budget"]["unknown"] == 1 and case_report["budget"]["spent"] == 4
+    assert case_report["budget"]["occupied"] == 5 and case_report["budget"]["remaining"] == 0
+    assert case_report["network_dispatches"] == 5 and len(inference.dispatches) == 4
+    with pytest.raises(ValueError, match="exact frozen"):
+        asyncio.run(answerbench.run_batch(problems, output, CONFIG, limits(), source,
+            resume=True, case_ids=[cases[0]["id"]], transport_factory=factory))
+
+
 def test_four_cases_two_real_api_processes_review_export_and_frozen_resume(workspace, tmp_path):
     problems, source, cases = workspace
     output = tmp_path / "normal-batch"

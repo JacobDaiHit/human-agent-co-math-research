@@ -18,6 +18,7 @@ import httpx
 from mathagent.config import EnvironmentFileError, load_local_environment
 from mathagent.providers.protocol import PROMPT_VERSION
 from mathagent.providers.remote import DeepSeekProvider, GLMProvider, ProviderFailure
+from mathagent.runtime.recovery import UNKNOWN_TRANSPORT_FAILURES
 
 log = logging.getLogger("mathagent.worker")
 
@@ -146,7 +147,7 @@ class HTTPWorker:
                     observation = getattr(error, "observation", None) or {"raw_text": "", "complete": False}
                     observation = {**observation, "call_config": config}
                     await self._post(request_path + "/observation", {**execution, "observation": observation})
-                    await self._post(
+                    settlement = await self._post(
                         request_path + "/settle",
                         {
                             **execution,
@@ -154,8 +155,17 @@ class HTTPWorker:
                             "reason": error.code,
                             "usage": {k: v for k, v in observation.get("usage", {}).items() if isinstance(v, int) and not isinstance(v, bool) and v >= 0},
                             "provider_request_id": observation.get("provider_request_id"),
+                            "retry_unknown": error.outcome == "unknown" and error.code in UNKNOWN_TRANSPORT_FAILURES and retry < 2,
                         },
                     )
+                    if settlement.get("unknown_retry_allowed"):
+                        # Discard the interrupted response entirely. Its ledger
+                        # entry remains unknown; reserve a distinct paid request.
+                        task = {**task, "request_budget_status": settlement["request_budget_status"]}
+                        task["request_budget_status"]["snapshot"] = "after_unknown_settlement"
+                        task["request_budget_status"]["stale"] = True
+                        await asyncio.sleep(0.5 * 2**retry)
+                        continue
                     if error.outcome == "unaccepted" and error.retryable and retry < 2:
                         await asyncio.sleep(0.5 * 2**retry)
                         continue

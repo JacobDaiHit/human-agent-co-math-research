@@ -29,6 +29,7 @@ DEFAULT_OPTIONS = {
     "thinking_mode": "provider_default", "reasoning_effort": "provider_default",
     "completion_policy": "draft",
     "length_recovery": "none",
+    "unknown_recovery": "stop",
 }
 TERMINAL = {"completed", "cancelled", "failed", "interrupted", "budget_exhausted", "step_limit"}
 
@@ -485,10 +486,11 @@ class AgentRuntime:
                 )
             except (ValueError, TypeError):
                 continue
-            # Another in-flight/unknown call cannot be explained by this result.
-            # Keep the ordinary reconciliation path instead of inventing its cost.
+            # Only an explicitly authorized unknown may coexist with this output.
+            # Recovery still quarantines it and preserves the unknown cost.
             if any(
                 other.id != request.id and other.state in {"dispatched", "unknown"}
+                and not self.runtime._continued_unknown(other, attempt)
                 for other in requests
             ):
                 continue
@@ -550,6 +552,8 @@ class AgentRuntime:
 
     def observe(self, session, payload):
         request, attempt, run = self.runtime._request(session, payload)
+        if request.state == "unknown":
+            raise DomainError(409, "request_outcome_unknown", "未知请求的观察记录已冻结，不能作为后续产物提交")
         observation = payload["observation"]
         raw = observation.get("raw_text", "")
         if not isinstance(raw, str) or len(raw) > 200000:
