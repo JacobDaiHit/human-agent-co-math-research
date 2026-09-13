@@ -40,6 +40,12 @@
 
 这些证据说明当前虚拟化管理程序没有运行；尚不能仅据此断定是哪个 Windows 组件或启动设置。没有修改系统启动配置、启用 Windows 功能或重启电脑。
 
+### 随后授权的 Docker 修复
+
+用户随后明确要求检查 Docker 并按下一步处理。2026-09-13 管理员检查发现：`VirtualMachinePlatform` 与 WSL 均为 Enabled，但启动配置 `hypervisorlaunchtype=Off`。已先导出本地 BCD 备份，再执行 `bcdedit /set hypervisorlaunchtype auto`；命令成功，复核为 Auto。没有重装 Docker、改动无关 Windows 功能或自动重启。
+
+修复记录与备份保存在未纳入 Git 的 `data/diagnostics/`。**配置修复已验证，WSL/Docker 运行恢复仍须重启 Windows 后验证**。后续依次检查 Ubuntu 命令能执行、Docker Server 就绪，构建固定沙箱镜像并完成真实隔离验收，再启动仅数论题的预算内闭卷评测。
+
 ## 下一次数论复跑的冻结要求
 
 - 只选 `imo-bench-number_theory-081`，新目录独立记录；前三题原成绩保持。
