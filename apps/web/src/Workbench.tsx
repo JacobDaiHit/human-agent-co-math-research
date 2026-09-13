@@ -11,6 +11,9 @@ import { useWorkbenchTools } from './webmcp'
 import { BudgetPanel } from './BudgetPanel'
 import type { Budget } from './BudgetPanel'
 import { PresentationPanel } from './PresentationPanel'
+import { ArticleComposer } from './ArticleComposer'
+import { BranchMergePanel } from './BranchMergePanel'
+import { clearDeletedDrafts } from './drafts'
 
 type View='split'|'manuscript'|'graph'|'runs'|'history'
 function lastWorkspace():{projectId?:string;branchId?:string}{try{const value=JSON.parse(localStorage.getItem('mathagent:last-workspace')||'{}');return value&&typeof value==='object'?{projectId:typeof value.projectId==='string'?value.projectId:undefined,branchId:typeof value.branchId==='string'?value.branchId:undefined}:{}}catch{return {}}}
@@ -32,7 +35,7 @@ export function Workbench(){
     if(!id){setProjects(list.projects);setLoading(false);return}
     const [snap,bs]=await Promise.all([request<Snapshot>(`/projects/${id}/snapshot${branchId?`?branch_id=${branchId}`:''}`),request<{branches:Branch[]}>(`/projects/${id}/branches`)])
     if(gen!==generation.current)return
-    current.current={projectId:id,branchId:snap.branch.id};try{localStorage.setItem('mathagent:last-workspace',JSON.stringify(current.current))}catch{};setProjects(list.projects);setSnapshot(snap);setBranches(bs.branches);setLoading(false)
+    current.current={projectId:id,branchId:snap.branch.id};try{localStorage.setItem('mathagent:last-workspace',JSON.stringify(current.current))}catch{};clearDeletedDrafts(snap.branch.id,snap.objects.filter(object=>object.revision.payload.deleted===true).map(object=>object.id));setProjects(list.projects);setSnapshot(snap);setBranches(bs.branches);setLoading(false)
     request<Budget>(`/projects/${id}/budget`).then(data=>{if(current.current.projectId===id)setBudget(data)}).catch(()=>setBudget(null))
   },[])
   reload.current=async()=>refresh()
@@ -50,7 +53,7 @@ export function Workbench(){
     async function load(){let cursor=0;const items:ActivityEvent[]=[];const target=snapshot!.project.event_seq;while(cursor<target&&!cancelled){const batch=await request<{events:ActivityEvent[];last_seq:number}>(`/projects/${snapshot!.project.id}/events?after_seq=${cursor}`);items.push(...batch.events);if(batch.last_seq<=cursor)break;cursor=batch.last_seq}if(!cancelled)setEvents(items)}
     load().catch(e=>{if(!cancelled)setError(e.message)});return()=>{cancelled=true}
   },[view,snapshot?.project.event_seq,snapshot?.project.id])
-  useEffect(()=>{if(!snapshot||!query.trim()){setSearchResults(null);return}let cancelled=false;const timer=setTimeout(()=>request<{results:SearchResult[]}>(`/projects/${snapshot.project.id}/search?q=${encodeURIComponent(query.trim())}`).then(r=>{if(!cancelled)setSearchResults(r.results)}).catch(e=>{if(!cancelled)setError(e.message)}),250);return()=>{cancelled=true;clearTimeout(timer)}},[query,snapshot?.project.id])
+  useEffect(()=>{if(!snapshot||!query.trim()){setSearchResults(null);return}setSearchResults(null);let cancelled=false;const timer=setTimeout(()=>request<{results:SearchResult[]}>(`/projects/${snapshot.project.id}/search?q=${encodeURIComponent(query.trim())}`).then(r=>{if(!cancelled)setSearchResults(r.results)}).catch(e=>{if(!cancelled)setError(e.message)}),250);return()=>{cancelled=true;clearTimeout(timer)}},[query,snapshot?.project.id,snapshot?.project.event_seq])
   const object=snapshot?.objects.find(o=>o.id===selected)||null
   const select=(id:string)=>{setSelected(id);setHistoricalId(null);if(view==='runs'||view==='history')setView('split')}
   useWorkbenchTools(snapshot,()=>refresh(),select)
@@ -66,7 +69,7 @@ export function Workbench(){
   const unresolved=snapshot?.conflicts.filter(c=>!c.resolution).length||0
   return <div className="app-shell">
     <aside className="sidebar"><div className="brand"><span className="brand-mark">∴</span><span>MathAgent<small>研究工作台</small></span></div><button className="new-project" onClick={()=>setAction('project')} disabled={!connected}>＋ 新建研究</button><div className="section-label">研究项目</div><nav aria-label="研究项目">{projects.map(p=><button key={p.id} className={snapshot?.project.id===p.id?'project active':'project'} onClick={()=>chooseProject(p.id)}><span>◇</span>{p.title}</button>)}</nav><button className="example-link" disabled={!connected||loading} onClick={example}>打开特征值反例示例 ↗</button><div className="sidebar-bottom"><span className={connected&&streamConnected?'connection-dot':'connection-dot offline'}/>{connected?(streamConnected?'本地状态已同步':'正在重新连接'):'正在连接'}<small>研究材料保存在本机</small></div></aside>
-    <main className={showInspector?'has-inspector':''}><header className="workspace-header"><div><span className="eyebrow">WORKSPACE</span><h1>{snapshot?.project.title||'从一个数学问题开始'}</h1></div>{snapshot&&<div className="header-actions"><label className="sr-only" htmlFor="branch-picker">当前分支</label><select id="branch-picker" className="branch-picker" value={snapshot.branch.id} onChange={e=>chooseProject(snapshot.project.id,e.target.value)}>{branches.map(b=><option key={b.id} value={b.id}>{b.name==='main'?'主线':b.name}{b.presentation?.archived?' · 已归档':''}</option>)}</select><button onClick={()=>setAction('branch')}>＋ 分支</button><button onClick={exportProject}>导出</button></div>}</header>
+    <main className={showInspector?'has-inspector':''}><header className="workspace-header"><div><span className="eyebrow">WORKSPACE</span><h1>{snapshot?.project.title||'从一个数学问题开始'}</h1></div>{snapshot&&<div className="header-actions"><label className="sr-only" htmlFor="branch-picker">当前分支</label><select id="branch-picker" className="branch-picker" value={snapshot.branch.id} onChange={e=>chooseProject(snapshot.project.id,e.target.value)}>{branches.map(b=><option key={b.id} value={b.id}>{b.name==='main'?'主线':b.name}{b.presentation?.archived?' · 已归档':''}</option>)}</select><BranchMergePanel key={`${snapshot.project.id}-${snapshot.branch.id}`} snapshot={snapshot} branches={branches} onRefresh={()=>refresh()}/><ArticleComposer key={`${snapshot.project.id}-${snapshot.branch.id}`} snapshot={snapshot} onRefresh={()=>refresh()} onSelect={select}/><button onClick={()=>setAction('branch')}>＋ 分支</button><button onClick={exportProject}>导出</button></div>}</header>
       {error&&<div role="alert" className="error-banner">{error}<button onClick={()=>setError('')}>关闭</button></div>}
       {notice&&<div role="status" className="notice-banner">{notice}<button aria-label="关闭提示" onClick={()=>setNotice('')}>×</button></div>}
       {snapshot?<><div className="workspace-toolbar"><div className="view-tabs" role="tablist" aria-label="工作区视图">{([['split','图与稿'],['manuscript','工作稿'],['graph','研究地图'],['runs',`运行${activeRuns?` · ${activeRuns}`:''}`],['history','活动历史']] as [View,string][]).map(([v,label])=><button key={v} role="tab" aria-selected={view===v} className={view===v?'active':''} onClick={()=>setView(v)}>{label}</button>)}</div><div className="toolbar-actions"><button onClick={()=>setAction('object')}>＋ 对象</button><button className="primary" onClick={()=>setAction('run')}>启动研究</button></div></div>

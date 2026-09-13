@@ -121,6 +121,10 @@ class HTTPWorker:
                     "parameters": {}, "prompt_template_version": PROMPT_VERSION,
                     "simulated": task["provider"] == "fake",
                 }
+                if task["mode"] == "review":
+                    from mathagent.runtime.completion import review_input_receipt
+
+                    config = {**config, "review_input_receipt": review_input_receipt(task)}
                 await self._post(request_path + "/observation", {
                     **execution, "observation": {"call_config": config, "raw_text": "", "complete": False}
                 })

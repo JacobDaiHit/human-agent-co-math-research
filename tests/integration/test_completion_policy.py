@@ -85,7 +85,7 @@ def test_legacy_completion_endpoint_cannot_bypass_reviewed_answer_checks(app):
 
 
 @pytest.mark.parametrize("condition", [
-    "passed", "repeated_same_answer", "issues", "candidate_stale", "dependency_stale", "not_cited", "candidate_no_box", "different_answer", "review_excerpt",
+    "passed", "long_candidate", "candidate_truncated", "repeated_same_answer", "issues", "candidate_stale", "dependency_stale", "not_cited", "candidate_no_box", "different_answer", "review_excerpt",
 ])
 def test_finish_requires_current_passed_visible_cited_candidate_and_matching_answer(app, condition, monkeypatch):
     monkeypatch.setenv("MATHAGENT_ENABLE_REAL_API", "1")
@@ -98,6 +98,12 @@ def test_finish_requires_current_passed_visible_cited_candidate_and_matching_ans
             if task["mode"] == "review":
                 assert task["completion_policy"] == "draft" and task["autonomous"] is False
                 review_targets.append(task["target_revision_id"])
+                target_input = next(i for i in task["inputs"] if i["revision_id"] == task["target_revision_id"])
+                if condition == "long_candidate":
+                    assert len(target_input["body"]) > 12000 and not target_input["excerpted"]
+                    assert target_input["body"].endswith(r"The candidate concludes $\boxed{2}$.")
+                if condition == "candidate_truncated":
+                    assert target_input["excerpted"]
                 review_body = ("Long review details. " * 1200) if condition == "review_excerpt" else "An independent synthetic review of the exact candidate."
                 return result(review_body, mode="review",
                     verdict="issues" if condition == "issues" else "passed", next_action="finish")
@@ -106,6 +112,10 @@ def test_finish_requires_current_passed_visible_cited_candidate_and_matching_ans
                 candidate = "A candidate without any final box." if condition == "candidate_no_box" else r"The candidate concludes $\boxed{2}$."
                 if condition == "repeated_same_answer":
                     candidate = r"The calculation gives $\boxed{2}$. Thus the answer is $\boxed{2}$."
+                if condition == "long_candidate":
+                    candidate = "Synthetic derivation details.\n\n" * 600 + candidate
+                if condition == "candidate_truncated":
+                    candidate = "\\" * 95000 + candidate
                 return result("Save the candidate for independent review.", [
                     action("write_draft", kind="claim", body=candidate),
                 ], next_action="continue")
@@ -141,7 +151,7 @@ def test_finish_requires_current_passed_visible_cited_candidate_and_matching_ans
         await HTTPWorker(client, providers=["deepseek"], provider_factory=lambda _: Script(), fake_delay_seconds=0).run(once=True)
         steps = (await api.get(f"/runs/{run['run_id']}/steps"))["steps"]
         assert len(steps) == 3
-        succeeds = condition in {"passed", "repeated_same_answer"}
+        succeeds = condition in {"passed", "repeated_same_answer", "long_candidate"}
         assert steps[-1]["state"] == ("completed" if succeeds else "step_limit"), steps[-1]["actions"]
         feedback = [entry for entry in steps[-1]["actions"] if entry["type"] == "finish"]
         if succeeds:
@@ -149,6 +159,8 @@ def test_finish_requires_current_passed_visible_cited_candidate_and_matching_ans
         else:
             assert len(feedback) == 1 and feedback[0]["status"] == "rejected"
             assert feedback[0]["error"] == "completion_requirements_unmet"
+            if condition == "candidate_truncated":
+                assert "complete_review_material_must_be_delivered" in feedback[0]["issues"]
         snapshot = await api.get(f"/projects/{project['project_id']}/snapshot")
         assert len(snapshot["reviews"]) == 1
         if condition == "dependency_stale":

@@ -1,4 +1,4 @@
-"""Validated research operation proposals; no executable code or external browsing."""
+"""Validated research proposals; isolated code requires opt-in, browsing is absent."""
 
 import keyword
 import re
@@ -148,6 +148,12 @@ class HermitianCalculation(Command):
     target_revision_id: Id | None = None
 
 
+class RunCode(Command):
+    code: str = Field(min_length=1, max_length=20000)
+    timeout_seconds: int = Field(default=5, ge=1, le=10)
+    target_revision_id: Id | None = None
+
+
 class Calculate(
     RootModel[
         Annotated[
@@ -204,6 +210,7 @@ OPERATION_MODELS = {
     "request_review": RequestReview,
     "discuss": Discuss,
     "calculate": Calculate,
+    "run_code": RunCode,
 }
 
 

@@ -4,6 +4,7 @@ from typing import Literal
 
 from fastapi import Depends
 from mathagent.api.schemas import Command, Id
+from mathagent.application.code_execution import permitted_operations
 from mathagent.application.errors import DomainError
 from mathagent.application.state import record
 from mathagent.persistence.agent_models import AgentStep, ProviderCall
@@ -53,7 +54,7 @@ class StepCreate(Command):
 
 
 class PolicyUpdate(Command):
-    allowed_operations: list[str] = Field(max_length=12)
+    allowed_operations: list[str] = Field(max_length=13)
 
 
 def mount_agent_routes(app, runtime, human, worker, key, command):
@@ -108,7 +109,7 @@ def mount_agent_routes(app, runtime, human, worker, key, command):
             project = session.get(Project, project_id)
             if not project:
                 raise DomainError(404, "project_not_found", "研究项目不存在")
-            return {"project_id": project_id, "allowed_operations": project.policies.get("agent_operations", list(operation_schemas()))}
+            return {"project_id": project_id, "allowed_operations": permitted_operations(project)}
 
     @app.put("/projects/{project_id}/agent-policy", dependencies=[Depends(human)])
     def update_policy(project_id: str, p: PolicyUpdate, k: str = Depends(key)):
@@ -118,6 +119,8 @@ def mount_agent_routes(app, runtime, human, worker, key, command):
                 raise DomainError(404, "project_not_found", "研究项目不存在")
             if set(payload["allowed_operations"]) - set(operation_schemas()):
                 raise DomainError(422, "invalid_operation_policy", "包含不支持的操作")
+            if "run_code" in payload["allowed_operations"] and not project.policies.get("code_sandbox", {}).get("enabled"):
+                raise DomainError(403, "sandbox_not_enabled", "须先在项目设置中启用隔离代码沙箱。")
             project.policies = {**project.policies, "agent_operations": list(dict.fromkeys(payload["allowed_operations"]))}
             runtime.service.emit(session, project_id, None, "project.agent_policy_changed", payload)
             return 200, payload

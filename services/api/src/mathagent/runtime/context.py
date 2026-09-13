@@ -202,9 +202,14 @@ def compact_task(task):
         ),
     )
     inputs, missing, used = [], list(old_summary.get("omitted_revisions", [])), 0
+    reviewing = task.get("mode") == "review"
     for item in ordered:
-        page = _short_page(item, 12000)
-        if used + len(serialized(page)) > 85000 or len(inputs) >= 48:
+        page = _short_page(item, max(1, len(item["body"])) if reviewing else 12000)
+        if reviewing:
+            for field in ("payload", "proof_plan"):
+                if field in item:
+                    page[field] = copy.deepcopy(item[field])
+        if (inputs and used + len(serialized(page)) > (150000 if reviewing else 85000)) or len(inputs) >= 48:
             missing.append(read_ref(item))
             continue
         used += len(serialized(page))

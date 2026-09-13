@@ -136,6 +136,8 @@ class Runtime:
         attempt = session.get(Attempt, payload["attempt_id"])
         if attempt is None:
             raise DomainError(404, "attempt_not_found", "执行记录不存在")
+        if attempt.checkpoint.get("material_erased"):
+            raise DomainError(410, "material_deleted", "相关材料已永久删除，产物不能写回。")
         if not secrets.compare_digest(attempt.token, payload["token"]):
             raise DomainError(409, "invalid_execution_token", "执行令牌已失效或不匹配")
         run = self._run(session, attempt.run_id)
@@ -633,6 +635,19 @@ class Runtime:
         proof_plans = []
         while pending:
             item = pending.pop()
+            from mathagent.persistence.research_models import ResearchRecordReference
+
+            for revision_id in session.scalars(select(ResearchRecordReference.target_revision_id).where(
+                ResearchRecordReference.record_revision_id == item["revision_id"]
+            )):
+                if revision_id in context_revisions:
+                    continue
+                revision, obj = self.service.check_revision(session, branch, revision_id)
+                context_revisions.add(revision_id)
+                extra = {"object_id": obj.id, "revision_id": revision.id, "kind": obj.kind,
+                         "body": revision.body, "payload": revision.payload, "historical": True}
+                inputs.append(extra)
+                pending.append(extra)
             plan = session.get(ProofPlan, item["revision_id"])
             if plan is None:
                 continue
@@ -769,6 +784,8 @@ class Runtime:
         attempt = session.get(Attempt, payload["attempt_id"])
         if attempt is None:
             raise DomainError(404, "attempt_not_found", "执行记录不存在")
+        if attempt.checkpoint.get("material_erased"):
+            raise DomainError(410, "material_deleted", "相关材料已永久删除，产物不能写回。")
         if not secrets.compare_digest(attempt.token, payload["token"]):
             raise DomainError(409, "invalid_execution_token", "执行令牌已失效或不匹配")
         config = session.get(AgentRun, attempt.run_id)
@@ -864,6 +881,17 @@ class Runtime:
         self.service._add_reference(session, output_branch.id, revision.id)
         review_id = None
         if run.provider != "fake" and result and result["mode"] == "review" and not quarantined:
+            from mathagent.runtime.completion import review_material_hash
+
+            expected = {rid: review_material_hash(self.agent._input(session, branch, rid))
+                        for rid in attempt.checkpoint.get("context_revision_ids", [])}
+            observed = [session.get(ProviderCall, row.id) for row in requests if row.state == "spent"]
+            complete_material = bool(expected) and any(
+                call and call.complete and call.result == result
+                and call.call_config.get("review_input_receipt") == expected
+                for call in observed
+            )
+            attempt.checkpoint = {**attempt.checkpoint, "review_material_complete": complete_material}
             target_revision_id = attempt.checkpoint["target_revision_id"]
             refs = {**attempt.read_set, run.goal_object_id: target_revision_id}
             for plan in attempt.checkpoint.get("proof_plans", []):

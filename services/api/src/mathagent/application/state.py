@@ -79,6 +79,8 @@ class StateService:
 
     def check_revision(self, s, branch, revision_id, current=False):
         rev = self.require_revision(s, revision_id)
+        if rev.payload.get("deleted"):
+            raise DomainError(410, "material_deleted", "此材料已永久删除，不能重新引用或恢复。")
         obj = self.require_object(s, rev.object_id)
         if obj.project_id != branch.project_id:
             raise DomainError(422, "cross_project_reference", "不能引用其他项目的版本。")
@@ -221,7 +223,7 @@ class StateService:
         revised_payload = expected.payload if p.get("payload") is None else p["payload"]
         previous_type = expected.payload.get("artifact_type")
         if (
-            previous_type in ("failure", "source")
+            previous_type in ("failure", "source", "article", "code_execution")
             and revised_payload.get("artifact_type") != previous_type
         ):
             raise DomainError(

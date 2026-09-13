@@ -3,6 +3,19 @@
 import re
 
 
+def review_material_hash(item):
+    """Fingerprint mathematical input, excluding prior judgments and UI metadata."""
+    import hashlib
+    import json
+
+    material = {key: item[key] for key in ("body", "payload", "proof_plan") if key in item}
+    return hashlib.sha256(json.dumps(material, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def review_input_receipt(task):
+    return {item["revision_id"]: review_material_hash(item) for item in task["inputs"]}
+
+
 def boxed_answers(body):
     body = body or ""
     answers, offset = [], 0

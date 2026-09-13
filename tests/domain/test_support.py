@@ -50,6 +50,15 @@ def graph():
     return {key: node() for key in ("A", "B", "C", "D", "E")}, []
 
 
+def test_deleted_evidence_cannot_support_a_claim_even_with_old_adoption():
+    nodes, plans = graph()
+    nodes["Context"] = node("context", role="definition", deleted=True)
+    add_plan(nodes, plans, "PA", "A", contexts=["Context"])
+    result = analyze_support(nodes, plans)
+    assert result["claims"]["A"]["status"] != "supported"
+    assert any("deleted" in reason for reason in result["plans"]["PA"]["reasons"])
+
+
 def test_adoption_and_bare_claim_reviews_are_not_proof_roots():
     nodes, plans = graph()
     nodes["A"]["evidence"] = [review(), review("exact_computation")]

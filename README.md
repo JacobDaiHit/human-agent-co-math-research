@@ -6,6 +6,8 @@
 
 当前工作：[IMO-AnswerBench 四题无人试测](docs/evaluation/imo-answerbench-pilot.md)。固定四领域各一题，解题时不读取答案、不开放网页检索；结果和独立离线评分分别保存。自动文献检索已列入蓝图后续范围，本轮不实现。
 
+2026-09-13 补齐了分支三方合并、永久删除与文章整理，并接入默认关闭的离线代码沙箱；同时修复长证明审查材料送达和审查恢复额度。沙箱真实隔离验收仍被本机 Windows 虚拟化环境阻塞，因此尚未启动新的数论复跑。详见 [本轮复核与边界](docs/acceptance/blueprint-recheck-2026-09-13.md) 和 [沙箱准备](sandbox/README.md)。
+
 ## 启动工作台
 
 需要 Python 3.13、uv、Node.js 22 或更新版本。在项目根目录运行 PowerShell：

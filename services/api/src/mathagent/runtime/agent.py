@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 
+from mathagent.application.code_execution import CodeExecutionService, permitted_operations
 from mathagent.application.errors import DomainError
 from mathagent.persistence.agent_models import AgentRun, AgentStep, BranchRuntime, ProviderCall
 from mathagent.persistence.models import (
@@ -189,6 +190,9 @@ class AgentRuntime:
             if not output or not review or review.kind != "llm_review" or review.verdict != "passed":
                 reasons.add("independent_passed_review_required")
                 continue
+            if child_attempt.checkpoint.get("review_material_complete") is not True:
+                reasons.add("complete_review_material_must_be_delivered")
+                continue
             if output.id not in visible:
                 reasons.add("complete_review_body_must_be_read")
                 continue
@@ -293,7 +297,7 @@ class AgentRuntime:
         options = self.options(session, task["run_id"])
         task.update(options)
         branch = self.state.require_branch(session, self.runtime._run(session, task["run_id"]).branch_id)
-        permitted = session.get(Project, branch.project_id).policies.get("agent_operations", list(operation_schemas()))
+        permitted = permitted_operations(session.get(Project, branch.project_id))
         task["operation_schemas"] = {k: v for k, v in operation_schemas().items() if k in permitted} if options["autonomous"] else {}
         task["branch_id"], task["project_id"] = branch.id, branch.project_id
         snapshot = self.state.snapshot(session, branch.id)
@@ -310,6 +314,7 @@ class AgentRuntime:
             plan.update(object_id=rev.object_id, branch_id=branch.id)
             plan["read_ref"] = read_ref(plan)
         if not options["autonomous"]:
+            task["request_budget_status"] = self.request_budget_status(session, self.runtime._run(session, task["run_id"]))
             return compact_task(task)
         rows = session.scalars(select(AgentStep).where(AgentStep.run_id == task["run_id"]).order_by(AgentStep.number)).all()
         extra_ids = [r.output_revision_id for r in rows if r.output_revision_id]
@@ -552,6 +557,8 @@ class AgentRuntime:
 
     def observe(self, session, payload):
         request, attempt, run = self.runtime._request(session, payload)
+        if attempt.checkpoint.get("material_erased"):
+            raise DomainError(410, "material_deleted", "相关材料已永久删除，迟到输出不能写回。")
         if request.state == "unknown":
             raise DomainError(409, "request_outcome_unknown", "未知请求的观察记录已冻结，不能作为后续产物提交")
         observation = payload["observation"]
@@ -561,7 +568,7 @@ class AgentRuntime:
         config = observation.get("call_config", {})
         # Credentials are never accepted as configuration metadata.
         allowed = {"provider", "model", "parameters", "request_timeout_seconds", "prompt_template_version",
-                   "prompt_template_sha256", "prompt_sha256", "simulated", "transport_timeout_seconds"}
+                   "prompt_template_sha256", "prompt_sha256", "simulated", "transport_timeout_seconds", "review_input_receipt"}
         if set(config) - allowed or len(json.dumps(config, ensure_ascii=False)) > 30000:
             raise DomainError(422, "invalid_call_config", "调用元数据包含不允许的字段")
         row = session.get(ProviderCall, request.id)
@@ -608,7 +615,7 @@ class AgentRuntime:
             goal_id = arguments["goal_object_id"]
         payload = {"branch_id": branch_id, "goal_object_id": goal_id, "provider": parent_run.provider,
                    "mode": "review" if review else "research", "instruction": arguments["instruction"],
-                   "request_budget": 1 if review else arguments.get("request_budget", 3),
+                   "request_budget": 3 if review else arguments.get("request_budget", 3),
                    "autonomous": not review, **config.options, "completion_policy": "draft"}
         _, created = self.runtime.create(session, payload)
         child = session.get(AgentRun, created["run_id"])
@@ -628,7 +635,7 @@ class AgentRuntime:
         if kind in {"revise_object", "propose_proof", "record_failure", "record_source"} and arguments.get("branch_id") not in {None, branch.id}:
             raise DomainError(403, "operation_outside_run_branch", "此任务只能修改自己的研究分支；可创建该分支上的子任务")
         project = session.get(Project, branch.project_id)
-        permitted = project.policies.get("agent_operations", list(operation_schemas()))
+        permitted = permitted_operations(project)
         if kind not in permitted:
             raise DomainError(403, "operation_not_allowed", "项目未授权此研究操作")
         config = session.get(AgentRun, run.id)
@@ -641,6 +648,8 @@ class AgentRuntime:
             return response
         model = OPERATION_MODELS[kind]
         values = model.model_validate(arguments).model_dump(mode="json")
+        if kind == "run_code":
+            return CodeExecutionService(self.state).execute(session, run, values)
         if kind == "read_object":
             if values.get("branch_id"):
                 requested_branch = self.state.require_branch(session, values["branch_id"])
@@ -692,6 +701,8 @@ class AgentRuntime:
                       Revision.body.contains(values["query"], autoescape=True)).order_by(Revision.created_at.desc()).limit(values["limit"])
             items = []
             for rev in session.scalars(query):
+                if rev.payload.get("deleted"):
+                    continue
                 heads = session.scalars(select(Head).where(Head.object_id == rev.object_id).order_by(Head.branch_id)).all()
                 if not heads:
                     continue
@@ -734,6 +745,8 @@ class AgentRuntime:
 
     def apply_step(self, session, payload):
         attempt, run = self.runtime._attempt(session, payload)
+        if attempt.checkpoint.get("material_erased"):
+            raise DomainError(410, "material_deleted", "相关材料已永久删除，迟到步骤不能写回。")
         existing = session.scalar(select(AgentStep).where(AgentStep.request_id == payload["request_id"]))
         if existing:
             if existing.attempt_id != attempt.id:

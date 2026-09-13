@@ -19,6 +19,7 @@ class Database:
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=FULL")
+            cursor.execute("PRAGMA secure_delete=ON")
             cursor.execute("PRAGMA busy_timeout=15000")
             cursor.close()
 

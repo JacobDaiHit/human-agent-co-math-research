@@ -12,3 +12,8 @@ export function saveDraft(key:string,value:ObjectDraft|null){
   if(value)memory.set(key,value);else memory.delete(key)
   try{if(value)sessionStorage.setItem(key,JSON.stringify(value));else sessionStorage.removeItem(key)}catch{/* The in-memory draft still survives object navigation. */}
 }
+export function clearDeletedDrafts(_branch:string,objectIds:string[]){
+  const deleted=new Set(objectIds)
+  for(const key of memory.keys())if(key.startsWith('mathagent-draft:')&&deleted.has(key.slice(key.lastIndexOf(':')+1)))memory.delete(key)
+  try{for(let i=sessionStorage.length-1;i>=0;i--){const key=sessionStorage.key(i);if(key?.startsWith('mathagent-draft:')&&deleted.has(key.slice(key.lastIndexOf(':')+1)))sessionStorage.removeItem(key)}}catch{/* Storage can be unavailable in a private browser. */}
+}

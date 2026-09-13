@@ -450,6 +450,8 @@ class WorkspaceService:
                 ):
                     adoptions[adoption.revision_id] = adoption.state
                 for revision in revisions:
+                    if revision.payload.get("deleted"):
+                        continue
                     if revision.id not in visible or needle not in revision.body.casefold():
                         continue
                     current = heads[revision.object_id] == revision.id

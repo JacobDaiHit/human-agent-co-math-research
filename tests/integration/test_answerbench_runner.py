@@ -21,6 +21,17 @@ ANSWER_SENTINEL = "ANSWER_KEY_MUST_NEVER_ENTER_THE_RUNNER"
 CONFIG = ProviderConfig("deepseek", SECRET, "deepseek-v4-flash", "https://api.deepseek.com", True)
 
 
+def test_sandbox_preflight_blocks_before_any_inference(workspace, tmp_path, monkeypatch):
+    problems, root, _ = workspace
+    monkeypatch.setattr("mathagent.tools.code_sandbox.CodeSandbox.status", lambda _: {
+        "ready": False, "reason": "docker_unavailable", "image_id": None})
+    output = tmp_path / "must-not-run"
+    with pytest.raises(ValueError, match="Sandbox unavailable before benchmark"):
+        asyncio.run(answerbench.run_batch(problems, output, CONFIG,
+            replace(answerbench.Limits(), code_sandbox=True), root))
+    assert not output.exists()
+
+
 @pytest.fixture
 def workspace(tmp_path, monkeypatch):
     cases = [{"id": f"case-{index}", "category": category,

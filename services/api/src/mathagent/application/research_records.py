@@ -121,6 +121,16 @@ def validate_record_payload(kind, payload, session, branch):
     Validation failures intentionally omit supplied payload values.
     """
     artifact_type = payload.get("artifact_type")
+    if artifact_type in {"article", "code_execution"}:
+        field = "source_revision_ids" if artifact_type == "article" else "input_revisions"
+        refs = payload.get(field)
+        if kind != "artifact" or not isinstance(refs, list) or len(refs) > 4001 or any(not isinstance(rid, str) for rid in refs):
+            raise DomainError(422, "invalid_research_record", "文章或计算记录必须保留有效的来源版本列表。")
+        for revision_id in refs:
+            revision, _ = _visible_reference(session, branch, revision_id)
+            if revision.payload.get("deleted"):
+                raise DomainError(410, "material_deleted", "不能引用已永久删除的来源。")
+        return payload
     if not isinstance(artifact_type, str) or artifact_type not in {"failure", "source"}:
         return payload
     if kind != "artifact":
@@ -146,6 +156,9 @@ def validate_record_payload(kind, payload, session, branch):
 
 
 def record_reference_ids(payload):
+    if payload.get("artifact_type") in {"article", "code_execution"}:
+        field = "source_revision_ids" if payload["artifact_type"] == "article" else "input_revisions"
+        return list(dict.fromkeys(payload.get(field, [])))
     if payload.get("artifact_type") != "failure":
         return []
     return list(
@@ -159,6 +172,11 @@ def record_reference_ids(payload):
 
 def save_record_references(session, revision_id, payload):
     """Append FK-backed references for a newly created immutable revision."""
+    if payload.get("artifact_type") in {"article", "code_execution"}:
+        role = "article_source" if payload["artifact_type"] == "article" else "code_input"
+        for target in record_reference_ids(payload):
+            session.add(ResearchRecordReference(record_revision_id=revision_id, target_revision_id=target, role=role))
+        return
     if payload.get("artifact_type") != "failure":
         return
     for role, targets in (

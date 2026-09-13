@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from mathagent import __version__
 from mathagent.api.agent_routes import mount_agent_routes
 from mathagent.api.artifact_routes import build_artifact_router
+from mathagent.api.research_assets_routes import build_research_assets_router
 from mathagent.api.research_routes import build_research_router
 from mathagent.api.runtime_routes import mount_runtime_routes
 from mathagent.api.schemas import (
@@ -271,6 +272,7 @@ def create_app(database_path=None, token=None, worker_token=None, allowed_origin
         return command("run.resume", k, {"run_id": run_id}, runtime.resume)
 
     app.include_router(build_workspace_router(workspace, human, key, command))
+    app.include_router(build_research_assets_router(service, human, key, command))
     mount_runtime_routes(app, runtime, service, human, worker, key, command)
     app.include_router(build_artifact_router(service, human, key, command))
     app.include_router(build_research_router(ResearchRecordsService(service), human, key, command))

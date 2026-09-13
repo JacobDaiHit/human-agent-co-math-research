@@ -60,6 +60,8 @@ def _context_role(node: dict[str, Any]) -> str | None:
 
 def _blocked(node: dict[str, Any], revision_id: str, *, assumption=False):
     """Return a state that prevents this revision from being a support root."""
+    if isinstance(node.get("payload"), dict) and node["payload"].get("deleted"):
+        return _result("needs_recheck", reasons=[f"{revision_id}: evidence permanently deleted."])
     adoption = node.get("adoption_state", "draft")
     if adoption == "withdrawn":
         return _result("withdrawn", reasons=[f"{revision_id}: adoption was withdrawn."])
@@ -205,6 +207,9 @@ def analyze_support(
             node = nodes.get(ref)
             if not node:
                 reference_problems.append(f"{ref}: referenced revision is missing.")
+                continue
+            if isinstance(node.get("payload"), dict) and node["payload"].get("deleted"):
+                reference_problems.append(f"{ref}: evidence permanently deleted and unavailable.")
                 continue
             if node.get("kind") not in {"claim", "context"} or (
                 ref in contexts and node.get("kind") != "context"

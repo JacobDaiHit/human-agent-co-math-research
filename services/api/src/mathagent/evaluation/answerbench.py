@@ -110,6 +110,7 @@ class Limits:
     completion_policy: str = "reviewed_answer"
     length_recovery: str = "none"
     unknown_recovery: str = "stop"
+    code_sandbox: bool = False
 
     def validate(self):
         if not 1 <= self.request_budget <= 100 or not 1 <= self.max_steps <= 40:
@@ -126,6 +127,8 @@ class Limits:
             raise ValueError("Invalid output limit recovery policy")
         if self.unknown_recovery not in {"stop", "once"}:
             raise ValueError("Invalid unknown outcome recovery policy")
+        if type(self.code_sandbox) is not bool:
+            raise ValueError("Invalid sandbox policy")
 
 
 class CompletionOnlyTransport(httpx.AsyncBaseTransport):
@@ -225,7 +228,7 @@ async def local_api(directory, config):
 
 
 async def run_case(case, directory, config, limits, batch_id, *, api_factory=local_api,
-                   transport_factory=None):
+                   transport_factory=None, sandbox_image=None):
     directory.mkdir(parents=True, exist_ok=True)
     report_path = directory / "report.json"
     if report_path.exists():
@@ -271,7 +274,11 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
             "request_budget": limits.request_budget, "allow_real_api": True,
             "allowed_providers": [config.name]}, "PUT")
         await write(f"/projects/{project_id}/agent-policy", {"allowed_operations": OPERATIONS}, "PUT")
-        options = {k: v for k, v in asdict(limits).items() if k not in {"case_timeout_seconds", "parallel_cases"}}
+        if limits.code_sandbox:
+            sandbox = await write(f"/projects/{project_id}/code-sandbox", {"enabled": True}, "PUT")
+            if not sandbox.get("ready") or sandbox.get("image_id") != sandbox_image:
+                raise RuntimeError("Sandbox differs from frozen preflight; no inference dispatched")
+        options = {k: v for k, v in asdict(limits).items() if k not in {"case_timeout_seconds", "parallel_cases", "code_sandbox"}}
         research = await write("/runs", {"branch_id": branch_id,
             "goal_object_id": project["object_id"], "provider": config.name,
             "autonomous": True, "instruction": INSTRUCTION, **options})
@@ -377,6 +384,7 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
 def source_fingerprint(root):
     files = [*root.joinpath("services/api/src/mathagent").rglob("*.py"),
              root / "scripts/imo_answerbench.py", root / "pyproject.toml", root / "uv.lock"]
+    files.extend(path for path in (root / "sandbox/runner.py", root / "sandbox/Dockerfile") if path.is_file())
     entries = {str(path.relative_to(root)).replace("\\", "/"): digest(path.read_bytes()) for path in sorted(files)}
     return {"sha256": digest(json.dumps(entries, sort_keys=True).encode()), "files": entries}
 
@@ -417,12 +425,21 @@ async def run_batch(problems_file, directory, config, limits, root, *, resume=Fa
             raise ValueError("Select nonempty, unique, known case IDs")
         problems = {**problems, "problems": [case for case in problems["problems"] if case["id"] in case_ids]}
     directory = Path(directory).resolve()
+    sandbox_configuration = {"enabled": False}
+    if limits.code_sandbox:
+        from mathagent.tools.code_sandbox import TOOL_VERSION, CodeSandbox
+        sandbox = CodeSandbox(directory / "sandbox-preflight.sqlite3").status()
+        if not sandbox["ready"]:
+            raise ValueError("Sandbox unavailable before benchmark: " + sandbox["reason"])
+        sandbox_configuration = {"enabled": True, "image_id": sandbox["image_id"],
+                                 "network": "none", "tool_version": TOOL_VERSION}
     directory.mkdir(parents=True, exist_ok=resume)
     with batch_lock(directory):
         fingerprint = source_fingerprint(Path(root))
         stable = {"problems_sha256": digest(Path(problems_file).read_bytes()),
             "provider": config.name, "requested_model": config.model, "limits": asdict(limits),
             "source": fingerprint, "instruction_sha256": digest(INSTRUCTION.encode()),
+            "code_sandbox": sandbox_configuration,
             "scope": "targeted_retest" if case_ids is not None else "full_fixture",
             "case_ids": [case["id"] for case in problems["problems"]]}
         plan_file = directory / "plan.json"
@@ -445,7 +462,8 @@ async def run_batch(problems_file, directory, config, limits, root, *, resume=Fa
                 case_dir = directory / case["id"]
                 try:
                     return await run_case(case, case_dir, config, limits, plan["batch_id"],
-                        api_factory=api_factory, transport_factory=transport_factory)
+                        api_factory=api_factory, transport_factory=transport_factory,
+                        sandbox_image=sandbox_configuration.get("image_id"))
                 except Exception as error:
                     # Preserve partial journals/observations and continue the other cases.
                     case_dir.mkdir(parents=True, exist_ok=True)
