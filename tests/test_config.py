@@ -101,16 +101,34 @@ def test_load_utf16_big_endian(tmp_path, environment):
 
 
 def test_existing_process_values_including_empty_and_disabled_win(tmp_path, environment):
-    environment.update({"MATHAGENT_ENABLE_REAL_API": "0", "MATHAGENT_DEEPSEEK_API_KEY": ""})
+    environment.update(
+        {
+            "MATHAGENT_ENABLE_REAL_API": "0",
+            "MATHAGENT_DEEPSEEK_API_KEY": "",
+            "MATHAGENT_SANDBOX_IMAGE": "process-image",
+        }
+    )
     path = tmp_path / "synthetic.env"
     path.write_text(
-        "MATHAGENT_ENABLE_REAL_API=1\nMATHAGENT_DEEPSEEK_API_KEY=synthetic-key\nMATHAGENT_DEEPSEEK_MODEL=synthetic-model\n",
+        "MATHAGENT_ENABLE_REAL_API=1\n"
+        "MATHAGENT_DEEPSEEK_API_KEY=synthetic-key\n"
+        "MATHAGENT_DEEPSEEK_MODEL=synthetic-model\n"
+        "MATHAGENT_SANDBOX_IMAGE=dotenv-image\n",
         encoding="utf-8",
     )
     assert config.load_local_environment(path) == ["MATHAGENT_DEEPSEEK_MODEL"]
     assert environment["MATHAGENT_ENABLE_REAL_API"] == "0"
     assert environment["MATHAGENT_DEEPSEEK_API_KEY"] == ""
+    assert environment["MATHAGENT_SANDBOX_IMAGE"] == "process-image"
     assert config.load_local_environment(path) == []
+
+
+def test_load_sandbox_image_from_dotenv(tmp_path, environment):
+    path = tmp_path / "synthetic.env"
+    path.write_text("MATHAGENT_SANDBOX_IMAGE=dotenv-image\n", encoding="utf-8")
+
+    assert config.load_local_environment(path) == ["MATHAGENT_SANDBOX_IMAGE"]
+    assert environment["MATHAGENT_SANDBOX_IMAGE"] == "dotenv-image"
 
 
 def test_disabled_loader_does_not_access_files(environment, monkeypatch):

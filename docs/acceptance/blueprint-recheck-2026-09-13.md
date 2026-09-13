@@ -48,6 +48,16 @@
 
 ## 下一次数论复跑的冻结要求
 
+### 重启后的真实验收
+
+2026-09-13 重启后 `HypervisorPresent=true`，Ubuntu `true` 返回 0。Docker 随后暴露两个残留 AF_UNIX 通信文件错误（`Docker/run/dockerInference`、`docker-secrets-engine/engine.sock`）；停止 Docker 后将两个运行时目录分别保留为备份，再启动，Docker Server 29.4.0 正常响应。没有恢复出厂设置或删除镜像/卷。
+
+基础镜像首次下载因直连认证端点超时失败；仅在构建命令进程使用已有本地代理后构建成功，不改变模型或容器联网策略。固定镜像为 `sha256:8ff4228d908d291e4963f023bf02413ac35e10d6fb742cc22f5728c0c82b1874`。真实隔离测试 **3 通过、0 跳过**，见 `sandbox-isolation-2026-09-13.xml`；覆盖非特权执行、宿主/密钥隔离、断网、只读监督程序、逃逸进程与关闭管道的超时、输出上限和程序失败状态。至此原后端测试中跳过的三个实际环境检查已补验通过，既有测试记录保留原样。
+
+以下为执行前要求；run06 的预登记与最终结果独立记录，不覆盖旧批次。
+
+补充端到端配置检查发现 `.env` 白名单及 benchmark 独立 API 进程未传递镜像配置，已分别修正。新增真实 API 启用沙箱检查确认镜像匹配且请求占用为 0；与三项隔离测试合计 **4 通过**，见 `sandbox-api-final-2026-09-13.xml`。此前 runner 回归 9 项通过，新增测试首次因本仓库未安装 pytest-asyncio 无法运行，改用现有的 `asyncio.run` 模式后通过；初轮记录保留为 `sandbox-runner-initial-2026-09-13.xml`。
+
 - 只选 `imo-bench-number_theory-081`，新目录独立记录；前三题原成绩保持。
 - 历史总预算 12 次，已有 spent 3 次及 unknown 1 次，共占用 4 次；新批次至多 8 次，未知占用不得退回。跨历史批次的合并预算仍通过明确预登记核算。
 - 明确指定原模型 `deepseek-v4-flash`，不默默使用当前 `.env` 中不同的默认模型；High、启用思考、`reviewed_answer`，未知续试 `once`、长度恢复 `high`。

@@ -1,9 +1,13 @@
 """Opt-in real Docker acceptance. Mock tests cannot satisfy this isolation gate."""
 
+import asyncio
 import os
 import time
+from uuid import uuid4
 
 import pytest
+from mathagent.evaluation.answerbench import local_api
+from mathagent.providers.remote import ProviderConfig
 from mathagent.tools.code_sandbox import CodeSandbox
 
 pytestmark = pytest.mark.skipif(
@@ -68,3 +72,23 @@ def test_output_is_bounded_and_program_error_is_not_success(sandbox):
     assert len(flood["stdout"].encode()) <= 32768
     failed = sandbox.execute("isolation", "program-error", "raise ValueError('synthetic failure')", 2)
     assert not failed["ok"] and failed["reason"] == "program_error", failed
+
+
+def test_benchmark_api_receives_pinned_image_without_model_dispatch(tmp_path):
+    asyncio.run(_check_benchmark_api(tmp_path))
+
+
+async def _check_benchmark_api(tmp_path):
+    config = ProviderConfig("deepseek", "synthetic-unused", "deepseek-v4-flash", "https://api.deepseek.com", True)
+    async with local_api(tmp_path, config) as (client, human):
+        headers = {"Authorization": "Bearer " + human, "Idempotency-Key": str(uuid4())}
+        created = await client.post("/projects", json={"title": "Isolation preflight", "body": "Synthetic fixture"}, headers=headers)
+        assert created.is_success, created.text
+        project_id = created.json()["project_id"]
+        headers["Idempotency-Key"] = str(uuid4())
+        enabled = await client.put(f"/projects/{project_id}/code-sandbox", json={"enabled": True}, headers=headers)
+        assert enabled.is_success, enabled.text
+        assert enabled.json()["ready"] is True
+        assert enabled.json()["image_id"] == os.environ["MATHAGENT_SANDBOX_IMAGE"]
+        budget = await client.get(f"/projects/{project_id}/budget", headers=headers)
+        assert budget.json()["occupied"] == 0

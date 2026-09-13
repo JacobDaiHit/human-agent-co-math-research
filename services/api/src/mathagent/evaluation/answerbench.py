@@ -194,6 +194,10 @@ async def local_api(directory, config):
         prefix + "_API_KEY": config.api_key, prefix + "_MODEL": config.model,
         prefix + "_BASE_URL": config.base_url,
     })
+    # Only the operator-selected image crosses into the isolated API; project
+    # opt-in and the frozen-image check still happen before inference dispatch.
+    if os.environ.get("MATHAGENT_SANDBOX_IMAGE"):
+        environment["MATHAGENT_SANDBOX_IMAGE"] = os.environ["MATHAGENT_SANDBOX_IMAGE"]
     with (directory / "api.log").open("ab") as log:
         process = await asyncio.create_subprocess_exec(
             getattr(sys, "_base_executable", sys.executable), "-X", "utf8", "-m", "uvicorn", "mathagent.api.app:create_app", "--factory",
