@@ -30,6 +30,9 @@ def test_actual_prompt_uses_the_assigned_mode_schema(mode, autonomous):
         assert "scope" in schema["required"]
         assert schema["properties"]["scope"]["type"] == "string"
     assert result_schema("research")["properties"]["verdict"]["type"] == "null"
+    assert "恰好是一个 JSON 对象" in system
+    assert "第二个 JSON 值" in system
+    assert "裸控制字符" in system
 
 
 def test_autonomous_next_action_is_explicit_while_single_round_and_reviews_stay_compatible():

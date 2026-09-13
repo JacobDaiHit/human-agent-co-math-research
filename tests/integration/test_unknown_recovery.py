@@ -7,8 +7,10 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from mathagent.persistence.models import Attempt, Head
+from mathagent.persistence.runtime_models import ProviderRequest
 from mathagent.providers.remote import ProviderConfig, ProviderFailure, RemoteProvider
 from mathagent.runtime.worker import HTTPWorker
+from sqlalchemy import select
 from test_autonomous_agent import action, exercise, project_and_run, result
 from test_autonomous_agent import app as app
 
@@ -74,6 +76,32 @@ def test_wire_unknown_retains_occupancy_and_never_executes_partial_output(app, p
         snapshot = await api.get(f"/projects/{project['project_id']}/snapshot")
         current = next(r for r in snapshot["runs"] if r["id"] == run["run_id"])
         assert current["state"] == ("completed" if ledger["spent"] else "reconciliation_required")
+    exercise(app, scenario)
+
+
+def test_unknown_output_usage_keeps_the_full_pre_dispatch_reservation(app):
+    async def scenario(api, client):
+        _, run = await setup_run(
+            api, budget=3, unknown_recovery="stop", cumulative_output_token_budget=300
+        )
+
+        class Unknown:
+            async def generate(self, task):
+                assert task["max_output_tokens"] == 300
+                raise ProviderFailure("transport_read_error", outcome="unknown")
+
+        await HTTPWorker(client, providers=["deepseek"], provider_factory=lambda _: Unknown()).run(once=True)
+        tokens = (await api.get(f"/runs/{run['run_id']}/budget"))["output_token_budget"]
+        assert tokens["reported_output_tokens"] == 0
+        assert tokens["reserved_output_tokens"] == tokens["occupied_output_tokens"] == 300
+        assert tokens["remaining_output_tokens"] == 0
+        assert tokens["unknown_outcome_requests"] == tokens["unknown_usage_requests"] == 1
+        # Simulate a pre-0007 unknown request.  It had no reservation column
+        # value, so enabling a limit later must use the conservative fallback.
+        with app.state.database.sessions.begin() as session:
+            session.scalars(select(ProviderRequest).where(ProviderRequest.run_id == run["run_id"])).one().output_token_reservation = 0
+        migrated = (await api.get(f"/runs/{run['run_id']}/budget"))["output_token_budget"]
+        assert migrated["reserved_output_tokens"] == migrated["occupied_output_tokens"] == 65_536
     exercise(app, scenario)
 
 

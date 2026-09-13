@@ -24,6 +24,7 @@ class RunUpdate(Command):
     max_children: int = Field(ge=0, le=12)
     max_depth: int = Field(ge=0, le=4)
     max_output_tokens: int = Field(ge=256, le=MAX_OUTPUT_TOKENS)
+    cumulative_output_token_budget: int | None = Field(default=None, ge=256, le=10_000_000)
     request_timeout_seconds: int = Field(ge=1, le=600)
     thinking_mode: ThinkingMode = "provider_default"
     reasoning_effort: ReasoningEffort = "provider_default"
@@ -67,7 +68,10 @@ def mount_agent_routes(app, runtime, human, worker, key, command):
 
     @app.put("/runs/{run_id}/options", dependencies=[Depends(human)])
     def update_options(run_id: str, p: RunUpdate, k: str = Depends(key)):
-        return command("agent.options", k, {"run_id": run_id, **p.model_dump()}, agent.update_options)
+        values = p.model_dump()
+        if "cumulative_output_token_budget" not in p.model_fields_set:
+            values.pop("cumulative_output_token_budget")
+        return command("agent.options", k, {"run_id": run_id, **values}, agent.update_options)
 
     @app.get("/branches/{branch_id}/runtime-settings", dependencies=[Depends(human)])
     def branch_settings(branch_id: str):

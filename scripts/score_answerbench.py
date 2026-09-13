@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KEY = ROOT / "fixtures" / "imo_answerbench" / "answer-key.json"
 METHOD = "local_conservative_answer_equivalence"
-SCORER_REVISION = "2"
+SCORER_REVISION = "3"
 MAX_ANSWER_LENGTH = 512
 MAX_AST_NODES = 96
 MAX_AST_DEPTH = 14
@@ -76,6 +76,17 @@ def unwrap(text: str) -> str:
 
 
 def final_from_report(report: dict) -> tuple[str | None, str]:
+    if report.get("report_schema_version") == "2.0":
+        selected = report.get("answer_submission") or {}
+        if selected.get("status") != "submitted":
+            return None, "no_declared_submission"
+        body = report.get("final_body") or ""
+        answer = selected.get("answer")
+        if (selected.get("selection_rule") != "last-root-step-explicit-finish-single-box-v1"
+                or selected.get("body_sha256") != hashlib.sha256(body.encode()).hexdigest()
+                or not isinstance(answer, str) or not answer.strip()):
+            raise UnsupportedAnswer("Invalid frozen submission receipt")
+        return answer, "declared_submission_v1"
     answer = report.get("final_answer")
     if isinstance(answer, str) and answer.strip():
         return answer, "final_answer"
@@ -333,6 +344,12 @@ def score_report(report: dict, key: dict) -> dict:
         "state": report.get("state"),
         "terminal_reason": report.get("terminal_reason"),
         "completed": report.get("completed") is True,
+        "evaluation_mode": report.get("evaluation_mode", "legacy_research"),
+        "solver": report.get("solver", "agent"),
+        "proof_assessment": report.get("proof_assessment", {"status": "unrecorded"}),
+        "usage_summary": report.get("usage_summary"),
+        "requests": report.get("requests"),
+        "financial_reconciliation_pending": report.get("financial_reconciliation_pending"),
         "interventions": report.get("interventions", []),
         "runtime_terminal": report.get("state") in RUNTIME_TERMINAL_STATES,
         "runtime_completed": report.get("state") == "completed",
@@ -353,12 +370,15 @@ def score_report(report: dict, key: dict) -> dict:
                    "final_answer_present": candidate is not None})
     if candidate is None:
         return classify_result({**common, "grade": "incorrect", "reason": "missing_final_answer"})
-    if not common["completed"]:
+    if not common["completed"] and report.get("report_schema_version") != "2.0":
         return classify_result({**common, "grade": "ungraded", "reason": "run_not_completed"})
     return classify_result({**common, **compare(candidate, key["short_answer"], key["answer_type"])})
 
 
 def score_batch(batch_dir: Path, answer_key: Path = DEFAULT_KEY, *, case_ids=None) -> dict:
+    plan_path = batch_dir / "plan.json"
+    if case_ids is None and plan_path.exists():
+        case_ids = json.loads(plan_path.read_text(encoding="utf-8"))["configuration"]["case_ids"]
     raw_key = answer_key.read_bytes()
     keys = json.loads(raw_key)["answers"]
     if case_ids is not None:
@@ -383,15 +403,16 @@ def score_batch(batch_dir: Path, answer_key: Path = DEFAULT_KEY, *, case_ids=Non
     counts = Counter(result["grade"] for result in results)
     statuses = Counter(result["answer_status"] for result in results)
     return {
-        "schema_version": "1.1",
-        "benchmark": "IMO-AnswerBench four-case integration sample",
+        "schema_version": "2.0",
+        "benchmark": "IMO-AnswerBench selected cases",
         "scope": "targeted_retest" if case_ids is not None else "full_fixture",
         "case_ids": [key["id"] for key in keys],
         "grading_method": METHOD,
         "scorer_revision": SCORER_REVISION,
         "scorer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "scorer_revision_note": "Revision 2 separates missing final answers from mathematically "
-        "incorrect answers. Answer extraction and equivalence rules are unchanged.",
+        "scorer_revision_note": "Revision 3 grades predeclared schema-v2 answer submissions independently "
+        "of internal proof review and workflow status. Legacy report completion gates remain unchanged; "
+        "no earlier candidate is promoted into a final answer. Equivalence rules are unchanged.",
         "official_answer_autograder": False,
         "method_notice": "Local conservative offline check, not official Gemini AnswerAutoGrader. "
         "Only final-answer equivalence is assessed; proofs are not graded. "

@@ -112,7 +112,12 @@ class HTTPWorker:
                 )
                 if not boundary["continue"]:
                     return
-                reservation = await self._post(attempt_path + "/requests", execution)
+                # Keep the service's durable reservation identical to the cap
+                # the adapter will receive.  A below-minimum remainder is
+                # deliberately rejected by reserve before any provider call.
+                reservation = await self._post(attempt_path + "/requests", {
+                    **execution, "requested_output_tokens": max(256, task["max_output_tokens"]),
+                })
                 if not reservation["continue"]:
                     return
                 request_path = f"/requests/{reservation['request_id']}"
@@ -162,6 +167,11 @@ class HTTPWorker:
                             "retry_unknown": error.outcome == "unknown" and error.code in UNKNOWN_TRANSPORT_FAILURES and retry < 2,
                         },
                     )
+                    output_budget = settlement.get("output_token_budget_status")
+                    if output_budget and output_budget.get("enabled"):
+                        task = {**task, "max_output_tokens": min(
+                            task["max_output_tokens"], output_budget["remaining_output_tokens"]
+                        ), "output_token_budget_status": output_budget}
                     if settlement.get("unknown_retry_allowed"):
                         # Discard the interrupted response entirely. Its ledger
                         # entry remains unknown; reserve a distinct paid request.

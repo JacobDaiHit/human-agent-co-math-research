@@ -107,6 +107,9 @@ class Runtime:
                 query = select(ProviderRequest).where(ProviderRequest.project_id == project_id)
             requests = session.scalars(query.order_by(ProviderRequest.created_at)).all()
             counts = self._counts(requests)
+            # A run's output limit belongs to its root tree, which may include
+            # siblings outside this endpoint's request-list subtree.
+            output_budget = self.agent.output_token_budget_status(session, run) if run_id else None
             return {
                 "project_id": project_id,
                 "run_id": run_id,
@@ -114,6 +117,7 @@ class Runtime:
                 **counts,
                 "remaining": max(0, limit - counts["occupied"]),
                 "unit": "requests",
+                "output_token_budget": output_budget,
                 "requests": [self._request_record(r) for r in requests],
             }
 
@@ -126,6 +130,7 @@ class Runtime:
             "provider": row.provider,
             "state": row.state,
             "usage": row.usage,
+            "output_token_reservation": row.output_token_reservation,
             "reason": row.reason,
             "provider_request_id": row.provider_request_id,
             "created_at": row.created_at,
@@ -273,12 +278,31 @@ class Runtime:
             attempt.checkpoint = {**attempt.checkpoint, "end_reason": "request_budget_exhausted"}
             self._emit(session, run, "run.budget_exhausted", {"attempt_id": attempt.id})
             return 200, {"continue": False, "state": run.state}
+        requested_output_tokens = payload.get("requested_output_tokens")
+        if requested_output_tokens is None:
+            # Legacy workers remain usable.  Current workers always supply the
+            # exact cap they will pass to the provider.
+            requested_output_tokens = self.agent.options(session, run.id)["max_output_tokens"]
+        output_budget = self.agent.output_token_budget_status(session, run)
+        if output_budget["enabled"] and requested_output_tokens > output_budget["remaining_output_tokens"]:
+            attempt.state = "failed"
+            run.state = "budget_exhausted"
+            attempt.checkpoint = {**attempt.checkpoint, "end_reason": "cumulative_output_token_budget_exhausted"}
+            self._emit(session, run, "run.budget_exhausted", {
+                "attempt_id": attempt.id, "output_token_budget": output_budget,
+                "requested_output_tokens": requested_output_tokens,
+            })
+            return 200, {"continue": False, "state": run.state, "output_token_budget": output_budget}
         row = ProviderRequest(
             project_id=branch.project_id,
             run_id=run.id,
             attempt_id=attempt.id,
             provider=run.provider,
             state="reserved",
+            # Retain the cap even while the optional limit is disabled.  If an
+            # operator later enables it, unreported/unknown prior calls still
+            # cannot be treated as a zero-token refund.
+            output_token_reservation=requested_output_tokens,
         )
         session.add(row)
         session.flush()
@@ -370,7 +394,8 @@ class Runtime:
             run.state = "reconciliation_required"
         self._emit(session, run, "request.settled", self._request_record(row))
         return 200, {**self._request_record(row), "unknown_retry_allowed": retry_allowed,
-                     "request_budget_status": self.agent.request_budget_status(session, run) if retry_allowed else None}
+                     "request_budget_status": self.agent.request_budget_status(session, run) if retry_allowed else None,
+                     "output_token_budget_status": self.agent.output_token_budget_status(session, run)}
 
     def fail(self, session, payload):
         attempt, run = self._attempt(session, payload)

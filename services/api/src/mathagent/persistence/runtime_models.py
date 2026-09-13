@@ -30,5 +30,6 @@ class ProviderRequest(Base):
     state: Mapped[str] = mapped_column(String, default="reserved")
     provider_request_id: Mapped[str | None] = mapped_column(String, nullable=True)
     usage: Mapped[dict] = mapped_column(JSON, default=dict)
+    output_token_reservation: Mapped[int] = mapped_column(Integer, default=0)
     reason: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[str] = mapped_column(String, default=now)

@@ -191,6 +191,32 @@ def test_invalid_json_retains_complete_response_usage_id_and_configuration(strea
     assert error.observation["call_config"]["model"] == "synthetic-model"
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        json.dumps(result()) + '\n{"unrelated": true}',
+        json.dumps(result(body="first line\nsecond line")).replace("\\n", "\n"),
+    ],
+    ids=["second_top_level_value", "unescaped_control_character"],
+)
+def test_completed_malformed_json_is_spent_without_local_repair(raw):
+    with pytest.raises(ProviderFailure) as caught:
+        call(lambda _: httpx.Response(200, json=envelope(raw)))
+    error = caught.value
+    assert str(error) == "invalid_structured_output"
+    assert error.outcome == "spent" and not error.retryable
+    assert error.observation["raw_text"] == raw
+    assert error.observation["complete"] is True
+    assert error.observation["finish_reason"] == "stop"
+
+
+def test_one_json_object_with_escaped_newline_is_accepted_without_rewriting():
+    raw = json.dumps(result(body="first line\nsecond line"))
+    output = call(lambda _: httpx.Response(200, json=envelope(raw)))
+    assert output["result"]["body"] == "first line\nsecond line"
+    assert output["observation"]["raw_text"] == raw
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 def test_length_truncation_retains_prefix_and_trailing_usage(streaming):
     raw = '{"mode":"research","body":"partial'

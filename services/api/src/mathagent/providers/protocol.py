@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-PROMPT_VERSION = "research-operations-v6"
+PROMPT_VERSION = "research-operations-v7"
 
 
 class AgentAction(BaseModel):
@@ -139,6 +139,9 @@ def messages_for(task):
             "正文、findings、scope 以及操作正文中的数学内容都遵守此规则。"
             "计算器 inputs 的机器表达式使用工具约定的 ** 和 *，不要加 $ 或 LaTeX 命令。"
             "JSON 中 LaTeX 命令的反斜杠只转义一层；解析 JSON 后应是一个反斜杠，不能变成双反斜杠。"
+            "响应必须恰好是一个 JSON 对象：从第一个字符 { 到最后一个字符 }，前后不得有说明、"
+            "Markdown 代码围栏、第二个 JSON 值或其他文本。JSON 字符串中的换行和控制字符必须"
+            "按 JSON 转义（例如 \\n），不得直接写入裸控制字符。"
             "body 给出完整必要论证，findings 简短且不重复整段正文；操作进度只概括实际回执。"
             "引用仅能使用输入中的 revision_id。\n"
             "以下仅演示正确的格式和转义，与当前题目无关，不要照抄："
@@ -160,6 +163,8 @@ def messages_for(task):
                     "remaining_steps": task.get("remaining_steps"),
                     "completion_requirements": task.get("completion_requirements"),
                     "request_budget_status": task.get("request_budget_status"),
+                    "output_token_budget_status": task.get("output_token_budget_status"),
+                    "review_request_reserve": task.get("review_request_reserve"),
                     "operation_results": task.get("operation_results", []),
                     "repair_output": task.get("repair_output"),
                     "output_limit_recovery": task.get("output_limit_recovery"),

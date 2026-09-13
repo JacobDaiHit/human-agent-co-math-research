@@ -24,6 +24,13 @@ class Execution(Command):
     token: Id
 
 
+class RequestReservation(Execution):
+    # The worker sends the exact cap it will give the provider.  The service
+    # durably reserves this amount before dispatch, so concurrent descendants
+    # cannot collectively exceed an enabled cumulative output budget.
+    requested_output_tokens: Annotated[int, Field(strict=True, ge=256, le=65_536)] | None = None
+
+
 class Heartbeat(Execution):
     boundary: bool = False
 
@@ -85,7 +92,7 @@ def mount_runtime_routes(app, runtime, service, human, worker, key, command):
         )
 
     @app.post("/attempts/{attempt_id}/requests", dependencies=[Depends(worker)])
-    def reserve(attempt_id: str, p: Execution, k: str = Depends(key)):
+    def reserve(attempt_id: str, p: RequestReservation, k: str = Depends(key)):
         return command(
             "request.reserve",
             k,

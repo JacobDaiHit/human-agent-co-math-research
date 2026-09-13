@@ -110,6 +110,10 @@ class RunCreate(Command):
     max_children: int = Field(default=4, ge=0, le=12)
     max_depth: int = Field(default=2, ge=0, le=4)
     max_output_tokens: int = Field(default=4096, ge=256, le=MAX_OUTPUT_TOKENS)
+    # This constrains completion/output tokens across the complete root run tree.
+    # Prompt tokens are reported when supplied by the provider, but are not used as
+    # a tokenizer-dependent admission bound.
+    cumulative_output_token_budget: int | None = Field(default=None, ge=256, le=10_000_000)
     request_timeout_seconds: int = Field(default=180, ge=1, le=600)
     thinking_mode: ThinkingMode = "provider_default"
     reasoning_effort: ReasoningEffort = "provider_default"

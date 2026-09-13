@@ -15,6 +15,7 @@ def _completed(args, **kwargs):
 
 
 def test_status_fails_closed_without_immutable_local_image(tmp_path, monkeypatch):
+    monkeypatch.delenv("MATHAGENT_SANDBOX_IMAGE", raising=False)
     sandbox = CodeSandbox(tmp_path / "mathagent.db")
     assert sandbox.status() == {"ready": False, "reason": "image_not_configured", "image_id": None}
 

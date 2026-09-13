@@ -27,6 +27,7 @@ from sqlalchemy import func, select
 DEFAULT_OPTIONS = {
     "max_steps": 8, "max_review_rounds": 2, "max_children": 4, "max_depth": 2,
     "max_output_tokens": 4096, "request_timeout_seconds": 180,
+    "cumulative_output_token_budget": None,
     "thinking_mode": "provider_default", "reasoning_effort": "provider_default",
     "completion_policy": "draft",
     "length_recovery": "none",
@@ -64,7 +65,7 @@ class AgentRuntime:
         run = self.runtime._run(session, payload["run_id"])
         row = session.get(AgentRun, run.id) or self.register(session, run.id, payload)
         row.autonomous = payload["autonomous"]
-        row.options = {k: payload[k] for k in DEFAULT_OPTIONS}
+        row.options = {k: payload.get(k, row.options.get(k, default)) for k, default in DEFAULT_OPTIONS.items()}
         session.get(RunOptions, run.id).request_budget = payload["request_budget"]
         self.runtime._emit(session, run, "run.options_changed", self.options(session, run.id), "human")
         return 200, self.options(session, run.id)
@@ -138,6 +139,68 @@ class AgentRuntime:
 
     def additional_budget_exhausted(self, session, run, requests):
         return self.request_budget_status(session, run, requests)["remaining"] <= 0
+
+    @staticmethod
+    def _nonnegative_int(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    def output_token_budget_status(self, session, run, requests=None):
+        """Return conservative root-tree output accounting.
+
+        Vendor usage is not assumed to be complete.  A request with no usable
+        completion count continues to occupy its pre-dispatch reservation,
+        including unknown outcomes.
+        """
+        config = session.get(AgentRun, run.id)
+        root_id = config.root_run_id if config else run.id
+        root = session.get(AgentRun, root_id)
+        limit = (root.options if root else {}).get("cumulative_output_token_budget")
+        family = set(session.scalars(select(AgentRun.run_id).where(AgentRun.root_run_id == root_id)))
+        family.add(root_id)
+        if requests is None:
+            requests = session.scalars(select(ProviderRequest).where(ProviderRequest.run_id.in_(family))).all()
+        else:
+            requests = [item for item in requests if item.run_id in family]
+        reported_output = reported_input = reserved = unknown_requests = incomplete_usage = 0
+        for request in requests:
+            usage = request.usage if isinstance(request.usage, dict) else {}
+            completion = self._nonnegative_int(usage.get("completion_tokens"))
+            prompt = self._nonnegative_int(usage.get("prompt_tokens"))
+            if prompt is not None:
+                reported_input += prompt
+            if request.state == "spent" and completion is not None:
+                reported_output += completion
+            elif request.state in {"reserved", "dispatched", "unknown", "spent"}:
+                reservation = request.output_token_reservation
+                if reservation == 0:
+                    # Rows created before 0007 have no durable reservation.
+                    # Recover a saved provider cap when possible; otherwise use
+                    # the API's maximum rather than falsely treating unknown
+                    # historical usage as free after a limit is enabled.
+                    call = session.get(ProviderCall, request.id)
+                    parameters = (call.call_config or {}).get("parameters", {}) if call else {}
+                    configured = parameters.get("max_tokens", parameters.get("max_output_tokens")) \
+                        if isinstance(parameters, dict) else None
+                    reservation = configured if self._nonnegative_int(configured) is not None and 256 <= configured <= 65_536 else 65_536
+                reserved += reservation
+                incomplete_usage += 1
+            if request.state == "unknown":
+                unknown_requests += 1
+        occupied = reported_output + reserved
+        enabled = isinstance(limit, int) and not isinstance(limit, bool)
+        remaining = max(0, limit - occupied) if enabled else None
+        return {
+            "unit": "output_tokens", "enabled": enabled, "limit": limit if enabled else None,
+            "reported_output_tokens": reported_output,
+            "reported_input_tokens": reported_input,
+            "reserved_output_tokens": reserved,
+            "occupied_output_tokens": occupied,
+            "remaining_output_tokens": remaining,
+            "unknown_usage_requests": incomplete_usage,
+            "unknown_outcome_requests": unknown_requests,
+            "scope": "root_run_and_descendants",
+            "includes_format_repairs": True,
+        }
 
     def request_budget_status(self, session, run, requests=None):
         project_id = self.state.require_branch(session, run.branch_id).project_id
@@ -296,6 +359,28 @@ class AgentRuntime:
 
         options = self.options(session, task["run_id"])
         task.update(options)
+        run = self.runtime._run(session, task["run_id"])
+        output_budget = self.output_token_budget_status(session, run)
+        task["output_token_budget_status"] = output_budget
+        if output_budget["enabled"]:
+            # The service repeats this check atomically at reservation time.
+            # This is an effective provider cap, never an assertion about an
+            # exact prompt-token tokenizer bound.
+            task["max_output_tokens"] = min(task["max_output_tokens"], output_budget["remaining_output_tokens"])
+        root = session.get(AgentRun, session.get(AgentRun, run.id).root_run_id)
+        if root and root.options.get("completion_policy") == "reviewed_answer" and task["mode"] != "review":
+            task["review_request_reserve"] = {
+                "planning_only": True,
+                "hard_reserved_output_tokens": 0,
+                "recommended_remaining_requests": [
+                    "one independent review", "one revision after review", "one final synthesis",
+                ],
+                "recommended_output_tokens_per_request": (
+                    min(options["max_output_tokens"], output_budget["remaining_output_tokens"] // 3)
+                    if output_budget["enabled"] else options["max_output_tokens"]
+                ),
+                "guidance": "Preserve room for review, revision, and final synthesis. If the remaining output allowance cannot support all three, save a candidate for review early and do not claim it is proved.",
+            }
         branch = self.state.require_branch(session, self.runtime._run(session, task["run_id"]).branch_id)
         permitted = permitted_operations(session.get(Project, branch.project_id))
         task["operation_schemas"] = {k: v for k, v in operation_schemas().items() if k in permitted} if options["autonomous"] else {}

@@ -1,0 +1,129 @@
+"""Tool-free DeepSeek baselines: one shot or a fixed, gold-blind self-refinement chain."""
+
+import asyncio
+import time
+
+import httpx
+from mathagent.evaluation.outcomes import submission, usage_summary
+
+DIRECT_INSTRUCTION = r"""Solve the given Olympiad problem. No internet, tools, external
+references, answer key or human hints are available. Explain your reasoning and use
+LaTeX for all mathematics. Submit exactly one final answer in \boxed{...} in your reply.
+If the proof is incomplete, state its gaps honestly. If you have no answer, abstain
+without a boxed guess. An answer submission does not certify the proof.
+"""
+REFINE_INSTRUCTION = "Independently check your previous reasoning for errors, correct any you find, and submit your best final answer. State unresolved proof gaps. Do not assume the previous answer was correct."
+
+
+def output_occupancy(calls):
+    total = 0
+    for call in calls:
+        used = (call.get("usage") or {}).get("completion_tokens")
+        total += used if call["state"] == "spent" and type(used) is int and used >= 0 else call["reserved_output_tokens"]
+    return total
+
+
+async def run_direct_case(case, directory, config, limits, *, transport_factory=None):
+    from mathagent.evaluation.answerbench import CompletionOnlyTransport, stamp, write_json
+
+    directory.mkdir(parents=True, exist_ok=False)
+    started = time.monotonic()
+    calls, messages = [], [{"role": "system", "content": DIRECT_INSTRUCTION},
+                          {"role": "user", "content": case["problem"]}]
+    transport = CompletionOnlyTransport(config.base_url + "/chat/completions", directory,
+        inner=transport_factory(case) if transport_factory else None)
+    final_body, terminal, unknown_retries = None, "completed", 0
+    ledger = directory / "baseline-calls.json"
+    output_budget = limits.cumulative_output_token_budget
+    occupied_output = 0
+    async with httpx.AsyncClient(transport=transport, trust_env=False, follow_redirects=False) as client:
+        for index in range(limits.request_budget):
+            remaining_seconds = limits.case_timeout_seconds - (time.monotonic() - started)
+            if remaining_seconds <= 0:
+                terminal = "case_timeout"
+                break
+            maximum = min(limits.max_output_tokens, output_budget - occupied_output) if output_budget is not None else limits.max_output_tokens
+            if maximum < 256:
+                terminal = "output_token_budget_exhausted"
+                break
+            if sum(len(m["content"]) for m in messages) > 200_000:
+                terminal = "context_limit"
+                break
+            call = {"number": index + 1, "state": "dispatched", "usage": {},
+                    "reserved_output_tokens": maximum, "created_at": stamp()}
+            calls.append(call)
+            occupied_output += maximum
+            # Durable occupancy precedes dispatch; a crash is never a free retry.
+            write_json(ledger, {"calls": calls, "occupied_output_tokens": occupied_output})
+            final_body = None
+            payload = {"model": config.model, "messages": messages, "stream": False,
+                       "max_tokens": maximum, "thinking": {"type": "enabled"},
+                       "reasoning_effort": limits.reasoning_effort}
+            try:
+                async with asyncio.timeout(min(remaining_seconds, limits.request_timeout_seconds)):
+                    response = await client.post(config.base_url + "/chat/completions", json=payload,
+                        headers={"Authorization": "Bearer " + config.api_key}, timeout=limits.request_timeout_seconds)
+                    response.raise_for_status()
+                    value = response.json()
+                if not isinstance(value, dict):
+                    raise ValueError("Invalid completion object")
+                usage = value.get("usage") or {}
+                if not isinstance(usage, dict):
+                    raise ValueError("Invalid usage object")
+                call.update(state="spent", usage=usage, provider_request_id=value.get("id"))
+                used = usage.get("completion_tokens")
+                if type(used) is int and 0 <= used <= maximum:
+                    occupied_output -= maximum - used
+                choices = value.get("choices") or []
+                if not isinstance(choices, list) or (choices and not isinstance(choices[0], dict)):
+                    raise ValueError("Invalid completion choice")
+                choice = choices[0] if choices else {}
+                call["finish_reason"] = choice.get("finish_reason")
+                message = choice.get("message") or {}
+                if not isinstance(message, dict):
+                    raise ValueError("Invalid completion message")
+                content = message.get("content")
+                if choice.get("finish_reason") != "stop" or not isinstance(content, str) or not content.strip():
+                    terminal = "incomplete_output"
+                    break
+                final_body = content
+                write_json(directory / f"response-{index + 1}.json", {"body": content, "usage": usage,
+                    "finish_reason": choice["finish_reason"], "provider_request_id": value.get("id")})
+                if limits.solver == "self_refine" and index + 1 < limits.request_budget:
+                    messages.extend([{"role": "assistant", "content": content},
+                                     {"role": "user", "content": REFINE_INSTRUCTION}])
+            except (httpx.HTTPError, TimeoutError, ValueError, TypeError, KeyError) as error:
+                # No vendor error body or credentials are persisted. Unknown cost stays reserved.
+                call.update(state="unknown", error_type=type(error).__name__)
+                terminal = "reconciliation_required"
+                transport_unknown = isinstance(error, (httpx.ReadError, httpx.RemoteProtocolError,
+                    httpx.TimeoutException, TimeoutError))
+                if transport_unknown and limits.unknown_recovery == "once" and unknown_retries == 0 and index + 1 < limits.request_budget:
+                    unknown_retries += 1
+                    terminal = "completed"
+                    continue
+                break
+            finally:
+                occupied_output = output_occupancy(calls)
+                write_json(ledger, {"calls": calls, "occupied_output_tokens": occupied_output})
+    final = submission(final_body, declared=final_body is not None, source="last_baseline_response",
+                       source_id=calls[-1]["number"] if calls else None)
+    unknown = sum(c["state"] == "unknown" for c in calls)
+    report = {"report_schema_version": "2.0", "case_id": case["id"], "problem_id": case["id"],
+        "evaluation_mode": "answer", "solver": limits.solver, "state": terminal, "terminal_reason": terminal,
+        "answer_submission": final, "final_answer": final["answer"], "final_body": final_body,
+        "final_answer_present": final["answer"] is not None,
+        "completed": terminal == "completed" and final["answer"] is not None,
+        "workflow_completed": False, "review_completed": False, "independent_reviews": 0,
+        "proof_assessment": {"status": "not_reviewed", "formal_verification": False,
+                             "mathematical_correctness_verified": False},
+        "calls": calls, "usage_summary": usage_summary(calls), "requests": len(calls),
+        "occupied_output_tokens": occupied_output,
+        "budget": {"request_budget": limits.request_budget, "occupied": len(calls),
+                   "spent": sum(c["state"] == "spent" for c in calls), "unknown": unknown},
+        "human_interventions": 0, "interventions": [], "unattended_eligible": True,
+        "financial_reconciliation_pending": unknown > 0, "unknown_retries_authorized": unknown_retries,
+        "network_dispatches": transport.number, "model_web_tools": False, "answer_key_loaded": False,
+        "elapsed_seconds": time.monotonic() - started, "finished_at": stamp()}
+    write_json(directory / "report.json", report)
+    return report

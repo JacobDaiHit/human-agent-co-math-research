@@ -26,6 +26,14 @@ def main():
                         help="Retain unknown request occupancy; allow at most one budgeted retry per case tree")
     parser.add_argument("--case-id", action="append", help="Run only this exact frozen case; repeatable")
     parser.add_argument("--code-sandbox", action="store_true", help="Require the preconfigured local offline Docker sandbox; fail before inference if unavailable")
+    parser.add_argument("--evaluation-mode", choices=["answer", "research"], default="research")
+    parser.add_argument("--solver", choices=["agent", "direct", "self_refine"], default="agent",
+                        help="direct: one natural-language call; self_refine: fixed tool-free revision chain")
+    parser.add_argument("--cumulative-output-token-budget", type=int,
+                        help="Shared output/thinking token cap; unknown usage keeps its reservation. Input tokens reported separately.")
+    parser.add_argument("--no-calculator", action="store_true", help="Disable built-in calculation tools for tool-free agent ablation")
+    parser.add_argument("--case-order-seed", type=int, default=0,
+                        help="Local task ordering only, not a provider sampling seed")
     parser.add_argument("--request-budget", type=int, default=12)
     parser.add_argument("--max-steps", type=int, default=6)
     parser.add_argument("--max-output-tokens", type=int, default=65536)
@@ -41,7 +49,12 @@ def main():
         max_output_tokens=args.max_output_tokens, request_timeout_seconds=args.request_timeout,
         case_timeout_seconds=args.case_timeout, parallel_cases=args.parallel_cases,
         reasoning_effort=args.effort, length_recovery=args.length_recovery,
-        unknown_recovery=args.unknown_recovery, code_sandbox=args.code_sandbox)
+        unknown_recovery=args.unknown_recovery, code_sandbox=args.code_sandbox,
+        evaluation_mode=args.evaluation_mode, solver=args.solver,
+        cumulative_output_token_budget=args.cumulative_output_token_budget,
+        builtin_calculator=not args.no_calculator,
+        case_order_seed=args.case_order_seed,
+        completion_policy="reviewed_answer" if args.evaluation_mode == "research" else "draft")
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
     try:
         result = asyncio.run(run_batch(args.problems, args.output, config, limits, root,

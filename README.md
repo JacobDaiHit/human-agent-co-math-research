@@ -4,7 +4,7 @@
 
 最初缺口见 [蓝图落实审计](docs/acceptance/blueprint-audit-2026-09-08.md)，最新结果见 [一期补齐、研究地图与 IMO 准入评估](docs/acceptance/completion-assessment-2026-09-08.md)。功能与浏览器回归已完成；真实主任务收尾仍有协议失败记录，未宣称整个阶段已放行。
 
-当前工作：[IMO-AnswerBench 四题无人试测](docs/evaluation/imo-answerbench-pilot.md)。固定四领域各一题，解题时不读取答案、不开放网页检索；结果和独立离线评分分别保存。自动文献检索已列入蓝图后续范围，本轮不实现。
+当前评测入口：[Agent 与 DeepSeek 公平对照方案](施工方案/Agent与DeepSeek公平对照评测_2026-09-13.md)。支持答案/研究两种模式、裸模型单次及多轮自查基线、累计输出 token 预算与离线配对统计。既有[四题试测](docs/evaluation/imo-answerbench-pilot.md)保留为开发集历史，不据此宣称整体提升。求解时不读取答案、不开放网页检索；自动文献检索仍不实现。
 
 2026-09-13 补齐了分支三方合并、永久删除与文章整理，并接入默认关闭的离线代码沙箱；同时修复长证明审查材料送达和审查恢复额度。沙箱真实隔离验收仍被本机 Windows 虚拟化环境阻塞，因此尚未启动新的数论复跑。详见 [本轮复核与边界](docs/acceptance/blueprint-recheck-2026-09-13.md) 和 [沙箱准备](sandbox/README.md)。
 

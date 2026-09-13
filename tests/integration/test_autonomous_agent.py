@@ -6,8 +6,11 @@ from uuid import uuid4
 import httpx
 import pytest
 from mathagent.api.app import create_app
+from mathagent.persistence.agent_models import AgentRun
 from mathagent.persistence.models import Run
+from mathagent.persistence.runtime_models import ProviderRequest
 from mathagent.runtime.worker import HTTPWorker
+from sqlalchemy import select
 
 
 @pytest.fixture
@@ -130,6 +133,95 @@ def test_descendant_requests_obey_every_ancestor_budget(app, root_limit, child_l
         assert budget["occupied"] == budget["spent"] == expected_spent
         snap = await api.get(f"/projects/{p['project_id']}/snapshot")
         assert any(r["state"] == "budget_exhausted" for r in snap["runs"])
+    exercise(app, scenario)
+
+
+def test_cumulative_output_budget_caps_worker_before_a_second_provider_dispatch(app):
+    seen_caps = []
+
+    class Script:
+        async def generate(self, task):
+            seen_caps.append(task["max_output_tokens"])
+            return {**result("记录一次有已知用量的推理。", next_action="continue"),
+                    "usage": {"prompt_tokens": 11, "completion_tokens": 100}}
+
+    async def scenario(api, client):
+        project, run = await project_and_run(
+            api, cumulative_output_token_budget=300, max_steps=3
+        )
+        await HTTPWorker(client, provider_factory=lambda _: Script(), fake_delay_seconds=0).run(once=True)
+        budget = await api.get(f"/runs/{run['run_id']}/budget")
+        tokens = budget["output_token_budget"]
+        assert seen_caps == [300]
+        assert tokens == {
+            "unit": "output_tokens", "enabled": True, "limit": 300,
+            "reported_output_tokens": 100, "reported_input_tokens": 11,
+            "reserved_output_tokens": 0, "occupied_output_tokens": 100,
+            "remaining_output_tokens": 200, "unknown_usage_requests": 0,
+            "unknown_outcome_requests": 0, "scope": "root_run_and_descendants",
+            "includes_format_repairs": True,
+        }
+        snap = await api.get(f"/projects/{project['project_id']}/snapshot")
+        assert next(item for item in snap["runs"] if item["id"] == run["run_id"])["state"] == "budget_exhausted"
+    exercise(app, scenario)
+
+
+def test_sibling_children_atomically_share_the_root_output_reservation(app):
+    async def scenario(api, client):
+        project, root = await project_and_run(
+            api, cumulative_output_token_budget=300, max_steps=3
+        )
+        children = []
+        for instruction in ("child-a", "child-b"):
+            children.append(await api.write("/runs", {
+                "branch_id": project["branch_id"], "goal_object_id": project["object_id"],
+                "autonomous": True, "instruction": instruction, "request_budget": 3,
+            }))
+        # The public child-creation action is itself model-driven.  Set up the
+        # durable family directly so this regression isolates concurrent budget
+        # admission rather than proposal parsing.
+        with app.state.database.sessions.begin() as session:
+            for child in children:
+                config = session.get(AgentRun, child["run_id"])
+                config.parent_run_id = root["run_id"]
+                config.root_run_id = root["run_id"]
+        first = await api.write(f"/runs/{children[0]['run_id']}/claim", worker=True)
+        second = await api.write(f"/runs/{children[1]['run_id']}/claim", worker=True)
+        first_reservation = await api.write(
+            f"/attempts/{first['attempt_id']}/requests",
+            {"token": first["token"], "requested_output_tokens": 256}, worker=True,
+        )
+        assert first_reservation["continue"] is True
+        started = await api.write(
+            f"/requests/{first_reservation['request_id']}/start", {"token": first["token"]}, worker=True,
+        )
+        assert started["continue"] is True
+        rejected = await api.write(
+            f"/attempts/{second['attempt_id']}/requests",
+            {"token": second["token"], "requested_output_tokens": 256}, worker=True,
+        )
+        assert rejected["continue"] is False and rejected["state"] == "budget_exhausted"
+        with app.state.database.sessions() as session:
+            requests = session.scalars(select(ProviderRequest).where(
+                ProviderRequest.run_id.in_([child["run_id"] for child in children])
+            )).all()
+            assert [(item.run_id, item.state) for item in requests] == [(children[0]["run_id"], "dispatched")]
+        budget = (await api.get(f"/runs/{root['run_id']}/budget"))["output_token_budget"]
+        assert budget["occupied_output_tokens"] == 256 and budget["remaining_output_tokens"] == 44
+    exercise(app, scenario)
+
+
+def test_older_settings_client_cannot_silently_remove_output_budget(app):
+    async def scenario(api, client):
+        _, run = await project_and_run(api, cumulative_output_token_budget=1000)
+        options = await api.get(f"/runs/{run['run_id']}/options")
+        options.pop("run_id")
+        options.pop("cumulative_output_token_budget")
+        preserved = await api.write(f"/runs/{run['run_id']}/options", options, method="PUT")
+        assert preserved["cumulative_output_token_budget"] == 1000
+        removed = await api.write(f"/runs/{run['run_id']}/options",
+            {**options, "cumulative_output_token_budget": None}, method="PUT")
+        assert removed["cumulative_output_token_budget"] is None
     exercise(app, scenario)
 
 
