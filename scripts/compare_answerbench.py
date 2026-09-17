@@ -12,7 +12,26 @@ def read(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def paired_comparison(baseline_dirs, agent_dirs, *, bootstrap_seed=20260913, bootstrap_samples=5000):
+def _search_diagnostics(state):
+    """Summarize controller telemetry; these values are not proof or accuracy."""
+    if not isinstance(state, dict):
+        return None
+    routes = state.get("routes")
+    decisions = state.get("decisions")
+    gaps = state.get("gaps")
+    memory = state.get("memory")
+    actions = 0
+    if isinstance(decisions, list):
+        actions = sum(len(item.get("actions", [])) if isinstance(item, dict) and isinstance(item.get("actions", []), list) else 0 for item in decisions)
+    return {"route_count": len(routes) if isinstance(routes, list) else state.get("route_count", 0),
+            "gap_count": len(gaps) if isinstance(gaps, list) else state.get("gap_count", 0),
+            "memory_count": len(memory) if isinstance(memory, (list, dict)) else state.get("memory_count", 0),
+            "decision_count": len(decisions) if isinstance(decisions, list) else state.get("decision_count", 0),
+            "work_action_count": actions}
+
+
+def paired_comparison(baseline_dirs, agent_dirs, *, bootstrap_seed=20260913, bootstrap_samples=5000,
+                      agent_ablation=False):
     if not baseline_dirs or len(baseline_dirs) != len(agent_dirs):
         raise ValueError("Supply one matched baseline and agent batch per repeat")
     if type(bootstrap_samples) is not int or bootstrap_samples < 20:
@@ -46,12 +65,21 @@ def paired_comparison(baseline_dirs, agent_dirs, *, bootstrap_seed=20260913, boo
                       "case_timeout_seconds", "unknown_recovery", "parallel_cases", "cumulative_output_token_budget", "case_order_seed"):
             if ls[field] != rs[field]:
                 raise ValueError("Unmatched comparison limit: " + field)
+        if not agent_ablation:
+            for field in ("builtin_calculator", "code_sandbox"):
+                if ls.get(field) != rs.get(field):
+                    raise ValueError("Unmatched comparison tool: " + field)
         if ls["evaluation_mode"] != "answer" or rs["evaluation_mode"] != "answer" or rs["solver"] != "agent":
             raise ValueError("Primary answer comparison requires answer mode and an agent right arm")
-        if ls["solver"] not in {"direct", "self_refine"}:
-            raise ValueError("Left arm must be direct or self_refine")
-        if ls["solver"] == "self_refine" and (ls["request_budget"] != rs["request_budget"] or ls["cumulative_output_token_budget"] is None):
-            raise ValueError("Self-refine comparison requires equal request and explicit output budgets")
+        if agent_ablation:
+            if ls["solver"] != "agent":
+                raise ValueError("Agent ablation requires agent solvers in both arms")
+            if ls["request_budget"] != rs["request_budget"] or ls["cumulative_output_token_budget"] is None:
+                raise ValueError("Agent ablation requires equal request and explicit output budgets")
+        elif ls["solver"] not in {"direct", "self_refine", "independent_samples"}:
+            raise ValueError("Left arm must be direct, self_refine or independent_samples")
+        if ls["solver"] in {"self_refine", "independent_samples"} and (ls["request_budget"] != rs["request_budget"] or ls["cumulative_output_token_budget"] is None):
+            raise ValueError("Multi-call baseline comparison requires equal request and explicit output budgets")
         normalized = copy.deepcopy(plans)
         for plan in normalized:
             plan["case_ids"] = sorted(plan["case_ids"])
@@ -87,6 +115,10 @@ def paired_comparison(baseline_dirs, agent_dirs, *, bootstrap_seed=20260913, boo
                     totals[arm][target] += usage.get("reported_tokens", {}).get(key, 0)
                 totals[arm]["elapsed_seconds"] += report.get("elapsed_seconds", 0)
                 totals[arm]["usage_missing_cases"] += int(usage.get("all_usage_known") is not True)
+            for arm, report in zip(("baseline", "agent"), reports, strict=True):
+                diagnostics = _search_diagnostics(report.get("search_state"))
+                if diagnostics is not None:
+                    totals[arm].setdefault("search_diagnostics", []).append(diagnostics)
     n = len(observations)
     wins = sum(r["agent_correct"] > r["baseline_correct"] for r in observations)
     losses = sum(r["agent_correct"] < r["baseline_correct"] for r in observations)
@@ -100,7 +132,13 @@ def paired_comparison(baseline_dirs, agent_dirs, *, bootstrap_seed=20260913, boo
     discordant = wins + losses
     # Repeats within a problem are correlated: exact sign test only for one repeat.
     pvalue = min(1, 2 * sum(math.comb(discordant, k) for k in range(min(wins, losses) + 1)) / 2**discordant) if discordant and len(baseline_dirs) == 1 else None
-    return {"comparison": "single_call_reference" if ls["solver"] == "direct" else "matched_output_budget",
+    tools_ablation = bool(agent_ablation and (ls.get("builtin_calculator") != rs.get("builtin_calculator") or
+                                              ls.get("code_sandbox") != rs.get("code_sandbox")))
+    return {"comparison": "agent_controller_ablation" if agent_ablation else ("single_call_reference" if ls["solver"] == "direct" else "matched_output_budget"),
+        "agent_ablation": agent_ablation,
+        "arm_configuration": {"baseline": {"solver": ls["solver"], "solver_controller": ls.get("solver_controller", "legacy"), "search_config": ls.get("search_config", {})},
+                               "agent": {"solver": rs["solver"], "solver_controller": rs.get("solver_controller", "legacy"), "search_config": rs.get("search_config", {})}},
+        "tools_ablation": tools_ablation,
         "unique_problems": len(clusters), "repeats": len(baseline_dirs), "observations": n,
         "baseline_accuracy": b/n, "agent_accuracy": a/n, "accuracy_delta": (a-b)/n,
         "agent_wins": wins, "agent_losses": losses, "ties": n-wins-losses,
@@ -109,7 +147,9 @@ def paired_comparison(baseline_dirs, agent_dirs, *, bootstrap_seed=20260913, boo
         "problem_cluster_bootstrap_95_interval": [boot[int(.025*bootstrap_samples)], boot[int(.975*bootstrap_samples)-1]],
         "bootstrap_seed": bootstrap_seed, "bootstrap_samples": bootstrap_samples,
         "single_repeat_exact_mcnemar_p": pvalue, "costs": totals,
-        "agent_calculation_tools": {"builtin": rs["builtin_calculator"], "sandbox": rs["code_sandbox"]},
+        "agent_calculation_tools": {"baseline": {"builtin": ls["builtin_calculator"], "sandbox": ls["code_sandbox"]},
+                                     "agent": {"builtin": rs["builtin_calculator"], "sandbox": rs["code_sandbox"]}},
+        "diagnostic_notice": "search_diagnostics are runtime controller telemetry only; they are not mathematical correctness or proof evidence.",
         "notice": "Equal output ceilings are not equal actual total tokens or money. Public-data contamination is unknown. "
                   "Ungraded is counted as not verified correct; resolve it blind with the same policy in both arms. "
                   "Small/development samples do not establish general improvement. Internal review is not independent proof grading.",
@@ -121,8 +161,10 @@ def main():
     parser.add_argument("--baseline", action="append", required=True, type=Path)
     parser.add_argument("--agent", action="append", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--agent-ablation", action="store_true",
+                        help="Permit an explicit agent-vs-agent controller ablation")
     args = parser.parse_args()
-    result = paired_comparison(args.baseline, args.agent)
+    result = paired_comparison(args.baseline, args.agent, agent_ablation=args.agent_ablation)
     with args.output.open("x", encoding="utf-8") as stream:
         json.dump(result, stream, ensure_ascii=False, indent=2)
     print(json.dumps({k: v for k, v in result.items() if k != "pairs"}, ensure_ascii=False))

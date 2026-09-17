@@ -29,6 +29,14 @@ from mathagent.persistence.models import (
 )
 from mathagent.persistence.research_models import ResearchRecordReference
 from mathagent.persistence.runtime_models import ProviderRequest
+from mathagent.persistence.search_models import (
+    SearchDecision,
+    SearchGap,
+    SearchMemory,
+    SearchRoute,
+    SearchSession,
+    SearchWork,
+)
 from mathagent.persistence.workspace_models import Annotation, BlockRevision
 from sqlalchemy import select
 
@@ -38,6 +46,25 @@ WARNINGS = [
     "单独保存的评测归档、已下载副本、外部备份和未关联的手工复制不在本操作范围内，需另行处理。",
     "这是应用数据删除，不承诺对磁盘、同步服务或备份介质作取证级擦除。",
 ]
+
+
+def _budget_only(value):
+    """Retain numeric accounting knobs while removing any copied task prose."""
+    if isinstance(value, dict):
+        return {key: _budget_only(item) for key, item in value.items()
+                if isinstance(item, (dict, list, int, float, bool))}
+    if isinstance(value, list):
+        return [_budget_only(item) for item in value if isinstance(item, (dict, list, int, float, bool))]
+    return value if isinstance(value, (int, float, bool)) else None
+
+
+def _work_budget_only(value):
+    if not isinstance(value, dict):
+        return {}
+    # Work ids and pool live in columns; output capacity is the only snapshot
+    # field retained for resource-accounting review.
+    cap = value.get("output_cap")
+    return {"output_cap": cap} if isinstance(cap, int | float) else {}
 
 
 class DeletionService:
@@ -63,6 +90,31 @@ class DeletionService:
                     encoded = json.dumps(rev.payload, ensure_ascii=False)
                     if any(rid in encoded for rid in ids):
                         related.add(rev.id)
+            # Route cards may copy deleted proof text in their revision body.
+            # Treat all controller references for this project as derived scope.
+            roots = set(session.scalars(select(SearchSession.root_run_id).where(
+                SearchSession.project_id == root.project_id
+            )))
+            related.update(session.scalars(select(SearchSession.goal_revision_id).where(
+                SearchSession.root_run_id.in_(roots)
+            )))
+            related.update(session.scalars(select(SearchRoute.card_revision_id).where(
+                SearchRoute.root_run_id.in_(roots)
+            )))
+            related.update(value for value in session.scalars(select(SearchRoute.candidate_revision_id).where(
+                SearchRoute.root_run_id.in_(roots)
+            )) if value)
+            related.update(session.scalars(select(SearchGap.target_revision_id).where(
+                SearchGap.root_run_id.in_(roots)
+            )))
+            related.update(value for value in session.scalars(select(SearchGap.source_revision_id).where(
+                SearchGap.root_run_id.in_(roots)
+            )) if value)
+            related.update(session.scalars(select(SearchMemory.revision_id).where(
+                SearchMemory.root_run_id.in_(roots)
+            )))
+            for memory in session.scalars(select(SearchMemory).where(SearchMemory.root_run_id.in_(roots))):
+                related.update(memory.dependency_snapshot.values())
             expanded = selected | {by_id[rid].object_id for rid in related if rid in by_id}
             if expanded == selected:
                 return root.project_id, selected, ids
@@ -143,6 +195,23 @@ class DeletionService:
             call.raw_sha256 = hashlib.sha256(b"").hexdigest()
         for step in session.scalars(select(AgentStep).where(AgentStep.run_id.in_(run_ids))):
             step.body, step.actions, step.receipt = "", [], {"material_erased": True}
+        roots = set(session.scalars(select(SearchSession.root_run_id).where(
+            SearchSession.project_id == project_id
+        )))
+        for search in session.scalars(select(SearchSession).where(SearchSession.root_run_id.in_(roots))):
+            search.config = _budget_only(search.config)
+            search.phase, search.selected_route_id = "terminated", None
+        for route in session.scalars(select(SearchRoute).where(SearchRoute.root_run_id.in_(roots))):
+            route.progress, route.candidate_revision_id, route.state = {}, None, "closed"
+        for gap in session.scalars(select(SearchGap).where(SearchGap.root_run_id.in_(roots))):
+            gap.details, gap.state = {}, "closed"
+        for memory in session.scalars(select(SearchMemory).where(SearchMemory.root_run_id.in_(roots))):
+            memory.dependency_snapshot, memory.assumptions, memory.state = {}, [], "deleted"
+            memory.source_event = f"erased:{memory.id}"
+        for work in session.scalars(select(SearchWork).where(SearchWork.root_run_id.in_(roots))):
+            work.input_snapshot, work.state = _work_budget_only(work.input_snapshot), "cancelled"
+        for decision in session.scalars(select(SearchDecision).where(SearchDecision.root_run_id.in_(roots))):
+            decision.details = {}
         for request in session.scalars(select(ProviderRequest).where(ProviderRequest.project_id == project_id)):
             if request.state == "reserved":
                 request.state = "released"

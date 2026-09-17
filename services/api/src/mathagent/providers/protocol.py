@@ -3,9 +3,11 @@
 import json
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from mathagent.providers.actions import StructuredGap
+from mathagent.providers.mathematical_guidance import SOLUTION_SET_GUIDANCE
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-PROMPT_VERSION = "research-operations-v7"
+PROMPT_VERSION = "research-operations-v12"
 
 
 class AgentAction(BaseModel):
@@ -14,6 +16,8 @@ class AgentAction(BaseModel):
         "read_object", "search_project", "write_draft", "revise_object", "propose_proof",
         "record_failure", "record_source", "create_branch", "spawn_task", "request_review",
         "discuss", "calculate", "run_code",
+        "propose_routes", "report_progress", "report_gap", "propose_check",
+        "request_memory", "share_memory",
     ]
     arguments: dict = Field(default_factory=dict)
 
@@ -26,6 +30,7 @@ class ResearchResult(BaseModel):
     cited_revision_ids: list[str] = Field(default_factory=list, max_length=500)
     verdict: Literal["passed", "issues", "inconclusive"] | None = None
     scope: str | None = Field(default=None, min_length=1, max_length=10_000)
+    structured_gaps: list[StructuredGap] = Field(default_factory=list, max_length=100)
     actions: list[AgentAction] = Field(default_factory=list, max_length=8)
     next_action: Literal["continue", "wait", "finish"] = "finish"
 
@@ -39,6 +44,10 @@ class ResearchResult(BaseModel):
             raise ValueError("A review must explicitly describe its limited scope")
         if self.mode == "research" and self.verdict is not None:
             raise ValueError("Research drafts cannot issue review verdicts")
+        if self.mode == "research" and self.structured_gaps:
+            raise ValueError("Only reviews can report structured_gaps; research must use [] or omit it. "
+                             "Preserve research uncertainties in body/findings or an available report_gap action; "
+                             "do not change mode to review.")
         return self
 
 
@@ -52,7 +61,36 @@ def validate_result(value, *, mode, read_set, context_revision_ids=(), autonomou
         set(read_set.values()) | set(context_revision_ids)
     ):
         raise ValueError("Output cites a revision outside the fixed input snapshot")
+    visible = set(read_set.values()) | set(context_revision_ids)
+    if any(not set(gap.evidence_revision_ids) <= visible for gap in result.structured_gaps):
+        raise ValueError("Review gap cites evidence outside the fixed input snapshot")
     return result
+
+
+def repair_feedback(raw, task):
+    """Return bounded protocol diagnostics, never Pydantic input dumps or tracebacks."""
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        return [{"loc": [], "type": "json_invalid", "msg": error.msg,
+                 "line": error.lineno, "column": error.colno, "offset": error.pos,
+                 "excerpt": raw[max(0, error.pos - 80):error.pos + 80],
+                 "instruction": "Re-serialize one complete JSON object. Escape quotes inside strings; "
+                                "check object/array separators. Preserve mathematical content and uncertainty."}]
+    except (ValueError, TypeError):
+        return [{"loc": [], "type": "json_invalid", "msg": "Return exactly one valid JSON object."}]
+    try:
+        validate_result(value, mode=task["mode"], read_set=task.get("read_set", {}),
+                        context_revision_ids=task.get("context_revision_ids", []),
+                        autonomous=bool(task.get("autonomous")))
+    except ValidationError as error:
+        return [{"loc": list(item["loc"]), "type": item["type"], "msg": item["msg"][:1000]}
+                for item in error.errors(include_input=False, include_context=False, include_url=False)[:10]]
+    except (ValueError, TypeError):
+        return [{"loc": [], "type": "task_contract", "msg":
+                 "Match the assigned mode, explicitly supply next_action for autonomous research, "
+                 "and cite only revisions in the fixed input snapshot."}]
+    return []
 
 
 def result_schema(mode, *, autonomous=False):
@@ -62,6 +100,11 @@ def result_schema(mode, *, autonomous=False):
     schema = ResearchResult.model_json_schema()
     schema["properties"]["mode"] = {"type": "string", "const": mode}
     if mode == "research":
+        schema["properties"]["structured_gaps"] = {
+            "type": "array", "maxItems": 0, "default": [],
+            "description": "Research must omit this field or use []. Preserve uncertainties in body/findings "
+                           "or an available report_gap action. Only review tasks populate structured_gaps.",
+        }
         if autonomous:
             schema["required"].append("next_action")
             schema["properties"]["next_action"].pop("default", None)
@@ -89,6 +132,7 @@ def messages_for(task):
         "研究指定数学目标，提出有依据的候选论证、反例或下一步。明确前提、缺口和不确定性。"
         "当前 mode 必须是 research，顶层 verdict 必须为 null。即使子任务独立审查已给出 passed，"
         "也只能在正文或 findings 描述其结论及范围，不得把审查结论复制到研究任务的顶层 verdict。"
+        "顶层 structured_gaps 必须省略或为 []；研究缺口写入 body/findings，或用公开的 report_gap 操作报告。"
         if mode == "research"
         else "独立审查指定目标版本。检查论证前提、依赖、循环推理和缺口；不要把其他模型意见当作证据。"
         "对目标版本给出 passed/issues/inconclusive；局部审查不宣称覆盖全部证明。"
@@ -110,8 +154,17 @@ def messages_for(task):
             "下列是可用操作参数（不包含 branch_id 的操作默认当前分支）：\n"
             + json.dumps(task.get("operation_schemas", {}), ensure_ascii=False)
         )
+    instruction += "\n" + SOLUTION_SET_GUIDANCE
+    if task.get("search_context") is not None:
+        instruction += (
+            "\n当前任务由 bounded_search_v1 控制器调度。只可提出控制器公开的受控操作，"
+            "不得把路线、检查、记忆共享或修复意图说成已执行。"
+            "引用必须来自 search_context、memory_packet 或实际操作回执；服务端会核对归属、"
+            "固定版本、权限和预算。检查结果只能说明实际执行的有限范围，不能声称形式化验证。"
+            "review 的 structured_gaps 只报告目标版本的局部缺口，target 由服务端固定绑定。"
+        )
     if task.get("repair_output") is not None:
-        instruction += "\n上次响应不符合结构协议。请修复 repair_output 中的 JSON，仅纠正格式和字段约束，保留数学内容及不确定性；不要声称上次 actions 已执行。"
+        instruction += "\n上次响应不符合结构协议。请根据 repair_feedback 修复 repair_output 中的 JSON，仅纠正格式和字段约束，保留数学内容及不确定性；不要声称上次 actions 已执行。不得通过改变任务 mode 绕过约束。"
     if mode == "review" and any(item.get("payload", {}).get("artifact_type") == "article" for item in task.get("inputs", [])):
         instruction += (
             "\n当前材料包含文章稿件。逐项核查全文符号是否一致、假设是否在使用处成立、"
@@ -122,12 +175,24 @@ def messages_for(task):
         instruction += (
             "\n上次响应耗尽输出上限，未执行其中任何操作。本次是原预算内唯一一次输出截断恢复。"
             "选择一个能在本次输出内完成的有限子目标，及时返回有用的局部结果和明确下一步；"
+            "只处理当前最小的关键缺口或必要条件，不重复整题规划和已经保存的推导；"
             "无须在一次响应中解决全部困难。可参考 visible_fragment，但它不是已保存或已验证的状态。"
             "保留不确定性，不得为结束任务编造证明或答案。"
         )
     example = {"body": r"公式示例：行内 $a\ge b$；独立公式 $$\frac{a+b}{2}$$。",
                "findings": [r"所有出现的数学符号，例如 $a,b$，均放入数学环境。"]}
-    return [
+    if task.get("repair_output") is not None:
+        instruction = (
+            "本次仅修复上一份响应的序列化和字段协议，不重新解题、不延长证明、不运行任何操作。"
+            "按 repair_feedback 的位置检查引号、逗号及括号，重新输出一个完整 JSON 对象，不输出补丁。"
+            "保留原有数学内容、代码字符串、引用、缺口和不确定性；不得补出数学结论或把计划当成回执。"
+            "字符串内的双引号必须转义；LaTeX 反斜杠只按 JSON 转义一层。"
+            "如原文不完整或存在无法确定的内容，明确保留未解决状态，不猜测缺失的证明或操作参数。"
+            f"指定 mode={mode}，不得改变。"
+            + ("research 的 verdict=null、structured_gaps=[]；将原研究缺口保留在 body/findings。"
+               if mode == "research" else "保留审查的真实 verdict、scope 和缺口，不把局部审查升级为证明。")
+        )
+    messages = [
         {
             "role": "system",
             "content": instruction + "\n只输出符合以下 schema 的 JSON；产物始终是未采纳草稿。"
@@ -167,11 +232,21 @@ def messages_for(task):
                     "review_request_reserve": task.get("review_request_reserve"),
                     "operation_results": task.get("operation_results", []),
                     "repair_output": task.get("repair_output"),
+                    "repair_feedback": task.get("repair_feedback"),
                     "output_limit_recovery": task.get("output_limit_recovery"),
                     "discussions": task.get("discussions", []),
                     "context_summary": task.get("context_summary", {}),
+                    **({"search_context": task["search_context"],
+                        "memory_packet": task.get("memory_packet")}
+                       if task.get("search_context") is not None else {}),
                 },
                 ensure_ascii=False,
             ),
         },
     ]
+    if task.get("repair_output") is not None:
+        payload = json.loads(messages[1]["content"])
+        payload["instruction"] = "Only re-serialize repair_output according to repair_feedback; do not solve again."
+        payload["operation_schemas"] = task.get("operation_schemas", {})
+        messages[1]["content"] = json.dumps(payload, ensure_ascii=False)
+    return messages

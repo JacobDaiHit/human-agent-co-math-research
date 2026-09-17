@@ -38,6 +38,8 @@ class Runtime:
         self.max_active_attempts = max_active_attempts
         self.provider = FakeProvider()
         self.agent = AgentRuntime(self)
+        from mathagent.runtime.search import SearchController
+        self.search = SearchController(self)
 
     def _settings(self, session, project_id):
         if session.get(Project, project_id) is None:
@@ -158,7 +160,8 @@ class Runtime:
         branch = self.service.require_branch(session, run.branch_id)
         current = self.service.read_set(session, branch.id)
         return (
-            attempt.control_epoch != run.control_epoch
+            self.search.inputs_stale(session, run, attempt)
+            or attempt.control_epoch != run.control_epoch
             or branch.control_epoch != attempt.checkpoint.get("branch_control_epoch")
             or any(current.get(k) != v for k, v in attempt.read_set.items())
             or any((head := session.get(Head, (item["branch_id"], item["object_id"]))) is None
@@ -215,15 +218,30 @@ class Runtime:
         attempt.lease_until = (
             datetime.now(UTC) + timedelta(seconds=self.lease_seconds)
         ).isoformat()
+        search_capacity = {}
+        search = self.search.session_for(session, run.id)
+        if payload.get("boundary") and search and search.config.get("budget_policy") == "adaptive":
+            try:
+                cap = self.search.admit(session, run)
+            except DomainError as error:
+                if error.response.get("error") != "search_pool_exhausted":
+                    raise
+                cap = 0
+            work = self.search.work_for(session, run.id)
+            search_capacity = {"search_output_cap": cap,
+                               "search_min_output_tokens": self.search.minimum_output_tokens(
+                                   session, search, work.kind if work else "advance")}
         return 200, {
             "attempt_id": attempt.id,
             "state": run.state,
             "continue": True,
             "control_pending": run.state != "running",
             "lease_until": attempt.lease_until,
+            **search_capacity,
         }
 
     def claim_next(self, session, payload):
+        self.search.tick(session)
         self.agent.wake_waiting(session)
         # Reconcile every expired lease first, including tasks for offline providers.
         for run in session.scalars(
@@ -284,6 +302,15 @@ class Runtime:
             # exact cap they will pass to the provider.
             requested_output_tokens = self.agent.options(session, run.id)["max_output_tokens"]
         output_budget = self.agent.output_token_budget_status(session, run)
+        try:
+            self.search.admit(session, run, requested_output_tokens)
+        except DomainError as error:
+            if error.response.get("error") != "search_pool_exhausted":
+                raise
+            attempt.state, run.state = "failed", "budget_exhausted"
+            attempt.checkpoint = {**attempt.checkpoint, "end_reason": "search_pool_exhausted"}
+            self._emit(session, run, "run.budget_exhausted", {"reason": "search_pool_exhausted"})
+            return 200, {"continue": False, "state": run.state}
         if output_budget["enabled"] and requested_output_tokens > output_budget["remaining_output_tokens"]:
             attempt.state = "failed"
             run.state = "budget_exhausted"
@@ -519,6 +546,7 @@ class Runtime:
         session.flush()
         session.add(RunOptions(run_id=run.id, mode=mode, request_budget=budget))
         self.agent.register(session, run.id, payload)
+        self.search.initialize(session, run, payload)
         self.agent.branch_allowed(session, run)
         response = {
             "run_id": run.id,
@@ -593,6 +621,7 @@ class Runtime:
 
     def claim(self, session, payload):
         run = self._run(session, payload["run_id"])
+        self.search.admit(session, run)
         self.agent.branch_allowed(session, run)
         before = run.state
         self._reconcile_expired(session, run)
@@ -814,6 +843,8 @@ class Runtime:
         if not secrets.compare_digest(attempt.token, payload["token"]):
             raise DomainError(409, "invalid_execution_token", "执行令牌已失效或不匹配")
         config = session.get(AgentRun, attempt.run_id)
+        if config and config.autonomous and self.search.session_for(session, attempt.run_id) and not agent_step:
+            raise DomainError(422, "autonomous_step_required", "受控任务必须经步骤端点应用与核对派发合同。")
         if config and config.autonomous and config.options.get("completion_policy") == "reviewed_answer" and not agent_step:
             raise DomainError(422, "autonomous_step_required", "此任务必须经研究步骤端点检查完成条件")
         body = payload["body"]
@@ -859,6 +890,8 @@ class Runtime:
             if current_read_set.get(object_id) != revision_id
         }
         reasons = []
+        if self.search.inputs_stale(session, run, attempt):
+            reasons.append("search_root_or_frozen_input_changed")
         if self._expired(attempt):
             reasons.append("lease_expired")
         if run.current_attempt_id != attempt.id:
@@ -912,7 +945,8 @@ class Runtime:
                         for rid in attempt.checkpoint.get("context_revision_ids", [])}
             observed = [session.get(ProviderCall, row.id) for row in requests if row.state == "spent"]
             complete_material = bool(expected) and any(
-                call and call.complete and call.result == result
+                call and call.complete and isinstance(call.result, dict)
+                and {"structured_gaps": [], **call.result} == result
                 and call.call_config.get("review_input_receipt") == expected
                 for call in observed
             )
@@ -991,6 +1025,8 @@ class Runtime:
             "end_reason": reasons or ["completed"],
         }
         self._emit(session, run, "attempt.completed", response, run.provider)
+        if not agent_step:
+            self.search.completed(session, run, attempt, result or {})
         return 200, response
 
     def intervene(self, session, payload):

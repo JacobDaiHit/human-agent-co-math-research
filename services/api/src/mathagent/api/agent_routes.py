@@ -12,25 +12,28 @@ from mathagent.persistence.models import Project
 from mathagent.persistence.runtime_models import ProviderRequest
 from mathagent.providers.actions import operation_schemas
 from mathagent.providers.options import MAX_OUTPUT_TOKENS, ReasoningEffort, ThinkingMode
+from mathagent.providers.search_contract import SearchConfig
 from pydantic import Field
 from sqlalchemy import select
 
 
 class RunUpdate(Command):
-    request_budget: int = Field(ge=1, le=1000)
-    autonomous: bool
-    max_steps: int = Field(ge=1, le=40)
-    max_review_rounds: int = Field(ge=0, le=2)
-    max_children: int = Field(ge=0, le=12)
-    max_depth: int = Field(ge=0, le=4)
-    max_output_tokens: int = Field(ge=256, le=MAX_OUTPUT_TOKENS)
+    request_budget: int | None = Field(default=None, ge=1, le=1000)
+    autonomous: bool | None = None
+    max_steps: int | None = Field(default=None, ge=1, le=40)
+    max_review_rounds: int | None = Field(default=None, ge=0, le=2)
+    max_children: int | None = Field(default=None, ge=0, le=12)
+    max_depth: int | None = Field(default=None, ge=0, le=4)
+    max_output_tokens: int | None = Field(default=None, ge=256, le=MAX_OUTPUT_TOKENS)
     cumulative_output_token_budget: int | None = Field(default=None, ge=256, le=10_000_000)
-    request_timeout_seconds: int = Field(ge=1, le=600)
-    thinking_mode: ThinkingMode = "provider_default"
-    reasoning_effort: ReasoningEffort = "provider_default"
-    completion_policy: Literal["draft", "reviewed_answer"] = "draft"
-    length_recovery: Literal["none", "high"] = "none"
-    unknown_recovery: Literal["stop", "once"] = "stop"
+    request_timeout_seconds: int | None = Field(default=None, ge=1, le=600)
+    thinking_mode: ThinkingMode | None = None
+    reasoning_effort: ReasoningEffort | None = None
+    completion_policy: Literal["draft", "reviewed_answer"] | None = None
+    length_recovery: Literal["none", "high"] | None = None
+    unknown_recovery: Literal["stop", "once"] | None = None
+    solver_controller: Literal["legacy", "bounded_search_v1"] | None = None
+    search_config: SearchConfig | None = None
 
 
 class BranchBudget(Command):
@@ -55,7 +58,7 @@ class StepCreate(Command):
 
 
 class PolicyUpdate(Command):
-    allowed_operations: list[str] = Field(max_length=13)
+    allowed_operations: list[str] = Field(max_length=24)
 
 
 def mount_agent_routes(app, runtime, human, worker, key, command):
@@ -68,9 +71,7 @@ def mount_agent_routes(app, runtime, human, worker, key, command):
 
     @app.put("/runs/{run_id}/options", dependencies=[Depends(human)])
     def update_options(run_id: str, p: RunUpdate, k: str = Depends(key)):
-        values = p.model_dump()
-        if "cumulative_output_token_budget" not in p.model_fields_set:
-            values.pop("cumulative_output_token_budget")
+        values = p.model_dump(exclude_unset=True)
         return command("agent.options", k, {"run_id": run_id, **values}, agent.update_options)
 
     @app.get("/branches/{branch_id}/runtime-settings", dependencies=[Depends(human)])

@@ -19,7 +19,7 @@ import sys
 import sysconfig
 import time
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
@@ -79,6 +79,23 @@ def instruction_for(limits):
     if limits.solver != "agent":
         from mathagent.evaluation.direct import DIRECT_INSTRUCTION
         return DIRECT_INSTRUCTION
+    if limits.solver_controller == "bounded_search_v1":
+        return r"""Solve the original problem closed-book with the bounded search controller.
+Do exactly the work assigned by search_context.kind. Analysis proposes route cards,
+not a complete solution. Advance and repair save actual progress and report_progress.
+The server dispatches independent reviews; never call legacy request_review or spawn_task.
+Use only the published operations and actual returned revision IDs. Preserve original
+quantifiers and hypotheses. Extra unproved assumptions remain conditional.
+All calls, reviews, repairs and recovery share the frozen budget. Prefer a concise valid
+structured response to an unfinished long derivation; do not solve the entire problem
+inside the planning stage. No internet search, external references, old solutions,
+hidden answer key or human mathematical hints are available.
+Use LaTeX for mathematical expressions. In final work, summarize only the selected
+candidate, cite its revision and reproduce its single boxed answer unchanged; explicitly
+abstain without a box if there is no deliverable answer. Never invent a proof or claim
+an unverified remembered theorem is established. Follow the stage contract, including
+next_action and allowed actions. Research verdict must remain null.
+"""
     return INSTRUCTION if limits.evaluation_mode == "research" else ANSWER_INSTRUCTION
 
 
@@ -135,6 +152,8 @@ class Limits:
     code_sandbox: bool = False
     evaluation_mode: str = "research"
     solver: str = "agent"
+    solver_controller: str = "legacy"
+    search_config: dict = field(default_factory=dict)
     cumulative_output_token_budget: int | None = None
     builtin_calculator: bool = True
     case_order_seed: int = 0
@@ -153,8 +172,24 @@ class Limits:
         expected_policy = "reviewed_answer" if self.evaluation_mode == "research" else "draft"
         if self.completion_policy != expected_policy:
             raise ValueError("Completion policy differs from evaluation mode")
-        if self.solver not in {"agent", "direct", "self_refine"}:
+        if self.solver not in {"agent", "direct", "self_refine", "independent_samples"}:
             raise ValueError("Invalid solver")
+        if self.solver_controller not in {"legacy", "bounded_search_v1"}:
+            raise ValueError("Invalid solver controller")
+        if self.solver_controller == "bounded_search_v1":
+            if self.solver != "agent" or self.cumulative_output_token_budget is None:
+                raise ValueError("bounded_search_v1 requires the autonomous agent and a cumulative output token budget")
+            if not isinstance(self.search_config, dict):
+                raise ValueError("Invalid search configuration")
+            try:
+                from mathagent.providers.search_contract import SearchConfig
+                normalized = SearchConfig.model_validate(self.search_config).model_dump(mode="json")
+            except (ImportError, TypeError, ValueError) as error:
+                raise ValueError("Invalid search configuration") from error
+            self.search_config.clear()
+            self.search_config.update(normalized)
+        elif self.search_config:
+            raise ValueError("Search configuration requires bounded_search_v1")
         if self.solver != "agent" and (self.evaluation_mode != "answer" or self.code_sandbox):
             raise ValueError("Plain baselines require answer mode without tools")
         if self.solver == "direct" and self.request_budget != 1:
@@ -322,13 +357,19 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
             "request_budget": limits.request_budget, "allow_real_api": True,
             "allowed_providers": [config.name]}, "PUT")
         operations = [name for name in OPERATIONS if limits.builtin_calculator or name != "calculate"]
+        if limits.solver_controller == "bounded_search_v1":
+            from mathagent.runtime.search import SEARCH_ACTIONS
+            operations.extend(sorted(SEARCH_ACTIONS))
         await write(f"/projects/{project_id}/agent-policy", {"allowed_operations": operations}, "PUT")
         if limits.code_sandbox:
             sandbox = await write(f"/projects/{project_id}/code-sandbox", {"enabled": True}, "PUT")
             if not sandbox.get("ready") or sandbox.get("image_id") != sandbox_image:
                 raise RuntimeError("Sandbox differs from frozen preflight; no inference dispatched")
         options = {k: v for k, v in asdict(limits).items() if k not in {
-            "case_timeout_seconds", "parallel_cases", "code_sandbox", "evaluation_mode", "solver", "builtin_calculator", "case_order_seed"}}
+            "case_timeout_seconds", "parallel_cases", "code_sandbox", "evaluation_mode", "solver",
+            "solver_controller", "search_config", "builtin_calculator", "case_order_seed"}}
+        if limits.solver_controller == "bounded_search_v1":
+            options.update(solver_controller=limits.solver_controller, search_config=limits.search_config)
         research = await write("/runs", {"branch_id": branch_id,
             "goal_object_id": project["object_id"], "provider": config.name,
             "autonomous": True, "instruction": instruction_for(limits), **options})
@@ -370,6 +411,7 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
                         await work
         snapshot = await read(f"/projects/{project_id}/snapshot")
         root = next(run for run in snapshot["runs"] if run["id"] == run_id)
+        search_state = None if limits.solver_controller == "legacy" else await read(f"/runs/{run_id}/search")
         all_runs = {run["id"]: run for run in snapshot["runs"]}
         all_reviews = {review["id"]: review for review in snapshot["reviews"]}
         branches = (await read(f"/projects/{project_id}/branches"))["branches"]
@@ -417,6 +459,7 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
             "workflow_completed": workflow_completed, "completed": mode_completed,
             "report_schema_version": "2.0", "evaluation_mode": limits.evaluation_mode,
             "solver": limits.solver, **outcomes, "usage_summary": usage_summary(calls),
+            "solver_controller": limits.solver_controller,
             "elapsed_seconds": (datetime.now(UTC) - datetime.fromisoformat(journal["started_at"])).total_seconds(),
             "final_answer": answer, "final_body": final_body, "requests": budget["occupied"],
             "budget": budget, "project_id": project_id, "root_run_id": run_id,
@@ -428,6 +471,8 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
             "network_dispatches": len(list(directory.glob("dispatch-*.json"))),
             "network_dispatches_this_process": transport.number,
             "evaluation_kind": "unattended_agent_short_answer" if audit["unattended_eligible"] else "intervened_agent_short_answer", "scored": False}
+        if search_state is not None:
+            report["search_state"] = search_state
         write_json(report_path, report)
         export = await write("/exports", {"project_id": project_id, "branch_id": branch_id})
         response = await client.get(f"/exports/{export['export_id']}/download", headers=headers)
@@ -461,6 +506,8 @@ def intervention_audit(events, scheduler_receipt=None):
         elif kind == "branch.intervention" and not payload.get("affected_runs"):
             scheduler = bool(scheduler_receipt) and payload == scheduler_receipt
         elif kind in {"run.resumed", "run.options_changed"}:
+            scheduler = False
+        elif kind == "search.decision" and payload.get("action") == "human_intervention":
             scheduler = False
         else:
             continue
@@ -503,6 +550,8 @@ async def run_batch(problems_file, directory, config, limits, root, *, resume=Fa
             "provider": config.name, "requested_model": config.model, "limits": asdict(limits),
             "source": fingerprint, "instruction_sha256": digest(instruction_for(limits).encode()),
             "submission_rule": SUBMISSION_RULE,
+            "selection_rule": ("independent-single-box-whitespace-vote-earliest-v1"
+                               if limits.solver == "independent_samples" else SUBMISSION_RULE),
             "code_sandbox": sandbox_configuration,
             "scope": "targeted_retest" if case_ids is not None else "full_fixture",
             "case_ids": [case["id"] for case in problems["problems"]]}

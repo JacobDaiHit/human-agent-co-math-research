@@ -59,6 +59,75 @@ class Discuss(Command):
     recipient_run_id: Id | None = None
 
 
+class RouteProposal(Command):
+    title: str = Field(min_length=1, max_length=300)
+    core_reduction: Body = Field(description="A mathematical reduction: construction, exhaustive classification, or proving nonexistence may all be valid. Do not assume the solution set is nonempty.")
+    key_lemmas: list[str] = Field(min_length=1, max_length=50)
+    assumptions: list[str] = Field(default_factory=list, max_length=50,
+        description="Extra unproved assumptions beyond the original problem. These remain conditional in this route; use an unconditional route to prove the original goal. Do not repeat original problem hypotheses here.")
+    subgoal: Body
+    cheap_check: Body
+    body: str | None = Field(default=None, min_length=1, max_length=200_000)
+    suspected_duplicate_of: int | None = Field(default=None, ge=0, le=2,
+        description="Optional zero-based earlier route index with the same mathematical reduction; a model suggestion, not an equivalence certificate.")
+    diversity_reason: str = Field(default="", max_length=3000)
+
+
+class ProposeRoutes(Command):
+    routes: list[RouteProposal] = Field(min_length=1, max_length=3)
+
+
+class ReportProgress(Command):
+    candidate_revision_id: Id | None = Field(default=None,
+        description=r"Saved mathematical candidate, including a justified empty solution set \boxed{\varnothing}. A null ID with status=candidate selects this response body; it does not mean no solutions.")
+    completed_subgoal_ids: list[Id] = Field(default_factory=list, max_length=100)
+    open_subgoals: list[str] = Field(default_factory=list, max_length=100)
+    status: Literal["progress", "candidate", "stalled"] = Field(
+        description="candidate means a claimed complete solution, including a nonexistence proof. Failed searches remain progress/stalled, not an empty-set answer.")
+    reusable_revision_ids: list[Id] = Field(default_factory=list, max_length=100)
+    assumptions: list[str] = Field(default_factory=list, max_length=50)
+
+
+GapKind = Literal[
+    "arithmetic", "missing_condition", "quantifier", "circular", "counterexample",
+    "missing_argument", "missing_material", "conflict",
+]
+
+
+class StructuredGap(Command):
+    """A local review gap; its target is the review's fixed target revision."""
+
+    kind: GapKind
+    anchor: str = Field(min_length=1, max_length=10_000)
+    detail: Body
+    evidence_revision_ids: list[Id] = Field(default_factory=list, max_length=100)
+
+
+class ReportGap(StructuredGap):
+    target_revision_id: Id
+
+
+class ProposeCheck(Command):
+    target_revision_id: Id
+    statement: Body
+    scope: Body
+    tool: Literal["calculate", "run_code"]
+    arguments: dict = Field(default_factory=dict)
+
+
+class RequestMemory(Command):
+    offset: int = Field(default=0, ge=0, le=1_000_000_000)
+    limit: int = Field(default=20, ge=1, le=200)
+    route_id: Id | None = None
+
+
+class ShareMemory(Command):
+    revision_id: Id
+    target_route_id: Id
+    assumptions: list[str] = Field(default_factory=list, max_length=50)
+    reason: Body
+
+
 CALCULATION_SYNTAX = (
     "Use integer literals and exact rational fractions such as 1/3. "
     "Use explicit * for multiplication and ** for powers; never ^ or implicit multiplication. "
@@ -209,6 +278,12 @@ OPERATION_MODELS = {
     "spawn_task": SpawnTask,
     "request_review": RequestReview,
     "discuss": Discuss,
+    "propose_routes": ProposeRoutes,
+    "report_progress": ReportProgress,
+    "report_gap": ReportGap,
+    "propose_check": ProposeCheck,
+    "request_memory": RequestMemory,
+    "share_memory": ShareMemory,
     "calculate": Calculate,
     "run_code": RunCode,
 }

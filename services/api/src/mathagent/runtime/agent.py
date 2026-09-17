@@ -32,6 +32,7 @@ DEFAULT_OPTIONS = {
     "completion_policy": "draft",
     "length_recovery": "none",
     "unknown_recovery": "stop",
+    "solver_controller": "legacy", "search_config": {},
 }
 TERMINAL = {"completed", "cancelled", "failed", "interrupted", "budget_exhausted", "step_limit"}
 
@@ -63,10 +64,17 @@ class AgentRuntime:
 
     def update_options(self, session, payload):
         run = self.runtime._run(session, payload["run_id"])
+        if self.runtime.search.session_for(session, run.id):
+            raise DomainError(409, "search_config_frozen", "受控会话配置已冻结；请新建会话比较另一配置。")
+        if payload.get("solver_controller", "legacy") != "legacy":
+            raise DomainError(409, "search_new_session_required", "请新建受控会话，不将历史任务改写成新的搜索运行。")
+        if any(value is None for key, value in payload.items() if key != "cumulative_output_token_budget"):
+            raise DomainError(422, "null_run_option", "此运行选项不能设为 null。")
         row = session.get(AgentRun, run.id) or self.register(session, run.id, payload)
-        row.autonomous = payload["autonomous"]
+        row.autonomous = payload.get("autonomous", row.autonomous)
         row.options = {k: payload.get(k, row.options.get(k, default)) for k, default in DEFAULT_OPTIONS.items()}
-        session.get(RunOptions, run.id).request_budget = payload["request_budget"]
+        if "request_budget" in payload:
+            session.get(RunOptions, run.id).request_budget = payload["request_budget"]
         self.runtime._emit(session, run, "run.options_changed", self.options(session, run.id), "human")
         return 200, self.options(session, run.id)
 
@@ -293,6 +301,10 @@ class AgentRuntime:
     def initial_read_set(self, session, run, all_heads):
         from mathagent.persistence.models import ProofPlan
 
+        selected = self.runtime.search.initial_read_set(session, run, all_heads)
+        if selected is not None:
+            return selected
+
         config = session.get(AgentRun, run.id)
         if not config or (not config.autonomous and not config.target_revision_id):
             return all_heads
@@ -398,6 +410,12 @@ class AgentRuntime:
             rev = session.get(Revision, plan["revision_id"])
             plan.update(object_id=rev.object_id, branch_id=branch.id)
             plan["read_ref"] = read_ref(plan)
+        if self.runtime.search.session_for(session, run.id):
+            task["request_budget_status"] = self.request_budget_status(session, run)
+            task["completion_requirements"] = {"policy": options["completion_policy"]}
+            return self.runtime.search.enrich(session, task)
+        from mathagent.runtime.search import SEARCH_ACTIONS
+        task["operation_schemas"] = {k: v for k, v in task["operation_schemas"].items() if k not in SEARCH_ACTIONS}
         if not options["autonomous"]:
             task["request_budget_status"] = self.request_budget_status(session, self.runtime._run(session, task["run_id"]))
             return compact_task(task)
@@ -524,6 +542,8 @@ class AgentRuntime:
 
     def wake_waiting(self, session):
         for run in session.scalars(select(Run).where(Run.state == "waiting_children")):
+            if self.runtime.search.session_for(session, run.id):
+                continue
             children = session.scalars(select(Run).join(AgentRun, AgentRun.run_id == Run.id).where(AgentRun.parent_run_id == run.id)).all()
             if children and all(child.state in TERMINAL for child in children):
                 try:
@@ -717,12 +737,16 @@ class AgentRuntime:
         branch = self.state.require_branch(session, run.branch_id)
         self.branch_allowed(session, run)
         kind, arguments = action.type, dict(action.arguments)
+        self.runtime.search.guard_action(session, run, kind, arguments)
         if kind in {"revise_object", "propose_proof", "record_failure", "record_source"} and arguments.get("branch_id") not in {None, branch.id}:
             raise DomainError(403, "operation_outside_run_branch", "此任务只能修改自己的研究分支；可创建该分支上的子任务")
         project = session.get(Project, branch.project_id)
         permitted = permitted_operations(project)
         if kind not in permitted:
             raise DomainError(403, "operation_not_allowed", "项目未授权此研究操作")
+        from mathagent.runtime.search import SEARCH_ACTIONS
+        if kind in SEARCH_ACTIONS:
+            return self.runtime.search.action(session, run, kind, arguments)
         config = session.get(AgentRun, run.id)
         author = "agent:" + run.provider
         if kind in {"record_failure", "record_source"}:
@@ -758,6 +782,8 @@ class AgentRuntime:
                 # Full histories are read via immutable output records, never repeated in every page.
                 item["run_context"] = {"attempt_id": context_attempt.id, "run_id": run.id,
                     "instruction": context.get("instruction", ""),
+                    "search_context": context.get("search_context"),
+                    "memory_packet": context.get("memory_packet"),
                     "input_revisions": [{"revision_id": rid, "object_id": rev.object_id,
                         "branch_id": source.branch_id, "section": "record"}
                         for rid in context.get("context_revision_ids", [])
@@ -848,6 +874,7 @@ class AgentRuntime:
             raise DomainError(409, "not_autonomous", "此任务未启用自主操作")
         result = validate_result(payload["result"], mode=attempt.checkpoint["mode"],
                     read_set=attempt.read_set, context_revision_ids=attempt.checkpoint.get("context_revision_ids", []), autonomous=True)
+        self.runtime.search.validate_final(session, run, result)
         attempt.checkpoint = {**attempt.checkpoint, "agent_result_sha256": hashlib.sha256(
             json.dumps(payload["result"], sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
         number = (session.scalar(select(func.max(AgentStep.number)).where(AgentStep.run_id == run.id)) or 0) + 1
@@ -872,6 +899,8 @@ class AgentRuntime:
             session.flush()
             children = session.scalars(select(Run).join(AgentRun, AgentRun.run_id == Run.id).where(AgentRun.parent_run_id == run.id)).all()
             waiting = any(child.state not in TERMINAL for child in children)
+            if self.runtime.search.session_for(session, run.id):
+                waiting = False
             completion_issues = []
             if result.next_action == "finish" and config.options.get("completion_policy") == "reviewed_answer":
                 completion_issues = self.completion_issues(session, run, result)
@@ -904,5 +933,9 @@ class AgentRuntime:
                         output_revision_id=completion["output_revision_id"])
         session.add(row)
         session.flush()
+        self.runtime.search.completed(session, run, attempt, result.model_dump(), outcomes)
+        if self.runtime.search.session_for(session, run.id):
+            receipt = {**receipt, "state": run.state, "continue": run.state == "queued"}
+            row.state, row.receipt = run.state, receipt
         self.runtime._emit(session, run, "agent.step_saved", {"step_id": row.id, **receipt})
         return 201, receipt

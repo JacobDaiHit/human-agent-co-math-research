@@ -185,6 +185,51 @@ def _condense(value, budget, ref):
     return omitted(value, ref)
 
 
+def _run_context_ref(goal_ref, section):
+    return {**goal_ref, "section": "record", "offset": 0}
+
+
+def _memory_ref(goal_ref, limit=200):
+    return {"type": "request_memory", "arguments": {"offset": 0, "limit": limit}}
+
+
+def _compact_search_context(value, budget, goal_ref):
+    """Keep controller identity while making route details rereadable."""
+    if not isinstance(value, dict):
+        return omitted(value, _run_context_ref(goal_ref, "run_context.search_context"))
+    ref = _run_context_ref(goal_ref, "run_context.search_context")
+    core = ("work_id", "kind", "route_id", "controller", "budget",
+            "original_goal_revision_id", "selected_route_id")
+    result = {key: value[key] for key in core if key in value}
+    for key, item in value.items():
+        if key in core:
+            continue
+        result[key] = item if len(serialized(item)) <= max(400, budget // 3) else omitted(item, ref)
+    if len(serialized(result)) > budget:
+        # Preserve the controller identity even when route progress/gaps are huge.
+        result = {key: result[key] for key in core if key in result}
+        result["omitted"] = True
+        result["read_ref"] = ref
+    return result
+
+
+def _compact_memory_packet(value, budget, goal_ref):
+    if not isinstance(value, dict):
+        return omitted(value, _memory_ref(goal_ref))
+    result = dict(value)
+    entries = result.get("entries")
+    if entries is not None and len(serialized(entries)) > max(600, budget // 2):
+        result["entries"] = omitted(entries, _memory_ref(goal_ref))
+    if len(serialized(result)) > budget:
+        result = {key: result[key] for key in (
+            "metadata", "entries", "offset", "limit", "total", "next_offset", "selection"
+        ) if key in result}
+        result["read_refs"] = omitted(value.get("read_refs", []), _memory_ref(goal_ref))
+        if "entries" in result and len(serialized(result["entries"])) > max(400, budget // 2):
+            result["entries"] = omitted(result["entries"], _memory_ref(goal_ref))
+    return result
+
+
 def compact_task(task):
     from mathagent.providers.protocol import messages_for
 
@@ -239,6 +284,18 @@ def compact_task(task):
         task[field] = value
         if value != original:
             summary["condensed_sections"][field] = omitted(original, goal_ref)
+    if task.get("search_context") is not None:
+        original = task["search_context"]
+        task["search_context"] = _compact_search_context(original, 10000, goal_ref)
+        if task["search_context"] != original:
+            summary["condensed_sections"]["search_context"] = omitted(
+                original, _run_context_ref(goal_ref, "run_context.search_context"))
+    if task.get("memory_packet") is not None:
+        original = task["memory_packet"]
+        task["memory_packet"] = _compact_memory_packet(original, 10000, goal_ref)
+        if task["memory_packet"] != original:
+            summary["condensed_sections"]["memory_packet"] = omitted(
+                original, _memory_ref(goal_ref))
     instruction = task.get("instruction", "")
     if len(instruction) > 8000:
         summary["condensed_sections"]["instruction"] = {
@@ -264,6 +321,8 @@ def compact_task(task):
                 "proof_plans",
                 "repair_output",
                 "instruction",
+                "search_context",
+                "memory_packet",
             )
             if task.get(k)
         ]
@@ -287,6 +346,10 @@ def compact_task(task):
             task[key] = value[: len(value) // 2]
         elif isinstance(value, list):
             task[key] = value[len(value) // 2 :] if len(value) > 1 else []
+        elif key == "search_context":
+            task[key] = _compact_search_context(value, max(1200, len(serialized(value)) // 2), goal_ref)
+        elif key == "memory_packet":
+            task[key] = _compact_memory_packet(value, max(1200, len(serialized(value)) // 2), goal_ref)
         else:
             task[key] = []
     summary["included_count"] = len(task["inputs"])

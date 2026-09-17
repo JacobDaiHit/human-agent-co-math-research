@@ -173,6 +173,40 @@ def test_unknown_retry_completes_reviewed_workflow_with_unresolved_cost(workspac
             resume=True, case_ids=[cases[0]["id"]], transport_factory=factory))
 
 
+def test_bounded_search_answerbench_emits_search_state(workspace, tmp_path):
+    problems, source, cases = workspace
+    output = tmp_path / "bounded"
+
+    def factory(_case):
+        async def handle(request):
+            task = json.loads(json.loads(request.content)["messages"][-1]["content"])
+            assert SECRET not in json.dumps(task)
+            context, kind = task["search_context"], task["search_context"]["kind"]
+            if kind == "analysis":
+                result = {"mode": "research", "body": "analysis", "findings": ["fixture"], "cited_revision_ids": [], "next_action": "finish", "actions": [{"type": "propose_routes", "arguments": {"routes": [{"title": "a", "core_reduction": "a", "key_lemmas": ["a"], "assumptions": [], "subgoal": "a", "cheap_check": "a"}, {"title": "b", "core_reduction": "b", "key_lemmas": ["b"], "assumptions": [], "subgoal": "b", "cheap_check": "b"}]}}]}
+            elif kind == "advance":
+                result = {"mode": "research", "body": r"$1+1=2$, $\boxed{2}$.", "findings": ["fixture"], "cited_revision_ids": [], "next_action": "finish", "actions": [{"type": "report_progress", "arguments": {"status": "candidate"}}]}
+            elif kind == "check":
+                result = {"mode": "review", "body": "checked", "findings": ["fixture"], "verdict": "passed", "scope": "fixture review", "cited_revision_ids": [], "actions": [], "structured_gaps": [], "next_action": "finish"}
+            else:
+                result = {"mode": "research", "body": r"$\boxed{2}$", "findings": ["fixture"], "cited_revision_ids": [context["route"]["candidate_revision_id"]], "actions": [], "next_action": "finish"}
+            return httpx.Response(200, json={"id": "synthetic", "usage": {"completion_tokens": 20}, "choices": [{"message": {"content": json.dumps(result)}, "finish_reason": "stop"}]})
+        return httpx.MockTransport(handle)
+
+    bounded = limits(request_budget=6, max_steps=6, max_children=3, max_output_tokens=1024,
+        cumulative_output_token_budget=4096, parallel_cases=1, solver_controller="bounded_search_v1",
+        search_config={"max_routes": 2, "active_routes": 2, "check_requests": 1,
+                       "final_output_tokens": 512, "check_output_tokens": 512})
+    result = asyncio.run(answerbench.run_batch(problems, output, CONFIG, bounded, source,
+        case_ids=[cases[0]["id"]], transport_factory=factory))
+    assert result["all_completed"]
+    report = read_json(output / cases[0]["id"] / "report.json")
+    assert report["search_state"]["session"]["phase"] == "terminated"
+    assert len(report["search_state"]["routes"]) == 2
+    assert any(work["kind"] == "check" for work in report["search_state"]["works"])
+    assert report["final_answer"] == "2" and SECRET not in json.dumps(report)
+
+
 def test_four_cases_two_real_api_processes_review_export_and_frozen_resume(workspace, tmp_path):
     problems, source, cases = workspace
     output = tmp_path / "normal-batch"
@@ -395,3 +429,14 @@ def test_intervention_audit_excludes_only_receipted_scheduler_controls():
     audit = answerbench.intervention_audit(events, receipt)
     assert audit["human_interventions"] == 1 and not audit["unattended_eligible"]
     assert [event["actor"] for event in audit["interventions"]] == ["benchmark_scheduler", "human"]
+
+
+def test_search_route_controls_disqualify_unattended_comparison():
+    events = [
+        {"id": "dispatch", "type": "search.decision", "payload": {"action": "advance"}},
+        {"id": "priority", "type": "search.decision", "payload": {
+            "action": "human_intervention", "details": {"action": "priority", "priority": 2}}},
+    ]
+    audit = answerbench.intervention_audit(events)
+    assert audit["human_interventions"] == 1 and not audit["unattended_eligible"]
+    assert audit["interventions"][0]["event_id"] == "priority"

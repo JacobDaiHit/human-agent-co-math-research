@@ -27,8 +27,11 @@ def main():
     parser.add_argument("--case-id", action="append", help="Run only this exact frozen case; repeatable")
     parser.add_argument("--code-sandbox", action="store_true", help="Require the preconfigured local offline Docker sandbox; fail before inference if unavailable")
     parser.add_argument("--evaluation-mode", choices=["answer", "research"], default="research")
-    parser.add_argument("--solver", choices=["agent", "direct", "self_refine"], default="agent",
-                        help="direct: one natural-language call; self_refine: fixed tool-free revision chain")
+    parser.add_argument("--solver", choices=["agent", "direct", "self_refine", "independent_samples"], default="agent",
+                        help="direct: one call; self_refine: fixed refinement; independent_samples: independent vote")
+    parser.add_argument("--solver-controller", choices=["legacy", "bounded_search_v1"], default="legacy")
+    parser.add_argument("--search-config", type=Path,
+                        help="Read bounded search controller settings from this JSON file")
     parser.add_argument("--cumulative-output-token-budget", type=int,
                         help="Shared output/thinking token cap; unknown usage keeps its reservation. Input tokens reported separately.")
     parser.add_argument("--no-calculator", action="store_true", help="Disable built-in calculation tools for tool-free agent ablation")
@@ -44,6 +47,12 @@ def main():
     if not args.execute:
         parser.error("No requests made. Use --execute for a bounded real batch.")
     load_local_environment()
+    search_config = {}
+    if args.search_config:
+        value = json.loads(args.search_config.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            parser.error("--search-config must point to a JSON object")
+        search_config = value
     config = replace(ProviderConfig.from_env("deepseek"), model=args.model)
     limits = Limits(request_budget=args.request_budget, max_steps=args.max_steps,
         max_output_tokens=args.max_output_tokens, request_timeout_seconds=args.request_timeout,
@@ -51,6 +60,7 @@ def main():
         reasoning_effort=args.effort, length_recovery=args.length_recovery,
         unknown_recovery=args.unknown_recovery, code_sandbox=args.code_sandbox,
         evaluation_mode=args.evaluation_mode, solver=args.solver,
+        solver_controller=args.solver_controller, search_config=search_config,
         cumulative_output_token_budget=args.cumulative_output_token_budget,
         builtin_calculator=not args.no_calculator,
         case_order_seed=args.case_order_seed,

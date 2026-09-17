@@ -36,6 +36,14 @@ from mathagent.persistence.models import (
 )
 from mathagent.persistence.research_models import ResearchRecordReference
 from mathagent.persistence.runtime_models import ProviderRequest, RunOptions
+from mathagent.persistence.search_models import (
+    SearchDecision,
+    SearchGap,
+    SearchMemory,
+    SearchRoute,
+    SearchSession,
+    SearchWork,
+)
 from mathagent.persistence.workspace_models import Annotation, ConflictResolution
 from sqlalchemy import or_, select
 
@@ -189,6 +197,71 @@ class ExportService:
             )
         return required
 
+    @staticmethod
+    def _snapshot_revision_ids(value, key=""):
+        if isinstance(value, dict):
+            if key in {"read_set", "dependency_snapshot"}:
+                return {item for item in value.values() if isinstance(item, str)}
+            found = set()
+            for name, item in value.items():
+                found.update(ExportService._snapshot_revision_ids(item, name))
+            return found
+        if isinstance(value, list):
+            return set().union(*(ExportService._snapshot_revision_ids(item, key) for item in value))
+        if isinstance(value, str) and (key.endswith("revision_id") or key.endswith("revision_ids")):
+            return {value}
+        return set()
+
+    def _search_snapshot(self, session, project_id):
+        """Freeze controller indexes with their exact revision-reference closure."""
+        required, sessions = set(), []
+        for search in session.scalars(select(SearchSession).where(
+            SearchSession.project_id == project_id
+        ).order_by(SearchSession.created_at, SearchSession.root_run_id)):
+            root = session.get(Run, search.root_run_id)
+            if root is None or self.service.require_branch(session, root.branch_id).project_id != project_id:
+                raise DomainError(422, "cross_project_reference", "搜索会话引用越过项目边界。")
+            item = {"session": record(search), "routes": [], "work": [], "gaps": [],
+                    "memory": [], "decisions": []}
+            required.add(search.goal_revision_id)
+            for route in session.scalars(select(SearchRoute).where(
+                SearchRoute.root_run_id == search.root_run_id
+            ).order_by(SearchRoute.ordinal, SearchRoute.id)):
+                item["routes"].append(record(route))
+                required.add(route.card_revision_id)
+                if route.candidate_revision_id:
+                    required.add(route.candidate_revision_id)
+            for work in session.scalars(select(SearchWork).where(
+                SearchWork.root_run_id == search.root_run_id
+            ).order_by(SearchWork.created_at, SearchWork.id)):
+                row = record(work)
+                item["work"].append(row)
+                required.update(self._snapshot_revision_ids(row["input_snapshot"]))
+            for gap in session.scalars(select(SearchGap).where(
+                SearchGap.root_run_id == search.root_run_id
+            ).order_by(SearchGap.id)):
+                item["gaps"].append(record(gap))
+                required.add(gap.target_revision_id)
+                if gap.source_revision_id:
+                    required.add(gap.source_revision_id)
+                required.update(self._snapshot_revision_ids(gap.details))
+            for memory in session.scalars(select(SearchMemory).where(
+                SearchMemory.root_run_id == search.root_run_id
+            ).order_by(SearchMemory.id)):
+                row = record(memory)
+                item["memory"].append(row)
+                required.add(memory.revision_id)
+                required.update(memory.dependency_snapshot.values())
+                required.update(memory.assumptions)
+            for decision in session.scalars(select(SearchDecision).where(
+                SearchDecision.root_run_id == search.root_run_id
+            ).order_by(SearchDecision.sequence, SearchDecision.id)):
+                row = record(decision)
+                item["decisions"].append(row)
+                required.update(self._snapshot_revision_ids(row["details"]))
+            sessions.append(item)
+        return required, {"scope": "all_project_search_sessions_at_snapshot", "sessions": sessions}
+
     def create(self, session, payload):
         project = session.get(Project, payload["project_id"])
         if project is None:
@@ -226,6 +299,8 @@ class ExportService:
             )
         )
         required.update(self._runtime_snapshot(session, snapshot))
+        search_required, snapshot["search_state"] = self._search_snapshot(session, project.id)
+        required.update(search_required)
         for conflict in snapshot["conflicts"]:
             required.update(
                 conflict[key]

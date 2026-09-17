@@ -1,0 +1,937 @@
+"""Bounded, durable search control. All mutations share the runtime transaction.
+
+The controller schedules work, not mathematical truth. Revisions and tool/review
+receipts remain the evidence; proposed progress never becomes a proof certificate.
+"""
+
+import hashlib
+import json
+from datetime import UTC, datetime
+
+from mathagent.application.errors import DomainError
+from mathagent.application.state import record
+from mathagent.persistence.agent_models import AgentRun, AgentStep
+from mathagent.persistence.models import Attempt, Branch, Head, Revision, Run
+from mathagent.persistence.runtime_models import ProviderRequest
+from mathagent.persistence.search_models import (
+    SearchDecision,
+    SearchGap,
+    SearchMemory,
+    SearchRoute,
+    SearchSession,
+    SearchWork,
+)
+from mathagent.providers.actions import OPERATION_MODELS
+from mathagent.providers.protocol import AgentAction
+from mathagent.providers.search_contract import SearchConfig
+from mathagent.runtime.completion import boxed_answers, delivered_review_ranges
+from mathagent.runtime.context import compact_task
+from mathagent.runtime.memory import MemoryService
+from sqlalchemy import select
+
+SEARCH_ACTIONS = {"propose_routes", "report_progress", "report_gap", "propose_check", "request_memory", "share_memory"}
+BLOCKED_ACTIONS = {"spawn_task", "request_review", "create_branch", "discuss", "search_project", "record_source"}
+DONE = {"completed", "failed", "cancelled", "interrupted", "budget_exhausted", "step_limit"}
+OPEN_WORK = {"queued", "running"}
+
+
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+class SearchController:
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.state = runtime.service
+        self.memory = MemoryService(self.state)
+
+    def session_for(self, session, run_id):
+        config = session.get(AgentRun, run_id)
+        return session.get(SearchSession, config.root_run_id) if config else None
+
+    def inputs_stale(self, session, run, attempt):
+        root_id = attempt.checkpoint.get("search_root_id")
+        if not root_id:
+            return False
+        root = session.get(Run, root_id)
+        search = session.get(SearchSession, root_id)
+        return (not root or not search or search.phase == "terminated"
+            or root.control_epoch != attempt.checkpoint.get("search_root_control_epoch")
+            or root.state in {"paused", "pause_requested", "cancelled", "cancel_requested", "interrupted"}
+            or any((head := session.get(Head, (search.config["initial_branch_id"], oid))) is None
+                or head.revision_id != rid for oid, rid in search.config["initial_read_set"].items()))
+
+    def work_for(self, session, run_id):
+        return session.scalar(select(SearchWork).where(SearchWork.run_id == run_id,
+            SearchWork.state.in_(OPEN_WORK)).order_by(SearchWork.created_at.desc(), SearchWork.id))
+
+    def initialize(self, session, run, payload):
+        if payload.get("solver_controller", "legacy") != "bounded_search_v1":
+            return
+        cfg = SearchConfig.model_validate(payload.get("search_config") or {}).model_dump()
+        limit = payload.get("cumulative_output_token_budget")
+        count = payload.get("request_budget", 5)
+        if (not payload.get("autonomous") or payload.get("mode", "research") != "research"
+                or limit is None or limit < cfg["final_output_tokens"] + cfg["check_output_tokens"] + 512
+                or count < cfg["final_requests"] + cfg["check_requests"] + 2
+                or payload.get("max_steps", 8) < 2):
+            raise DomainError(422, "search_budget_configuration", "受控求解需要自主研究、输出总上限及足够的探索、检查与收尾额度。")
+        if payload.get("completion_policy") == "reviewed_answer" and cfg["check_requests"] < 1:
+            raise DomainError(422, "search_review_capacity", "证明完成策略必须保留独立审查额度。")
+        branch = self.state.require_branch(session, run.branch_id)
+        heads = self.state.read_set(session, branch.id)
+        initial = {oid: rid for oid, rid in heads.items()
+                   if oid == run.goal_object_id or self.state.require_object(session, oid).kind == "context"}
+        row = SearchSession(root_run_id=run.id, project_id=branch.project_id,
+            goal_revision_id=heads[run.goal_object_id], phase="analysis",
+            config={**cfg, "initial_read_set": initial, "initial_branch_id": branch.id,
+                    "controller_version": "bounded_search_v1", "config_hash": fingerprint(cfg)}, version=0)
+        session.add(row)
+        session.flush()
+        for oid, rid in initial.items():
+            self.memory.record(session, run.id, None, rid, branch.id, "context", "initial:" + oid)
+        if not self._work(session, row, None, run, "analysis", list(initial.values())):
+            run.state, row.phase = "budget_exhausted", "terminated"
+
+    def _decision(self, session, search, trigger, action, details):
+        old = session.scalar(select(SearchDecision).where(SearchDecision.root_run_id == search.root_run_id,
+            SearchDecision.trigger_key == trigger))
+        if old:
+            return old
+        # StateService.execute holds BEGIN IMMEDIATE across event processing and
+        # work creation. The unique trigger is an additional replay fence.
+        route = session.get(SearchRoute, details.get("route_id")) if details.get("route_id") else None
+        details = {**details, "config_hash": search.config.get("config_hash"),
+            "route_version": route.version if route else None, "budget_snapshot": self.budget(session, search)}
+        search.version += 1
+        row = SearchDecision(root_run_id=search.root_run_id, sequence=search.version,
+            trigger_key=trigger, action=action, details=details)
+        session.add(row)
+        session.flush()
+        root = session.get(Run, search.root_run_id)
+        self.runtime._emit(session, root, "search.decision", {"decision_id": row.id,
+            "sequence": search.version, **details, "action": action, "details": details})
+        return row
+
+    def _requests(self, session, search):
+        ids = select(AgentRun.run_id).where(AgentRun.root_run_id == search.root_run_id)
+        return session.scalars(select(ProviderRequest).where(ProviderRequest.run_id.in_(ids))).all()
+
+    def budget(self, session, search, *, exclude_work=None):
+        root = session.get(Run, search.root_run_id)
+        options = self.runtime.agent.options(session, root.id)
+        cfg = search.config
+        if cfg.get("budget_policy") == "adaptive":
+            return self._adaptive_budget(session, search, exclude_work=exclude_work)
+        limits = {
+            "explore": (options["request_budget"] - cfg["final_requests"] - cfg["check_requests"],
+                        options["cumulative_output_token_budget"] - cfg["final_output_tokens"] - cfg["check_output_tokens"]),
+            "check": (cfg["check_requests"], cfg["check_output_tokens"]),
+            "final": (cfg["final_requests"], cfg["final_output_tokens"]),
+        }
+        used = {p: {"requests": 0, "output_tokens": 0, "held_requests": 0, "held_output_tokens": 0} for p in limits}
+        requested_work = set()
+        for request in self._requests(session, search):
+            if request.state == "released":
+                continue
+            attempt = session.get(Attempt, request.attempt_id)
+            wid = attempt.checkpoint.get("search_work_id")
+            work = session.get(SearchWork, wid) if wid else None
+            pool = work.budget_pool if work else "explore"
+            requested_work.add(wid)
+            usage = request.usage or {}
+            completion = usage.get("completion_tokens")
+            output = completion if request.state == "spent" and type(completion) is int and completion >= 0 else request.output_token_reservation
+            used[pool]["requests"] += 1
+            used[pool]["output_tokens"] += output
+        for work in session.scalars(select(SearchWork).where(SearchWork.root_run_id == root.id,
+                SearchWork.state.in_(OPEN_WORK))):
+            if work.id == exclude_work or work.id in requested_work:
+                continue
+            used[work.budget_pool]["held_requests"] += 1
+            used[work.budget_pool]["held_output_tokens"] += work.input_snapshot.get("output_cap", 256)
+        result = {}
+        for pool, (count, tokens) in limits.items():
+            item = used[pool]
+            result[pool] = {**item, "request_limit": count, "output_limit": tokens,
+                "remaining_requests": max(0, count - item["requests"] - item["held_requests"]),
+                "remaining_output_tokens": max(0, tokens - item["output_tokens"] - item["held_output_tokens"])}
+        # During finalization unused capacity is usable by the finalizer, never
+        # the reverse. Already dispatched work remains accounted and is drained.
+        if search.phase == "final":
+            result["final"]["remaining_requests"] += sum(result[p]["remaining_requests"] for p in ("explore", "check"))
+            result["final"]["remaining_output_tokens"] += sum(result[p]["remaining_output_tokens"] for p in ("explore", "check"))
+        return result
+
+    def _adaptive_budget(self, session, search, *, exclude_work=None):
+        """One root ledger for adaptive runs.
+
+        A request that may still settle (including ``unknown``) consumes its
+        reservation.  A queued work item has the same effect until it obtains
+        a ProviderRequest.  This deliberately makes each displayed pool share
+        the same remaining capacity; pool numbers are availability views, not
+        independently spendable balances.
+        """
+        root = session.get(Run, search.root_run_id)
+        options = self.runtime.agent.options(session, root.id)
+        spent_requests = spent_tokens = held_requests = held_tokens = 0
+        requested_work = set()
+        for request in self._requests(session, search):
+            if request.state == "released":
+                continue
+            attempt = session.get(Attempt, request.attempt_id)
+            wid = attempt.checkpoint.get("search_work_id") if attempt else None
+            requested_work.add(wid)
+            spent_requests += 1
+            completion = (request.usage or {}).get("completion_tokens")
+            spent_tokens += (completion if request.state == "spent" and type(completion) is int
+                             and completion >= 0 else request.output_token_reservation)
+        for work in session.scalars(select(SearchWork).where(
+                SearchWork.root_run_id == root.id, SearchWork.state.in_(OPEN_WORK))):
+            if work.id == exclude_work or work.id in requested_work:
+                continue
+            held_requests += 1
+            held_tokens += work.input_snapshot.get("output_cap", 256)
+        remaining_requests = max(0, options["request_budget"] - spent_requests - held_requests)
+        remaining_tokens = max(0, options["cumulative_output_token_budget"] - spent_tokens - held_tokens)
+        common = {"requests": spent_requests, "output_tokens": spent_tokens,
+                  "held_requests": held_requests, "held_output_tokens": held_tokens,
+                  "request_limit": options["request_budget"],
+                  "output_limit": options["cumulative_output_token_budget"],
+                  "remaining_requests": remaining_requests,
+                  "remaining_output_tokens": remaining_tokens}
+        return {pool: {**common, "shared_root_budget": True} for pool in ("explore", "check", "final")}
+
+    def _adaptive_floor(self, search, kind):
+        """Tokens reserved beyond this work before a useful dispatch."""
+        cfg = search.config
+        final = cfg["final_output_tokens"]
+        check = min(cfg["check_output_tokens"], cfg["min_check_output_tokens"])
+        if kind == "final":
+            return 0
+        if kind == "check":
+            return final
+        if kind == "repair":
+            # A repaired candidate still needs an independent review.
+            return final + check
+        # A future candidate must be independently checkable; this keeps an
+        # exploration response from consuming the last meaningful review cap.
+        return final + check
+
+    def _adaptive_request_floor(self, search, kind):
+        cfg = search.config
+        final = cfg["final_requests"]
+        check = 1 if cfg["check_requests"] else 0
+        if kind == "final":
+            return 0
+        if kind == "check":
+            return final
+        # Analysis and repair/advance can produce a candidate which must still
+        # have a request for independent checking and final delivery.
+        return final + check
+
+    def minimum_output_tokens(self, session, search, kind):
+        """Smallest useful response for this work, capped by model capacity.
+
+        Kept public for the worker's recovery path: a retry must ask for at
+        least this amount instead of repeatedly shrinking a failed request.
+        """
+        cfg = search.config
+        root_max = self.runtime.agent.options(session, search.root_run_id)["max_output_tokens"]
+        if kind == "analysis":
+            value = min(cfg["analysis_output_tokens"], cfg["min_work_output_tokens"])
+        elif kind == "final":
+            value = min(cfg["final_output_tokens"], cfg["min_work_output_tokens"])
+        elif kind in {"check", "repair"}:
+            value = min(cfg["check_output_tokens"], cfg["min_check_output_tokens"])
+        else:
+            value = cfg["min_work_output_tokens"]
+        return min(root_max, value)
+
+    def _work(self, session, search, route, run, kind, refs):
+        pool = "final" if kind == "final" else "check" if kind in {"check", "repair"} else "explore"
+        allowance = self.budget(session, search)[pool]
+        adaptive = search.config.get("budget_policy") == "adaptive"
+        if allowance["remaining_requests"] < 1 or allowance["remaining_output_tokens"] < 256:
+            return None
+        # Leave a fair first opportunity for unexplored routes, including under
+        # small output budgets. This is a cap, not a target to waste tokens on.
+        if adaptive:
+            root_max = self.runtime.agent.options(session, search.root_run_id)["max_output_tokens"]
+            available = allowance["remaining_output_tokens"] - self._adaptive_floor(search, kind)
+            ceiling = search.config["analysis_output_tokens"] if kind == "analysis" else root_max
+            cap = min(root_max, ceiling, available)
+            minimum = self.minimum_output_tokens(session, search, kind)
+            request_capacity = allowance["remaining_requests"] - self._adaptive_request_floor(search, kind)
+            if cap < minimum or request_capacity < 1:
+                self._decision(session, search, "insufficient:" + kind + ":" + (route.id if route else run.id),
+                               "budget_stop", {"kind": kind, "route_id": route.id if route else None,
+                               "available_output_tokens": max(0, available), "minimum_output_tokens": minimum,
+                               "available_requests": max(0, request_capacity)})
+                return None
+        else:
+            slots = 1 if pool != "explore" else max(1, min(search.config["active_routes"], allowance["remaining_requests"]))
+            cap = min(self.runtime.agent.options(session, search.root_run_id)["max_output_tokens"],
+                      allowance["remaining_output_tokens"] // slots)
+        work = SearchWork(root_run_id=search.root_run_id, route_id=route.id if route else None,
+            run_id=run.id, kind=kind, state="queued", budget_pool=pool,
+            input_snapshot={"required_revision_ids": sorted(set(refs)), "output_cap": max(256, cap)})
+        session.add(work)
+        session.flush()
+        if route and kind != "final":
+            route.state = "running"
+        self._decision(session, search, "dispatch:" + work.id, kind,
+                       {"work_id": work.id, "route_id": work.route_id, "output_cap": cap})
+        return work
+
+    def admit(self, session, run, requested_tokens=None):
+        search = self.session_for(session, run.id)
+        if not search:
+            return None
+        work = self.work_for(session, run.id)
+        root = session.get(Run, search.root_run_id)
+        if any((head := session.get(Head, (search.config["initial_branch_id"], oid))) is None
+                or head.revision_id != rid for oid, rid in search.config["initial_read_set"].items()):
+            raise DomainError(403, "search_frozen_input_changed", "原题或假设版本已改变；请新建受控会话。")
+        if not work or search.phase == "terminated" or (run.id != root.id and root.state in {
+                "paused", "pause_requested", "cancelled", "cancel_requested", "interrupted", "reconciliation_required"}):
+            raise DomainError(403, "search_dispatch_not_authorized", "该工作没有当前有效的受控派发资格。")
+        available = self.budget(session, search, exclude_work=work.id)[work.budget_pool]
+        cap = min(work.input_snapshot["output_cap"], available["remaining_output_tokens"])
+        if search.config.get("budget_policy") == "adaptive":
+            # The work's own reservation is excluded above, while all other
+            # queued/dispatched/unknown holds remain. Never shrink a useful
+            # admitted work into a repeated tiny retry.
+            cap = min(cap, max(0, available["remaining_output_tokens"] - self._adaptive_floor(search, work.kind)))
+            floor = self.minimum_output_tokens(session, search, work.kind)
+            if cap < floor:
+                raise DomainError(403, "search_pool_exhausted", "当前全局额度不足以完成有意义的受控工作。")
+            if requested_tokens is not None and requested_tokens < floor:
+                raise DomainError(403, "search_pool_exhausted", "请求额度低于当前阶段的最小有效输出额度。")
+            if available["remaining_requests"] - self._adaptive_request_floor(search, work.kind) < 1:
+                raise DomainError(403, "search_pool_exhausted", "当前全局请求额度已保留给检查与收尾。")
+        if available["remaining_requests"] < 1 or cap < 256 or (requested_tokens is not None and requested_tokens > cap):
+            raise DomainError(403, "search_pool_exhausted", "当前阶段额度不足，修订与收尾保留额度不可借用。")
+        return cap
+
+    def validate_final(self, session, run, result):
+        search = self.session_for(session, run.id)
+        work = self.work_for(session, run.id)
+        if not search or not work or work.kind != "final":
+            return
+        if result.next_action != "finish" or result.actions:
+            raise DomainError(422, "search_final_contract", "收尾仅能明确提交或弃答，不能重新派发研究操作。")
+        selected = session.get(SearchRoute, search.selected_route_id) if search.selected_route_id else None
+        answer = boxed_answers(result.body)
+        if answer:
+            candidate = session.get(Revision, selected.candidate_revision_id) if selected else None
+            if (not candidate or len(answer) != 1 or answer != boxed_answers(candidate.body)
+                    or candidate.id not in result.cited_revision_ids):
+                raise DomainError(422, "search_final_selection_mismatch", "最终答案必须来自所选候选并引用其固定版本；没有候选时应弃答。")
+
+    def initial_read_set(self, session, run, all_heads):
+        search = self.session_for(session, run.id)
+        work = self.work_for(session, run.id)
+        if not search or not work:
+            return None
+        refs = set(work.input_snapshot.get("required_revision_ids", []))
+        refs.update(search.config["initial_read_set"].values())
+        # Do not replace an expected revision by its new head. Claim then fences
+        # both the local reference and its originating branch head.
+        result = {}
+        for rid in refs:
+            rev = session.get(Revision, rid)
+            if rev and all_heads.get(rev.object_id) == rid and not rev.payload.get("deleted"):
+                result[rev.object_id] = rid
+        result[run.goal_object_id] = all_heads[run.goal_object_id]
+        return result
+
+    def enrich(self, session, task):
+        run = session.get(Run, task["run_id"])
+        search = self.session_for(session, run.id)
+        work = self.work_for(session, run.id)
+        work.state = "running"
+        attempt = session.get(Attempt, task["attempt_id"])
+        route = session.get(SearchRoute, work.route_id) if work.route_id else None
+        self.memory.refresh(session, search.root_run_id)
+        packet = self.memory.packet(session, search.root_run_id, work.route_id,
+            required_revision_ids=work.input_snapshot.get("required_revision_ids", []))
+        if search.config["enable_memory"]:
+            selected_refs = set(task["context_revision_ids"])
+            packet["entries"] = [e for e in packet["entries"] if e["revision_id"] in selected_refs]
+            packet["selection"] = "goal_dependencies_current_gap_latest_checkpoint_explicit_imports"
+        task["memory_packet"] = packet
+        task["max_output_tokens"] = min(task["max_output_tokens"], self.admit(session, run))
+        if "provider_options" in task:
+            task["provider_options"] = {**task["provider_options"], "max_output_tokens": task["max_output_tokens"]}
+        if search.config.get("budget_policy") == "adaptive" and work.kind == "analysis":
+            # Route planning is deliberately short and non-deliberative: its
+            # value is a small route directory, rather than a hidden proof.
+            task["thinking_mode"] = "disabled"
+            task["reasoning_effort"] = "provider_default"
+            task["provider_options"] = {**task.get("provider_options", {}),
+                "max_output_tokens": task["max_output_tokens"], "thinking_mode": "disabled",
+                "reasoning_effort": "provider_default"}
+        task["operation_schemas"] = {k: v for k, v in task["operation_schemas"].items()
+            if k not in BLOCKED_ACTIONS and (search.config["enable_tools"] or k not in {"calculate", "run_code", "propose_check"})}
+        if work.kind == "analysis":
+            task["operation_schemas"] = {k: v for k, v in task["operation_schemas"].items() if k in {"propose_routes", "read_object", "request_memory"}}
+        elif work.kind == "final":
+            task["operation_schemas"] = {}
+        elif work.kind != "check":
+            task["operation_schemas"].pop("propose_routes", None)
+        gaps = list(session.scalars(select(SearchGap).where(SearchGap.root_run_id == search.root_run_id,
+            SearchGap.route_id == work.route_id, SearchGap.state == "open"))) if work.route_id else []
+        task["search_context"] = {"controller": "bounded_search_v1", "phase": search.phase,
+            "work_id": work.id, "kind": work.kind, "route_id": work.route_id,
+            "budget_policy": search.config.get("budget_policy", "fixed"),
+            "min_work_output_tokens": search.config.get("min_work_output_tokens"),
+            "min_check_output_tokens": search.config.get("min_check_output_tokens"),
+            "route": record(route) if route else None, "budget": self.budget(session, search, exclude_work=work.id),
+            "gaps": [record(g) for g in gaps], "original_goal_revision_id": search.goal_revision_id,
+            "route_directory": [{"route_id": r.id, "ordinal": r.ordinal, "state": r.state}
+                for r in session.scalars(select(SearchRoute).where(SearchRoute.root_run_id == search.root_run_id)
+                    .order_by(SearchRoute.ordinal))],
+            "selected_route_id": search.selected_route_id,
+            "contract": "Next actions are proposals. Preserve the original quantifiers and assumptions; review is scoped, never a formal certificate."}
+        if work.kind == "repair":
+            task["search_context"]["repair_contract"] = {
+                "target_revision_id": route.candidate_revision_id,
+                "gaps": [record(g) for g in gaps], "preserve": "Reusable results independent of the faulty step",
+                "forbidden": "Do not strengthen the original assumptions or repeat the rejected step; save a revised candidate and remaining gaps."}
+        instructions = {
+            "analysis": "本次只分析题目并调用 propose_routes 提出不同核心归约，不能提交题目答案。对求解集或存在性问题，不预设存在解；同时考虑构造解与排除解的必要条件，再按证据选择路线，不强制每题无解。只给少量路线卡（总计约 800 词以内），不写完整证明。",
+            "advance": r"完成当前路线的一个实质子目标。用 report_progress 报告进展；只有已覆盖原题且无未解子目标时才用 candidate。证明整个定义域无解也是完整候选，可提交 $\boxed{\varnothing}$ 及证明并进入独立审查。candidate_revision_id 为空表示本次正文为候选，不表示无解；候选正文必须含一个盒装答案。只在有限范围未找到解或研究停滞，应报告 progress/stalled 并保留缺口。",
+            "repair": "逐项修复 repair_contract 的缺口，保留独立有效成果；用 report_progress 报告新候选或 stalled，不重复已否定步骤。",
+            "check": "核对目标、全部前提和依赖；针对最早定位的局部缺口返回 structured_gaps。无解证明须覆盖原题全部允许取值与例外情形，不能用有限枚举未找到解代替；检查矛盾是否由原题必要条件推出。passed 只代表实际审查范围内未发现问题。",
+            "final": "本次必须 next_action=finish 且 actions=[]，仅按选定候选提交一个盒装答案和依据，引用候选版本；没有可交付答案则明确弃答。不能新增未经审查的推导。",
+        }
+        task["instruction"] = instructions[work.kind] + "\n" + task["instruction"]
+        # No project-wide discussions or sibling response bodies in first work.
+        task["previous_steps"], task["child_results"], task["discussions"] = [], [], []
+        task["operation_results"] = []
+        if work.route_id and work.kind not in {"check", "final"}:
+            previous = list(session.scalars(select(SearchWork).where(SearchWork.route_id == work.route_id,
+                SearchWork.state == "completed").order_by(SearchWork.created_at.desc(), SearchWork.id)))
+            if previous:
+                step = session.scalar(select(AgentStep).where(AgentStep.run_id == previous[0].run_id)
+                    .order_by(AgentStep.number.desc()))
+                if step:
+                    task["operation_results"] = step.actions
+        for item in task["inputs"]:
+            item.pop("operation_receipts", None)
+        initial_branch = search.config["initial_branch_id"]
+        external = [{"branch_id": initial_branch, "object_id": oid, "revision_id": rid}
+                    for oid, rid in search.config["initial_read_set"].items()]
+        # Input origin refs are not replaced with current versions on resume.
+        for entry in session.scalars(select(SearchMemory).where(SearchMemory.root_run_id == search.root_run_id)):
+            if entry.revision_id in task["context_revision_ids"]:
+                external.extend({"branch_id": entry.branch_id, "object_id": oid, "revision_id": rid}
+                    for oid, rid in entry.dependency_snapshot.items())
+        attempt.checkpoint = {**attempt.checkpoint, "search_work_id": work.id,
+            "search_root_id": search.root_run_id, "external_read_set": external,
+            "search_root_control_epoch": session.get(Run, search.root_run_id).control_epoch,
+            "memory_packet": packet, "search_context": task["search_context"]}
+        task = compact_task(task)
+        if work.kind == "final":
+            review_bodies = {}
+            for item in task["inputs"]:
+                rev = session.get(Revision, item["revision_id"])
+                if rev.payload.get("mode") == "review":
+                    review_bodies[rev.id] = rev.body
+            ranges, delivered = delivered_review_ranges(task, review_bodies, {})
+            attempt.checkpoint = {**attempt.checkpoint, "delivered_review_ranges": ranges,
+                "fully_delivered_review_ids": delivered}
+        attempt.checkpoint = {**attempt.checkpoint, "memory_packet_hash": fingerprint(task.get("memory_packet", {}))}
+        return task
+
+    def _refs_allowed(self, session, run, values):
+        attempt = session.get(Attempt, run.current_attempt_id)
+        allowed = set(attempt.checkpoint.get("context_revision_ids", [])) | set(attempt.read_set.values())
+        allowed.add(attempt.output_revision_id)
+        work = self.work_for(session, run.id)
+        allowed.update(self.memory.allowed_revisions(session, work.root_run_id, work.route_id))
+        def walk(value, key=""):
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    walk(v, k)
+            elif isinstance(value, list):
+                for v in value:
+                    walk(v, key)
+            elif value and (key.endswith("revision_id") or key.endswith("revision_ids")) and value not in allowed:
+                raise DomainError(403, "search_reference_outside_packet", "引用不属于本次题目和路线的可用材料。")
+        walk(values)
+
+    def guard_action(self, session, run, kind, arguments):
+        search = self.session_for(session, run.id)
+        if not search:
+            if kind in SEARCH_ACTIONS:
+                raise DomainError(403, "search_controller_required", "此操作只用于受控求解。")
+            return
+        work = self.work_for(session, run.id)
+        if not work or work.kind == "final" or kind in BLOCKED_ACTIONS:
+            raise DomainError(403, "search_operation_not_authorized", "此操作不属于当前派发合同。")
+        if work.kind == "analysis" and kind not in {"propose_routes", "read_object", "request_memory"}:
+            raise DomainError(403, "search_analysis_contract", "分析阶段仅提出路线和读取当前材料。")
+        if kind in {"run_code", "calculate", "propose_check"} and not search.config["enable_tools"]:
+            raise DomainError(403, "search_tools_disabled", "此试验已关闭工具检查。")
+        self._refs_allowed(session, run, arguments)
+        if kind == "read_object":
+            rid = arguments.get("revision_id")
+            if not rid:
+                head = session.get(Head, (arguments.get("branch_id") or run.branch_id, arguments["object_id"]))
+                self._refs_allowed(session, run, {"revision_id": head.revision_id if head else "missing"})
+
+    def action(self, session, run, kind, arguments):
+        search = self.session_for(session, run.id)
+        work = self.work_for(session, run.id)
+        values = OPERATION_MODELS[kind].model_validate(arguments).model_dump(mode="json")
+        route = session.get(SearchRoute, work.route_id) if work.route_id else None
+        if kind == "propose_routes":
+            if work.kind != "analysis" or session.scalar(select(SearchRoute.id).where(SearchRoute.root_run_id == search.root_run_id)):
+                raise DomainError(409, "routes_already_proposed", "本次分析的路线已经保存。")
+            count = search.config["max_routes"] if search.config["enable_multi_route"] else 1
+            fingerprints, created = set(), []
+            for index, card in enumerate(values["routes"][:count]):
+                signature = fingerprint([card["core_reduction"].strip(), card["key_lemmas"], card["assumptions"]])
+                if signature in fingerprints:
+                    continue
+                fingerprints.add(signature)
+                branch = self.state.require_branch(session, run.branch_id)
+                _, rev = self.state.new_object(session, branch, "artifact", card.get("body") or card["subgoal"],
+                    {"artifact_type": "search_route", **card}, "agent:" + run.provider)
+                self.state._add_reference(session, branch.id, rev.id)
+                duplicate = card.get("suspected_duplicate_of")
+                suspected = duplicate is not None and duplicate < index and (
+                    card["assumptions"] == values["routes"][duplicate]["assumptions"])
+                item = SearchRoute(root_run_id=run.id, card_revision_id=rev.id, ordinal=index,
+                    state="ready", progress={"suspected_duplicate_of": duplicate if suspected else None,
+                        "diversity_reason": card.get("diversity_reason", ""), "diversity_judgment": "model_proposed",
+                        "assumptions": card["assumptions"]},
+                    repairs=0, priority=-1 if suspected else 0, version=0)
+                session.add(item)
+                session.flush()
+                created.append({"route_id": item.id, "revision_id": rev.id})
+            return {"routes": created}
+        if kind == "request_memory":
+            requested_route = values.get("route_id") or work.route_id
+            if work.route_id and requested_route != work.route_id:
+                raise DomainError(403, "search_other_route_private", "路线工作不能读取其他路线的私有记忆。")
+            return self.memory.packet(session, search.root_run_id, requested_route,
+                offset=values["offset"], limit=values["limit"])
+        if not route:
+            raise DomainError(403, "route_required", "当前工作未分配研究路线。")
+        if kind == "report_progress":
+            card = self.state.require_revision(session, route.card_revision_id)
+            values["assumptions"] = list(dict.fromkeys([
+                *card.payload.get("assumptions", []), *route.progress.get("assumptions", []),
+                *values["assumptions"]]))
+            candidate = values.get("candidate_revision_id")
+            if values["status"] == "candidate" and not candidate:
+                candidate = session.get(Attempt, run.current_attempt_id).output_revision_id
+            if candidate:
+                rev = self.state.require_revision(session, candidate)
+                if len(boxed_answers(rev.body)) != 1:
+                    raise DomainError(422, "search_candidate_answer_required", "完整候选必须有一个明确的盒装答案。")
+                if values["open_subgoals"] or values["assumptions"]:
+                    values["status"] = "progress"
+                route.candidate_revision_id = candidate
+            route.progress = {**route.progress, **values}
+            return {"route_id": route.id, "candidate_revision_id": candidate, "status": values["status"]}
+        if kind == "report_gap":
+            gap = self._gap(session, search, route, values, session.get(Attempt, run.current_attempt_id).output_revision_id)
+            return {"gap_id": gap.id, "state": gap.state}
+        if kind == "share_memory":
+            target = session.get(SearchRoute, values["target_route_id"])
+            if not target or target.root_run_id != search.root_run_id:
+                raise DomainError(403, "cross_search_import", "共享目标不属于同一求解会话。")
+            rev = self.state.require_revision(session, values["revision_id"])
+            if not target.branch_id:
+                self._branch(session, search, target)
+            # Conditions are explicitly retained, never declared equivalent.
+            target_branch = self.state.require_branch(session, target.branch_id)
+            self._import(session, target_branch, [rev.id])
+            source = session.scalar(select(SearchMemory).where(SearchMemory.root_run_id == search.root_run_id,
+                SearchMemory.route_id == route.id, SearchMemory.revision_id == rev.id, SearchMemory.state == "current"))
+            if not source:
+                raise DomainError(409, "search_share_receipt_required", "先保存成果与适用条件，再在后续步骤共享。")
+            entry = self.memory.import_shared(session, search.root_run_id, target.id, source.id,
+                "import:" + target.id + ":" + rev.id)
+            entry.kind = "imported"
+            entry.assumptions = list(dict.fromkeys([*source.assumptions, *values["assumptions"]]))
+            return {"memory_id": entry.id, "revision_id": rev.id, "assumptions": entry.assumptions,
+                "evidence": "conditional_import_not_equivalence"}
+        if kind == "propose_check":
+            params = {**values["arguments"], "target_revision_id": values["target_revision_id"]}
+            result = self.runtime.agent.execute_action(session, run, AgentAction(type=values["tool"], arguments=params))
+            return {**result, "check_statement": values["statement"], "check_scope": values["scope"],
+                "mapping": "model_proposed_requires_review", "mathematical_correctness_verified": False}
+        raise DomainError(422, "unknown_search_action", "未知求解操作。")
+
+    def _gap(self, session, search, route, values, source):
+        details = {k: v for k, v in values.items() if k not in {"target_revision_id", "kind"}}
+        target = self.state.require_revision(session, values["target_revision_id"])
+        details["target_body_sha256"] = hashlib.sha256(target.body.encode()).hexdigest()
+        for gap in session.scalars(select(SearchGap).where(SearchGap.root_run_id == search.root_run_id,
+                SearchGap.route_id == route.id, SearchGap.target_revision_id == values["target_revision_id"])):
+            if gap.kind == values["kind"] and gap.details == details:
+                return gap
+        gap = SearchGap(root_run_id=search.root_run_id, route_id=route.id,
+            target_revision_id=values["target_revision_id"], source_revision_id=source,
+            kind=values["kind"], details=details, state="open", repairs=0)
+        session.add(gap)
+        session.flush()
+        return gap
+
+    def _branch(self, session, search, route):
+        if route.branch_id:
+            return self.state.require_branch(session, route.branch_id)
+        branch = Branch(project_id=search.project_id, parent_id=search.config["initial_branch_id"],
+                        name=f"路线 {route.ordinal + 1}", control_epoch=0)
+        session.add(branch)
+        session.flush()
+        for oid, rid in search.config["initial_read_set"].items():
+            session.add(Head(branch_id=branch.id, object_id=oid, revision_id=rid))
+        card = self.state.require_revision(session, route.card_revision_id)
+        session.add(Head(branch_id=branch.id, object_id=card.object_id, revision_id=card.id))
+        self.state._add_reference(session, branch.id, route.card_revision_id)
+        route.branch_id = branch.id
+        self.memory.record(session, search.root_run_id, route.id, route.card_revision_id,
+                           branch.id, "route", "route:" + route.id,
+                           assumptions=card.payload.get("assumptions", []))
+        self.state.emit(session, search.project_id, branch.id, "branch.created", {"route_id": route.id})
+        return branch
+
+    def _import(self, session, branch, refs):
+        # Reuse pinned proof/reference closure, not an automatic branch merge.
+        from mathagent.persistence.models import Dependency, ProofPlan
+        from mathagent.persistence.research_models import ResearchRecordReference
+        pending, seen = list(refs), set()
+        while pending:
+            rid = pending.pop()
+            if rid in seen:
+                continue
+            seen.add(rid)
+            rev = self.state.require_revision(session, rid)
+            obj = self.state.require_object(session, rev.object_id)
+            if obj.project_id != branch.project_id or rev.payload.get("deleted"):
+                raise DomainError(403, "search_import_unavailable", "导入证据不可用。")
+            head = session.get(Head, (branch.id, rev.object_id))
+            if head and head.revision_id != rev.id:
+                raise DomainError(409, "search_import_version_conflict", "固定版本导入与现有上下文冲突，需要重查。")
+            if not head:
+                session.add(Head(branch_id=branch.id, object_id=rev.object_id, revision_id=rid))
+                self.state._add_reference(session, branch.id, rid)
+            pending.extend(self.memory._payload_references(rev.payload))
+            plan = session.get(ProofPlan, rid)
+            if plan:
+                pending.append(plan.conclusion_revision_id)
+                pending.extend(session.scalars(select(Dependency.revision_id).where(Dependency.plan_revision_id == rid)))
+            pending.extend(session.scalars(select(ResearchRecordReference.target_revision_id).where(ResearchRecordReference.record_revision_id == rid)))
+        return seen
+
+    def _dispatch(self, session, search, route, kind):
+        branch = self._branch(session, search, route)
+        root = session.get(Run, search.root_run_id)
+        config = self.runtime.agent.options(session, root.id)
+        refs = list(search.config["initial_read_set"].values()) + [route.card_revision_id]
+        if route.candidate_revision_id:
+            refs.append(route.candidate_revision_id)
+        allowed = self.memory.allowed_revisions(session, search.root_run_id, route.id)
+        if search.config["enable_memory"]:
+            refs.extend(rid for rid in route.progress.get("reusable_revision_ids", []) if rid in allowed)
+            last = route.progress.get("last_output_revision_id")
+            if last in allowed:
+                refs.append(last)
+            for entry in session.scalars(select(SearchMemory).where(SearchMemory.root_run_id == search.root_run_id,
+                    SearchMemory.route_id == route.id, SearchMemory.state == "current")):
+                if entry.kind in {"imported", "artifact", "review"}:
+                    refs.append(entry.revision_id)
+            for gap in session.scalars(select(SearchGap).where(SearchGap.route_id == route.id, SearchGap.state == "open")):
+                refs.extend(rid for rid in [gap.target_revision_id, gap.source_revision_id,
+                    *gap.details.get("evidence_revision_ids", [])] if rid in allowed)
+        else:
+            # Ablation keeps safety and complete references, changing selection
+            # to the chronological, same-route baseline rather than erasing facts.
+            refs.extend(allowed)
+        refs = list(self._import(session, branch, refs))
+        target = route.candidate_revision_id if kind == "check" else search.goal_revision_id
+        rev = self.state.require_revision(session, target)
+        _, created = self.runtime.create(session, {**config, "solver_controller": "legacy",
+            "branch_id": branch.id, "goal_object_id": rev.object_id, "provider": root.provider,
+            "mode": "review" if kind == "check" else "research", "autonomous": kind != "check",
+            "max_steps": 1, "completion_policy": "draft", "request_budget": config["request_budget"],
+            "instruction": ("独立检查候选及工具证据的适用条件，逐项给出 structured_gaps；不要采信其他模型的审查意见。"
+                            if kind == "check" else "按 search_context 的路线及局部目标推进；修复时逐项回应 repair_contract。候选正文使用 LaTeX，显式 report_progress。")})
+        child = session.get(AgentRun, created["run_id"])
+        child.parent_run_id, child.root_run_id, child.depth = root.id, root.id, 1
+        child.target_revision_id = target if kind == "check" else None
+        run = session.get(Run, child.run_id)
+        work = self._work(session, search, route, run, kind, refs)
+        if not work:
+            run.state = "cancelled"
+        return work
+
+    def completed(self, session, run, attempt, result, outcomes=()):
+        search = self.session_for(session, run.id)
+        if not search:
+            return
+        wid = attempt.checkpoint.get("search_work_id")
+        work = session.get(SearchWork, wid) if wid else None
+        if not work or work.state not in OPEN_WORK:
+            return
+        if attempt.state != "completed":
+            work.state = "interrupted"
+            return
+        work.state = "completed"
+        work.input_snapshot = {**work.input_snapshot, "output_revision_id": attempt.output_revision_id,
+            "attempt_id": attempt.id}
+        route = session.get(SearchRoute, work.route_id) if work.route_id else None
+        if work.kind != "analysis":
+            self.memory.record(session, search.root_run_id, None if work.kind == "final" else work.route_id,
+                attempt.output_revision_id, run.branch_id,
+                "review" if work.kind == "check" else "progress", "work:" + work.id,
+                assumptions=route.progress.get("assumptions", []) if route else [])
+        for index, action in enumerate(outcomes):
+            value = action.get("result", {})
+            rid = value.get("revision_id")
+            if action.get("status") == "completed" and rid:
+                evidence = "exact_computation" if action["type"] == "calculate" else "finite_experiment" if action["type"] in {"run_code", "propose_check"} else "proposed"
+                self.memory.record(session, search.root_run_id, work.route_id, rid, run.branch_id,
+                    "artifact", f"action:{work.id}:{index}", evidence_type=evidence,
+                    assumptions=route.progress.get("assumptions", []) if route else [])
+        if work.kind == "analysis":
+            search.phase = "search"
+            if not session.scalar(select(SearchRoute.id).where(SearchRoute.root_run_id == search.root_run_id)):
+                self._decision(session, search, "no_routes:" + work.id, "finalize", {"reason": "analysis_produced_no_valid_routes"})
+                search.phase = "final"
+            run.state = "waiting_children"
+        elif work.kind == "final":
+            search.phase = "terminated"
+            if run.state != "completed":
+                run.state = "step_limit"
+            # Existing completion policy is still authoritative, including no answer.
+        elif work.kind == "check":
+            complete = attempt.checkpoint.get("review_material_complete") is True
+            passed = result.get("verdict") == "passed" and complete and not result.get("structured_gaps")
+            route.progress = {**route.progress, "review_passed": passed,
+                "review_revision_id": attempt.output_revision_id, "reviewed_candidate_id": route.candidate_revision_id}
+            if passed:
+                route.state = "candidate"
+                for gap in session.scalars(select(SearchGap).where(SearchGap.route_id == route.id, SearchGap.state == "open")):
+                    gap.state = "reviewed_repair"
+            else:
+                values = result.get("structured_gaps") or [{"target_revision_id": route.candidate_revision_id,
+                    "kind": "missing_argument" if complete else "missing_material", "anchor": "review",
+                    "detail": result.get("scope") or "审查材料或论证尚不完整。", "evidence_revision_ids": []}]
+                for value in values:
+                    value = {**value, "target_revision_id": route.candidate_revision_id}
+                    self._gap(session, search, route, value, attempt.output_revision_id)
+                route.state = "repair_needed" if search.config["enable_repairs"] and route.repairs < search.config["max_repairs"] else "paused"
+        else:
+            steps = route.progress.get("steps", 0) + 1
+            route.progress = {**route.progress, "steps": steps, "last_output_revision_id": attempt.output_revision_id}
+            if route.progress.get("status") == "candidate":
+                route.state = "needs_check"
+                route.progress = {**route.progress, "review_passed": False}
+            elif steps >= search.config["max_route_steps"] or route.progress.get("status") == "stalled":
+                route.state = "paused"
+            else:
+                route.state = "ready"
+            if work.kind == "repair":
+                route.repairs += 1
+                for gap in session.scalars(select(SearchGap).where(SearchGap.route_id == route.id, SearchGap.state == "open")):
+                    gap.repairs += 1
+                if route.progress.get("status") != "candidate":
+                    route.state = "paused"
+            # Each child is one bounded work item. The controller, not its
+            # next_action, decides whether to create another item.
+            run.state = "completed"
+        self._decision(session, search, "complete:" + work.id, "work_completed",
+            {"work_id": work.id, "route_id": work.route_id, "state": route.state if route else search.phase})
+
+    def tick(self, session):
+        for search in session.scalars(select(SearchSession).where(SearchSession.phase != "terminated")):
+            root = session.get(Run, search.root_run_id)
+            if root.state in {"paused", "pause_requested", "cancel_requested", "cancelled", "interrupted", "reconciliation_required"}:
+                continue
+            changed_initial = any((head := session.get(Head, (search.config["initial_branch_id"], oid))) is None
+                or head.revision_id != rid for oid, rid in search.config["initial_read_set"].items())
+            if changed_initial:
+                root.state = "interrupted"
+                root.control_epoch += 1
+                self._decision(session, search, "original_input_changed", "interrupted",
+                    {"reason": "frozen_problem_or_assumptions_changed", "requires_new_session": True})
+                continue
+            self.memory.refresh(session, root.id)
+            works = list(session.scalars(select(SearchWork).where(SearchWork.root_run_id == root.id)))
+            for work in works:
+                if work.state not in OPEN_WORK:
+                    continue
+                run = session.get(Run, work.run_id)
+                if run.state == "reconciliation_required":
+                    root.state = "reconciliation_required"
+                    continue
+                if run.state == "paused" and work.route_id:
+                    work.state = "paused"
+                if run.state in DONE:
+                    work.state = run.state
+                    if work.route_id:
+                        route = session.get(SearchRoute, work.route_id)
+                        route.state = "paused"
+                    if work.kind == "analysis":
+                        search.phase = "final"
+                    elif work.kind == "final":
+                        search.phase = "terminated"
+            if search.phase == "terminated" or root.state == "reconciliation_required":
+                continue
+            active = [w for w in works if w.state in OPEN_WORK]
+            if search.phase == "analysis":
+                continue
+            created = datetime.fromisoformat(search.created_at)
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            age = (datetime.now(UTC) - created).total_seconds()
+            if age >= search.config["deadline_seconds"] - search.config["final_seconds"]:
+                search.phase = "final"
+            routes = list(session.scalars(select(SearchRoute).where(SearchRoute.root_run_id == root.id)
+                .order_by(SearchRoute.priority.desc(), SearchRoute.ordinal)))
+            for route in routes:
+                stale = session.scalar(select(SearchMemory.id).where(SearchMemory.root_run_id == root.id,
+                    SearchMemory.route_id == route.id, SearchMemory.revision_id == route.candidate_revision_id,
+                    SearchMemory.state.in_(["stale", "deleted"]))) if route.candidate_revision_id else None
+                if stale:
+                    route.progress = {**route.progress, "review_passed": False, "stale_candidate": route.candidate_revision_id}
+                    route.candidate_revision_id = None
+                    route.state = "paused"
+            ready_candidate = next((r for r in routes if r.state == "candidate" and r.progress.get("review_passed")), None)
+            if ready_candidate:
+                search.selected_route_id = ready_candidate.id
+                search.phase = "final"
+            if search.phase == "final":
+                for work in active:
+                    if work.kind == "final":
+                        continue
+                    run = session.get(Run, work.run_id)
+                    if run.state == "queued":
+                        run.state, work.state = "cancelled", "cancelled"
+                        if work.route_id:
+                            session.get(SearchRoute, work.route_id).state = "paused"
+                active = [w for w in active if w.state in OPEN_WORK]
+                if not active:
+                    self.finalize(session, search, routes)
+                continue
+            active_routes = {w.route_id for w in active if w.route_id}
+            adaptive = search.config.get("budget_policy") == "adaptive"
+            # Adaptive runs deliberately serialize routes.  Apart from making
+            # the root ledger straightforward, this lets evidence from the
+            # most promising route determine whether another route is useful.
+            if adaptive and active:
+                continue
+            slots = (1 if adaptive else max(0, search.config["active_routes"] - len(active_routes)))
+            # Explicit priority classes, with first opportunity before repeated work.
+            ordered = sorted(routes, key=lambda r: (
+                ({"needs_check": 0, "repair_needed": 1, "ready": 2}.get(r.state, 9)
+                 if not adaptive else {"needs_check": 0, "repair_needed": 0,
+                    "ready": 1 if r.progress.get("steps", 0) else 2}.get(r.state, 9)),
+                r.progress.get("steps", 0) if not adaptive else -r.progress.get("steps", 0),
+                -r.priority, r.ordinal))
+            dispatched = False
+            for route in ordered:
+                if not slots or route.id in active_routes or route.state not in {"ready", "needs_check", "repair_needed"}:
+                    continue
+                kind = {"ready": "advance", "needs_check": "check", "repair_needed": "repair"}[route.state]
+                pool = "explore" if kind == "advance" else "check"
+                available = self.budget(session, search)[pool]
+                if available["remaining_requests"] < 1 or available["remaining_output_tokens"] < 256:
+                    continue
+                if self._dispatch(session, search, route, kind):
+                    slots -= 1
+                    dispatched = True
+            if not active and not dispatched:
+                search.phase = "final"
+                self.finalize(session, search, routes)
+
+    def finalize(self, session, search, routes):
+        if session.scalar(select(SearchWork.id).where(SearchWork.root_run_id == search.root_run_id, SearchWork.kind == "final")):
+            return
+        root = session.get(Run, search.root_run_id)
+        gaps = list(session.scalars(select(SearchGap).where(SearchGap.root_run_id == root.id,
+            SearchGap.state == "open")))
+        def candidate_gaps(route):
+            return [g for g in gaps if g.route_id == route.id and g.target_revision_id == route.candidate_revision_id]
+        candidates = [r for r in routes if r.candidate_revision_id
+            and not any(g.kind == "counterexample" for g in candidate_gaps(r))]
+        candidates.sort(key=lambda r: (not r.progress.get("review_passed", False),
+            r.progress.get("status") != "candidate", len(candidate_gaps(r)),
+            len(r.progress.get("open_subgoals", [])), r.ordinal))
+        selected = candidates[0] if candidates else None
+        search.selected_route_id = selected.id if selected else None
+        if not selected:
+            # There is no fixed candidate that can be turned into a safe
+            # submission.  A model-generated abstention would consume a paid
+            # request without adding evidence, so terminate with the durable
+            # unresolved outcome instead.
+            root.state, search.phase = "step_limit", "terminated"
+            self._decision(session, search, "no_deliverable:" + root.id, "terminate",
+                {"reason": "no_deliverable_candidate", "unresolved": True})
+            return
+        refs = list(search.config["initial_read_set"].values())
+        if selected:
+            refs += [selected.candidate_revision_id]
+            refs += list(self.memory.allowed_revisions(session, search.root_run_id, selected.id))
+        branch = self.state.require_branch(session, root.branch_id)
+        refs = self._import(session, branch, refs)
+        root.state, root.current_attempt_id = "queued", None
+        root.instruction += "\n最终提交：根据选定候选给出一个盒装答案并说明依据和剩余缺口；无可信候选时明确弃答。不得宣称未完成的证明成立。"
+        work = self._work(session, search, selected, root, "final", list(refs))
+        if not work:
+            root.state, search.phase = "budget_exhausted", "terminated"
+
+    def snapshot(self, session, run_id):
+        self.runtime._run(session, run_id)
+        search = self.session_for(session, run_id)
+        if not search:
+            return {"session": None, "routes": [], "gaps": [], "memory": [], "decisions": [], "budget": None}
+        result = {"session": record(search), "budget": self.budget(session, search)}
+        for key, model in (("routes", SearchRoute), ("gaps", SearchGap), ("memory", SearchMemory),
+                           ("decisions", SearchDecision), ("works", SearchWork)):
+            result[key] = [record(row) for row in session.scalars(select(model).where(model.root_run_id == search.root_run_id))]
+        return result
+
+    def intervene_route(self, session, payload):
+        route = session.get(SearchRoute, payload["route_id"])
+        if not route or route.root_run_id != payload["root_run_id"]:
+            raise DomainError(404, "search_route_not_found", "路线不存在。")
+        search = session.get(SearchSession, route.root_run_id)
+        if search.phase in {"final", "terminated"}:
+            raise DomainError(409, "search_finalizing", "已进入收尾，不能再扩大搜索。")
+        if payload["action"] == "pause":
+            route.progress = {**route.progress, "resume_state": route.state
+                if route.state in {"ready", "needs_check", "repair_needed", "candidate"} else "ready"}
+            route.state = "paused"
+            for work in session.scalars(select(SearchWork).where(SearchWork.route_id == route.id, SearchWork.state.in_(OPEN_WORK))):
+                route.progress = {**route.progress, "resume_state": {
+                    "check": "needs_check", "repair": "repair_needed"}.get(work.kind, "ready")}
+                self.runtime.intervene(session, {"run_id": work.run_id, "action": "pause"})
+        elif payload["action"] == "resume":
+            if route.state != "paused":
+                raise DomainError(409, "search_route_not_paused", "只有暂停的路线可以恢复。")
+            for work in session.scalars(select(SearchWork).where(SearchWork.route_id == route.id,
+                    SearchWork.state.in_([*OPEN_WORK, "paused"]))):
+                child = session.get(Run, work.run_id)
+                self.runtime._reconcile_expired(session, child)
+                unsettled = session.scalar(select(ProviderRequest.id).where(
+                    ProviderRequest.run_id == child.id, ProviderRequest.state.in_(["dispatched", "unknown"])))
+                attempt = session.get(Attempt, child.current_attempt_id) if child.current_attempt_id else None
+                if unsettled or (attempt and attempt.state == "running"):
+                    raise DomainError(409, "search_route_pause_pending", "先等待在途工作结束并核对未知请求，再恢复路线。")
+                work.state = "interrupted"
+            route.state = route.progress.get("resume_state", "ready")
+            if route.state == "ready" and route.progress.get("steps", 0) >= search.config["max_route_steps"]:
+                raise DomainError(409, "search_route_step_limit", "该路线已达到冻结的推进上限。")
+        else:
+            route.priority = payload["priority"]
+        route.version += 1
+        self._decision(session, search, f"human:{route.id}:{route.version}", "human_intervention", payload)
+        return 200, record(route)

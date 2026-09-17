@@ -4,6 +4,7 @@ from enum import StrEnum
 from typing import Annotated, Literal
 
 from mathagent.providers.options import MAX_OUTPUT_TOKENS, ReasoningEffort, ThinkingMode
+from mathagent.providers.search_contract import SearchConfig
 from pydantic import BaseModel, ConfigDict, Field
 
 Id = Annotated[str, Field(min_length=1, max_length=100)]
@@ -120,6 +121,8 @@ class RunCreate(Command):
     completion_policy: Literal["draft", "reviewed_answer"] = "draft"
     length_recovery: Literal["none", "high"] = "none"
     unknown_recovery: Literal["stop", "once"] = "stop"
+    solver_controller: Literal["legacy", "bounded_search_v1"] = "legacy"
+    search_config: SearchConfig = Field(default_factory=SearchConfig)
 
 
 class CompleteAttempt(Command):

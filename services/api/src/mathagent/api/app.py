@@ -277,6 +277,8 @@ def create_app(database_path=None, token=None, worker_token=None, allowed_origin
     app.include_router(build_artifact_router(service, human, key, command))
     app.include_router(build_research_router(ResearchRecordsService(service), human, key, command))
     mount_agent_routes(app, runtime, human, worker, key, command)
+    from mathagent.api.search_routes import mount_search_routes
+    mount_search_routes(app, runtime, human, key, command)
 
     frontend = Path(
         os.getenv(

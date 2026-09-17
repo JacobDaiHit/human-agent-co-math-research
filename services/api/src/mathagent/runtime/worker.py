@@ -104,6 +104,7 @@ class HTTPWorker:
         execution = {"token": task["token"]}
         repaired = False
         length_recovered = False
+        length_failed_cap = None
         try:
             provider = self.provider_factory(task["provider"]) if task["provider"] != "fake" or self.custom_provider else None
             for retry in range(3):
@@ -112,6 +113,16 @@ class HTTPWorker:
                 )
                 if not boundary["continue"]:
                     return
+                if boundary.get("search_output_cap") is not None:
+                    cap = min(task["max_output_tokens"], boundary["search_output_cap"])
+                    minimum = boundary.get("search_min_output_tokens", 256)
+                    if cap < minimum or (length_failed_cap is not None and cap < length_failed_cap):
+                        await self._safe_fail(task, "search_recovery_capacity" if length_failed_cap is not None
+                                              else "search_useful_capacity_exhausted")
+                        return
+                    task = {**task, "max_output_tokens": cap}
+                    if "provider_options" in task:
+                        task["provider_options"] = {**task["provider_options"], "max_output_tokens": cap}
                 # Keep the service's durable reservation identical to the cap
                 # the adapter will receive.  A below-minimum remainder is
                 # deliberately rejected by reserve before any provider call.
@@ -194,16 +205,33 @@ class HTTPWorker:
 
                         if recover_length:
                             length_recovered = True
-                            task = {**task, "thinking_mode": "enabled", "reasoning_effort": "high",
+                            length_failed_cap = reservation.get("output_token_reservation", task["max_output_tokens"])
+                            planning = (task.get("search_context", {}).get("budget_policy") == "adaptive"
+                                        and task["search_context"].get("kind") == "analysis")
+                            thinking = "disabled" if planning else "enabled"
+                            effort = "provider_default" if planning else "high"
+                            task = {**task, "thinking_mode": thinking, "reasoning_effort": effort,
                                 "output_limit_recovery": {"reason": "length", "attempt": 1,
                                     "visible_fragment": observation.get("raw_text", "")[:30000]}}
                             if "provider_options" in task:
                                 task["provider_options"] = {**task["provider_options"],
-                                    "thinking_mode": "enabled", "reasoning_effort": "high"}
+                                    "thinking_mode": thinking, "reasoning_effort": effort}
                             task.pop("repair_output", None)
+                            task.pop("repair_feedback", None)
                         else:
                             repaired = True
-                            task = {**task, "repair_output": observation.get("raw_text", "")[:30000]}
+                            from mathagent.providers.protocol import repair_feedback
+
+                            raw = observation.get("raw_text", "")
+                            task = {**task, "repair_output": raw[:30000],
+                                    "repair_feedback": repair_feedback(raw, task)}
+                            # Formatting is serialization work, not another long proof attempt.
+                            if task["provider"] == "deepseek":
+                                task = {**task, "thinking_mode": "disabled", "reasoning_effort": "provider_default"}
+                                if "provider_options" in task:
+                                    task["provider_options"] = {**task["provider_options"],
+                                        "thinking_mode": "disabled", "reasoning_effort": "provider_default"}
+                            task.pop("output_limit_recovery", None)
                         task = compact_task(task)
                         budget = task.get("request_budget_status")
                         if budget:
