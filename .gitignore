@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.test-tmp/
 .ruff_cache/
 *.egg-info/
 node_modules/

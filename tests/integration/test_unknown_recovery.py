@@ -13,6 +13,7 @@ from mathagent.runtime.worker import HTTPWorker
 from sqlalchemy import select
 from test_autonomous_agent import action, exercise, project_and_run, result
 from test_autonomous_agent import app as app
+from test_continuous_research import output as native_output
 
 
 @pytest.fixture(autouse=True)
@@ -53,12 +54,10 @@ def test_wire_unknown_retains_occupancy_and_never_executes_partial_output(app, p
             captured.append(payload)
             if len(captured) == 1 or repeated:
                 return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=BrokenStream())
-            task = json.loads(payload["messages"][1]["content"])
-            assert task["request_budget_status"]["remaining"] == budget - 1
-            assert all(scope["unknown"] == 1 for scope in task["request_budget_status"]["scopes"])
+            assert "tools" in payload and "response_format" not in payload
             assert "MUST_NOT_EXECUTE" not in json.dumps(payload)
             return httpx.Response(200, json={"usage": {"total_tokens": 10}, "choices": [{
-                "message": {"content": json.dumps(result("Valid result.", next_action="finish")["result"])}, "finish_reason": "stop"}]})
+                "message": native_output("Valid result.", ("submit_solution", {"outcome": "solved"}))["result"]["message"], "finish_reason": "stop"}]})
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as wire:
             config = ProviderConfig("deepseek", "synthetic-key", "synthetic-model", "https://mock.invalid", True)
@@ -72,7 +71,7 @@ def test_wire_unknown_retains_occupancy_and_never_executes_partial_output(app, p
         assert all(call["result"] is None for call in calls if not call["complete"])
         steps = (await api.get(f"/runs/{run['run_id']}/steps"))["steps"]
         assert len(steps) == ledger["spent"]
-        assert all(not step["actions"] for step in steps)
+        assert all(step["actions"][0]["type"] == "submit_solution" for step in steps)
         snapshot = await api.get(f"/projects/{project['project_id']}/snapshot")
         current = next(r for r in snapshot["runs"] if r["id"] == run["run_id"])
         assert current["state"] == ("completed" if ledger["spent"] else "reconciliation_required")
@@ -147,11 +146,11 @@ def test_allowance_survives_later_steps_reconciliation_options_update_and_restar
             async def generate(self, task):
                 calls.append(task)
                 if len(calls) == 2:
-                    return result("A valid intermediate step.")
+                    return native_output("A valid intermediate step.", ("read_material", {"ref": "original"}))
                 raise ProviderFailure("transport_read_error", outcome="unknown")
 
         await HTTPWorker(client, providers=["deepseek"], provider_factory=lambda _: Script()).run(once=True)
-        assert len(calls) == 3 and calls[0]["attempt_id"] == calls[1]["attempt_id"] != calls[2]["attempt_id"]
+        assert len(calls) == 3 and len({call["attempt_id"] for call in calls}) == 1
         ledger = await api.get(f"/runs/{run['run_id']}/budget")
         assert ledger["unknown"] == 2 and ledger["spent"] == 1
         for request in ledger["requests"]:
@@ -168,32 +167,37 @@ def test_allowance_survives_later_steps_reconciliation_options_update_and_restar
     exercise(app, scenario)
 
 
-def test_concurrent_children_share_one_transactional_allowance(app):
+def test_concurrent_members_share_one_transactional_unknown_allowance(app):
     async def scenario(api, client):
-        project, run = await setup_run(api)
-        seen, arrived = {}, asyncio.Event()
-
-        class Script:
-            async def generate(self, task):
-                name = task["instruction"]
-                seen[name] = seen.get(name, 0) + 1
-                if task["run_id"] == run["run_id"]:
-                    return result("Delegate two tasks.", [action("spawn_task", goal_object_id=task["goal_object_id"],
-                        instruction=name, request_budget=2) for name in ("child-a", "child-b")], next_action="wait")
-                if seen[name] == 1:
-                    if "child-a" in seen and "child-b" in seen:
-                        arrived.set()
-                    await asyncio.wait_for(arrived.wait(), 10)
-                    raise ProviderFailure("transport_read_error", outcome="unknown")
-                return result("Synthetic child output.", next_action="finish")
-
-        await HTTPWorker(client, providers=["deepseek"], concurrency=2, provider_factory=lambda _: Script()).run(once=True)
-        assert sorted(seen.values()) == [1, 1, 2]
+        _, run = await setup_run(api)
+        lead = await api.write(f"/runs/{run['run_id']}/claim", worker=True)
+        execution = {"token": lead["token"]}
+        request = await api.write(f"/attempts/{lead['attempt_id']}/requests", execution, worker=True)
+        await api.write(f"/requests/{request['request_id']}/start", execution, worker=True)
+        await api.write(f"/requests/{request['request_id']}/settle", {**execution, "outcome": "spent",
+            "usage": {"completion_tokens": 8}}, worker=True)
+        turn = await api.write(f"/attempts/{lead['attempt_id']}/steps", {**execution,
+            "request_id": request["request_id"], "result": native_output("Two independent workers.",
+                ("assign_work", {"member": "peer", "goal": "Explore the original problem."}))["result"]}, worker=True)
+        for tool in turn["pending_tools"]:
+            await api.write(f"/attempts/{lead['attempt_id']}/research-tool", {**execution, **tool}, worker=True)
+        peer = (await api.write("/worker/claim-next", {"providers": ["deepseek"]}, worker=True))["task"]
+        assert peer["research_member"] == "peer"
+        reservations = []
+        for task in (lead, peer):
+            prefix = f"/attempts/{task['attempt_id']}"
+            row = await api.write(prefix + "/requests", {"token": task["token"]}, worker=True)
+            await api.write(f"/requests/{row['request_id']}/observation", {
+                "token": task["token"], "observation": {"call_config": {}, "raw_text": "",
+                "complete": False}}, worker=True)
+            await api.write(f"/requests/{row['request_id']}/start", {"token": task["token"]}, worker=True)
+            reservations.append((task, row))
+        settled = await asyncio.gather(*[api.write(f"/requests/{row['request_id']}/settle",
+            {"token": task["token"], "outcome": "unknown", "reason": "transport_read_error",
+             "retry_unknown": True}, worker=True) for task, row in reservations])
+        assert sum(row["unknown_retry_allowed"] for row in settled) == 1
         ledger = await api.get(f"/runs/{run['run_id']}/budget")
-        assert ledger["unknown"] == 2 and ledger["spent"] == 2 and ledger["occupied"] == 4
-        with app.state.database.sessions() as session:
-            from sqlalchemy import select
-            assert sum(bool(a.checkpoint.get("continued_unknown_request_ids")) for a in session.scalars(select(Attempt))) == 1
+        assert ledger["unknown"] == 2 and ledger["spent"] == 1 and ledger["occupied"] == 3
     exercise(app, scenario)
 
 
@@ -239,7 +243,7 @@ def test_retry_authorization_is_not_permission_to_bypass_next_dispatch_boundary(
     exercise(app, scenario)
 
 
-def test_saved_retry_response_is_quarantined_after_crash_without_losing_unknown_cost(app):
+def test_saved_native_retry_response_is_retained_after_crash_without_losing_unknown_cost(app):
     async def scenario(api, client):
         project, run = await setup_run(api)
         task = await api.write(f"/runs/{run['run_id']}/claim", worker=True)
@@ -249,7 +253,7 @@ def test_saved_retry_response_is_quarantined_after_crash_without_losing_unknown_
             request = await api.write(prefix + "/requests", execution, worker=True)
             path = f"/requests/{request['request_id']}"
             await api.write(path + "/start", execution, worker=True)
-            output = result("Durable retry output.", [action("write_draft", kind="claim", body="OLD_ACTION_MUST_NOT_RUN")])["result"]
+            output = native_output("Durable retry output.", ("read_material", {"ref": "original"}))["result"]
             await api.write(path + "/observation", {**execution, "observation": {
                 "call_config": {}, "raw_text": json.dumps(output) if index else "", "complete": bool(index)},
                 **({"result": output} if index else {})}, worker=True)
@@ -264,12 +268,13 @@ def test_saved_retry_response_is_quarantined_after_crash_without_losing_unknown_
         ledger = await api.get(f"/runs/{run['run_id']}/budget")
         assert ledger["unknown"] == ledger["spent"] == 1 and ledger["occupied"] == 2
         steps = (await api.get(f"/runs/{run['run_id']}/steps"))["steps"]
-        assert len(steps) == 1 and steps[0]["receipt"]["quarantined"] and not steps[0]["actions"]
+        assert len(steps) == 1 and not steps[0]["actions"]
+        assert not steps[0]["receipt"]["tool_results"]
         assert steps[0]["body"] == "Durable retry output."
     exercise(app, scenario)
 
 
-def test_child_can_disable_inherited_recovery_during_inflight_request(app):
+def test_peer_settings_edit_changes_the_shared_root_recovery_policy(app):
     async def scenario(api, client):
         _, run = await setup_run(api)
         seen = []
@@ -278,8 +283,8 @@ def test_child_can_disable_inherited_recovery_during_inflight_request(app):
             async def generate(self, task):
                 seen.append(task["run_id"])
                 if task["run_id"] == run["run_id"]:
-                    return result("Delegate.", [action("spawn_task", goal_object_id=task["goal_object_id"],
-                        instruction="child", request_budget=3)], next_action="wait")
+                    return native_output("Delegate.", ("assign_work", {"member": "peer", "goal": "Independent exploration."}),
+                        ("send_message", {"recipient": "peer", "topic": "Compare approaches", "body": "Report your attempt.", "wait": True}))
                 options = await api.get(f"/runs/{task['run_id']}/options")
                 options.pop("run_id")
                 await api.write(f"/runs/{task['run_id']}/options", {**options, "unknown_recovery": "stop"}, method="PUT")

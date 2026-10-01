@@ -1,7 +1,7 @@
 import json
 import subprocess
 
-from mathagent.tools.code_sandbox import MAX_EXECUTIONS_PER_PROJECT, CodeSandbox
+from mathagent.tools.code_sandbox import CodeSandbox
 
 IMMUTABLE = "example.invalid/mathagent@sha256:" + "a" * 64
 
@@ -80,18 +80,19 @@ def test_dedup_binds_timeout_and_damaged_journal_fails_closed(tmp_path, monkeypa
     assert sandbox.execute("project-a", "attempt-1", "print(1)", timeout_seconds=1)["ok"]
     assert sandbox.execute("project-a", "attempt-1", "print(1)", timeout_seconds=2)["ok"]
     assert len([args for args in calls if args[1:3] == ["run", "--rm"]]) == 2
-    journal = next((tmp_path / "sandbox-jobs").rglob("*.json"))
+    journal = next(path for path in (tmp_path / "sandbox-jobs").rglob("*.json")
+                   if json.loads(path.read_text())["provenance"]["timeout_seconds"] == 1)
     journal.write_text("{")
     assert sandbox.execute("project-a", "attempt-1", "print(1)", timeout_seconds=1)["reason"] == "execution_unknown"
 
 
-def test_budget_and_redaction_preserve_accounting(tmp_path, monkeypatch):
+def test_project_has_no_lifetime_execution_counter_and_redaction_preserves_receipts(tmp_path, monkeypatch):
     monkeypatch.setattr("mathagent.tools.code_sandbox.subprocess.run", _completed)
     sandbox = CodeSandbox(tmp_path / "mathagent.db", IMMUTABLE)
-    for index in range(MAX_EXECUTIONS_PER_PROJECT):
+    for index in range(40):
         assert sandbox.execute("project-a", f"attempt-{index}", "print('secret')")["ok"]
-    assert sandbox.execute("project-a", "attempt-over", "print('secret')")["reason"] == "project_execution_limit"
-    assert sandbox.erase_project("project-a") == {"redacted": MAX_EXECUTIONS_PER_PROJECT, "pending": 0}
+    assert sandbox.execute("project-a", "attempt-over", "print('secret')")["ok"]
+    assert sandbox.erase_project("project-a") == {"redacted": 41, "pending": 0}
     record = json.loads(next((tmp_path / "sandbox-jobs").rglob("*.json")).read_text())
     assert "code" not in record
     assert "code_hash" in record

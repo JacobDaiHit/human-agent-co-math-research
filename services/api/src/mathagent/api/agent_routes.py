@@ -1,8 +1,10 @@
 """Human control/read APIs and worker-only durable research proposal endpoints."""
 
+import asyncio
 from typing import Literal
 
 from fastapi import Depends
+from fastapi.responses import JSONResponse
 from mathagent.api.schemas import Command, Id
 from mathagent.application.code_execution import permitted_operations
 from mathagent.application.errors import DomainError
@@ -32,7 +34,11 @@ class RunUpdate(Command):
     completion_policy: Literal["draft", "reviewed_answer"] | None = None
     length_recovery: Literal["none", "high"] | None = None
     unknown_recovery: Literal["stop", "once"] | None = None
-    solver_controller: Literal["legacy", "bounded_search_v1"] | None = None
+    solver_controller: Literal["legacy", "bounded_search_v1", "continuous_research"] | None = None
+    discussion: bool | None = None
+    research_deadline_seconds: int | None = Field(default=None, ge=1, le=86400)
+    answer_submission_recovery: bool | None = None
+    answer_requires_exhaustiveness: bool | None = None
     search_config: SearchConfig | None = None
 
 
@@ -57,11 +63,42 @@ class StepCreate(Command):
     result: dict
 
 
+class ResearchExecution(Command):
+    token: Id
+
+
+class ResearchTool(ResearchExecution):
+    request_id: Id
+    call_id: Id
+
+
 class PolicyUpdate(Command):
     allowed_operations: list[str] = Field(max_length=24)
 
 
 def mount_agent_routes(app, runtime, human, worker, key, command):
+    @app.get("/runs/{run_id}/research", dependencies=[Depends(human)])
+    def research_status(run_id: str):
+        with runtime.service.db.sessions() as session:
+            runtime._run(session, run_id)
+            return runtime.research.snapshot(session, run_id)
+
+    @app.post("/attempts/{attempt_id}/research-context", dependencies=[Depends(worker)])
+    def research_context(attempt_id: str, p: ResearchExecution, k: str = Depends(key)):
+        return command("research.context", k, {"attempt_id": attempt_id, **p.model_dump()},
+                       runtime.research.continuation)
+
+    @app.post("/attempts/{attempt_id}/research-tool", dependencies=[Depends(worker)])
+    async def research_tool(attempt_id: str, p: ResearchTool, k: str = Depends(key)):
+        payload = {"attempt_id": attempt_id, **p.model_dump()}
+        status, response = runtime.service.execute("research.tool", k, payload,
+                                                   runtime.research.execute_tool)
+        if "computation" not in response:
+            return JSONResponse(response, status_code=status)
+        result = await asyncio.to_thread(runtime.research.compute, response["computation"])
+        return command("research.computation", k + ":result", {**payload, "result": result},
+                       runtime.research.finish_computation)
+
     agent = runtime.agent
 
     @app.get("/runs/{run_id}/options", dependencies=[Depends(human)])

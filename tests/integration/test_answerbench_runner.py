@@ -10,6 +10,7 @@ import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -89,13 +90,15 @@ def limits(**changes):
         request_timeout_seconds=10, case_timeout_seconds=30, parallel_cases=2), **changes)
 
 
-def completion(body, *, actions=(), mode="research", next_action="finish", citations=()):
-    result = {"mode": mode, "body": body, "findings": ["Synthetic engineering fixture."],
-              "cited_revision_ids": list(citations), "actions": list(actions), "next_action": next_action}
-    if mode == "review":
-        result.update(verdict="passed", scope="Synthetic independent review of one proposal.")
-    return httpx.Response(200, json={"id": "synthetic-receipt", "usage": {"total_tokens": 12},
-        "choices": [{"message": {"content": json.dumps(result)}, "finish_reason": "stop"}]})
+def completion(body, *, actions=()):
+    if not actions:
+        actions = [("submit_solution", {"outcome": "solved", "answer": "2"})]
+    message = {"content": body, "tool_calls": [
+        {"id": str(uuid4()), "type": "function", "function": {
+            "name": name, "arguments": json.dumps(arguments)}}
+        for name, arguments in actions]}
+    return httpx.Response(200, json={"id": "synthetic-receipt", "usage": {"completion_tokens": 12},
+        "choices": [{"message": message, "finish_reason": "tool_calls"}]})
 
 
 class ScriptedInference:
@@ -106,33 +109,38 @@ class ScriptedInference:
     def factory(self, case):
         async def handle(request):
             payload = json.loads(request.content)
-            serialized = json.dumps(payload)
+            serialized = json.dumps(payload, ensure_ascii=False)
             own = case["id"].split("-")[-1]
             assert f"ONLY_CASE_{own}" in serialized
             assert all(f"ONLY_CASE_{other}" not in serialized for other in range(4) if str(other) != own)
             assert ANSWER_SENTINEL not in serialized and SECRET not in serialized
             assert request.url == httpx.URL("https://api.deepseek.com/chat/completions")
-            assert "tools" not in payload and "functions" not in payload
-            assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "max"
-            task = json.loads(payload["messages"][-1]["content"])
-            self.dispatches.append((case["id"], task["mode"]))
+            assert "tools" in payload and "response_format" not in payload
+            peer = "你是研究同伴" in serialized
+            startup = not peer and any("当前任务：\n理解题目的条件与目标" in message.get("content", "")
+                                      for message in payload["messages"])
+            if startup:
+                assert payload["thinking"] == {"type": "disabled"}
+                assert "reasoning_effort" not in payload and payload["max_tokens"] <= 4096
+                assert payload["tool_choice"] == "required"
+            else:
+                assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "max"
+                assert "tool_choice" not in payload
+            self.dispatches.append((case["id"], "peer" if peer else "lead"))
             await asyncio.sleep(0.08)
             if case["id"] == self.failed_case:
                 return httpx.Response(400, json={"error": {"message": "Synthetic rejected request"}})
-            if task["mode"] == "review":
-                return completion("The saved proposal has been independently inspected.", mode="review")
-            if not task["previous_steps"]:
-                return completion("Save the proposed proof before requesting review.", actions=[{
-                    "type": "write_draft", "arguments": {"kind": "claim", "body": r"$1+1=\boxed{2}$."},
-                }], next_action="continue")
-            if len(task["previous_steps"]) == 1:
-                receipt = task["previous_steps"][0]["actions"][0]["result"]
-                return completion("Request a separate review of the saved revision.", actions=[{
-                    "type": "request_review", "arguments": {"target_revision_id": receipt["revision_id"]},
-                }], next_action="wait")
-            assert task["child_results"] and task["child_results"][0]["state"] == "completed"
-            return completion(r"Adding one and one gives $\boxed{2}$.",
-                              citations=[task["child_results"][0]["target_revision_id"]])
+            if peer:
+                assert not any(message["role"] == "assistant" for message in payload["messages"])
+                return completion("Independent arithmetic: one plus one is two.", actions=[
+                    ("finish_work", {"summary": "Independent arithmetic: one plus one is two."})])
+            if not any(message["role"] == "assistant" for message in payload["messages"]):
+                return completion("Ask for independent arithmetic and wait for its result.", actions=[
+                    ("assign_work", {"member": "peer", "goal": "Compute one plus one independently."}),
+                    ("send_message", {"recipient": "peer", "topic": "Arithmetic",
+                                      "body": "Compare derivations after your independent attempt.", "wait": True})])
+            assert "Independent arithmetic" in serialized
+            return completion(r"Adding one and one gives $\boxed{2}$.")
         return httpx.MockTransport(handle)
 
 
@@ -140,7 +148,7 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def test_unknown_retry_completes_reviewed_workflow_with_unresolved_cost(workspace, tmp_path):
+def test_unknown_retry_completes_explicit_submission_with_unresolved_cost(workspace, tmp_path):
     problems, source, cases = workspace
     output = tmp_path / "unknown-retry"
     inference = ScriptedInference()
@@ -162,52 +170,46 @@ def test_unknown_retry_completes_reviewed_workflow_with_unresolved_cost(workspac
         case_ids=[cases[0]["id"]], transport_factory=factory))
     assert report["all_completed"] and report["all_unattended"] and report["source_unchanged"]
     case_report = read_json(output / cases[0]["id"] / "report.json")
-    assert case_report["workflow_completed"] and case_report["finalized_after_review"]
+    assert case_report["workflow_completed"] and not case_report["finalized_after_review"]
     assert case_report["financial_reconciliation_pending"] is True
     assert case_report["unknown_retries_authorized"] == 1
-    assert case_report["budget"]["unknown"] == 1 and case_report["budget"]["spent"] == 4
-    assert case_report["budget"]["occupied"] == 5 and case_report["budget"]["remaining"] == 0
-    assert case_report["network_dispatches"] == 5 and len(inference.dispatches) == 4
+    assert case_report["budget"]["unknown"] == 1 and case_report["budget"]["spent"] == 3
+    assert case_report["budget"]["occupied"] == 4 and case_report["budget"]["remaining"] == 1
+    assert case_report["network_dispatches"] == 4 and len(inference.dispatches) == 3
     with pytest.raises(ValueError, match="exact frozen"):
         asyncio.run(answerbench.run_batch(problems, output, CONFIG, limits(), source,
             resume=True, case_ids=[cases[0]["id"]], transport_factory=factory))
 
 
-def test_bounded_search_answerbench_emits_search_state(workspace, tmp_path):
+def test_no_discussion_ablation_emits_explicit_submission_and_frozen_choice(workspace, tmp_path):
     problems, source, cases = workspace
-    output = tmp_path / "bounded"
+    output = tmp_path / "no-discussion"
 
     def factory(_case):
         async def handle(request):
-            task = json.loads(json.loads(request.content)["messages"][-1]["content"])
-            assert SECRET not in json.dumps(task)
-            context, kind = task["search_context"], task["search_context"]["kind"]
-            if kind == "analysis":
-                result = {"mode": "research", "body": "analysis", "findings": ["fixture"], "cited_revision_ids": [], "next_action": "finish", "actions": [{"type": "propose_routes", "arguments": {"routes": [{"title": "a", "core_reduction": "a", "key_lemmas": ["a"], "assumptions": [], "subgoal": "a", "cheap_check": "a"}, {"title": "b", "core_reduction": "b", "key_lemmas": ["b"], "assumptions": [], "subgoal": "b", "cheap_check": "b"}]}}]}
-            elif kind == "advance":
-                result = {"mode": "research", "body": r"$1+1=2$, $\boxed{2}$.", "findings": ["fixture"], "cited_revision_ids": [], "next_action": "finish", "actions": [{"type": "report_progress", "arguments": {"status": "candidate"}}]}
-            elif kind == "check":
-                result = {"mode": "review", "body": "checked", "findings": ["fixture"], "verdict": "passed", "scope": "fixture review", "cited_revision_ids": [], "actions": [], "structured_gaps": [], "next_action": "finish"}
-            else:
-                result = {"mode": "research", "body": r"$\boxed{2}$", "findings": ["fixture"], "cited_revision_ids": [context["route"]["candidate_revision_id"]], "actions": [], "next_action": "finish"}
-            return httpx.Response(200, json={"id": "synthetic", "usage": {"completion_tokens": 20}, "choices": [{"message": {"content": json.dumps(result)}, "finish_reason": "stop"}]})
+            payload = json.loads(request.content)
+            names = [tool["function"]["name"] for tool in payload["tools"]]
+            assert "send_message" not in names
+            assign = next(tool["function"] for tool in payload["tools"] if tool["function"]["name"] == "assign_work")
+            assert assign["parameters"]["properties"]["member"]["enum"] == ["self"]
+            assert SECRET not in json.dumps(payload)
+            return completion(r"$1+1=2$, $\boxed{2}$.")
         return httpx.MockTransport(handle)
 
-    bounded = limits(request_budget=6, max_steps=6, max_children=3, max_output_tokens=1024,
-        cumulative_output_token_budget=4096, parallel_cases=1, solver_controller="bounded_search_v1",
-        search_config={"max_routes": 2, "active_routes": 2, "check_requests": 1,
-                       "final_output_tokens": 512, "check_output_tokens": 512})
-    result = asyncio.run(answerbench.run_batch(problems, output, CONFIG, bounded, source,
+    configured = limits(discussion=False, parallel_cases=1)
+    result = asyncio.run(answerbench.run_batch(problems, output, CONFIG, configured, source,
         case_ids=[cases[0]["id"]], transport_factory=factory))
     assert result["all_completed"]
     report = read_json(output / cases[0]["id"] / "report.json")
-    assert report["search_state"]["session"]["phase"] == "terminated"
-    assert len(report["search_state"]["routes"]) == 2
-    assert any(work["kind"] == "check" for work in report["search_state"]["works"])
-    assert report["final_answer"] == "2" and SECRET not in json.dumps(report)
+    assert report["research_state"]["session"]["state"] == "completed"
+    assert len(report["research_state"]["members"]) == 1
+    assert report.get("search_state") is None
+    assert report["final_answer"] == "2" and report["discussion_enabled"] is False
+    assert report["answer_submission"]["selection_rule"] == "explicit-root-research-submission-v1"
+    assert read_json(output / "plan.json")["configuration"]["limits"]["discussion"] is False
 
 
-def test_four_cases_two_real_api_processes_review_export_and_frozen_resume(workspace, tmp_path):
+def test_four_cases_two_real_api_processes_discussion_export_and_frozen_resume(workspace, tmp_path):
     problems, source, cases = workspace
     output = tmp_path / "normal-batch"
     inference = ScriptedInference()
@@ -235,7 +237,7 @@ def test_four_cases_two_real_api_processes_review_export_and_frozen_resume(works
         assert result["all_completed"] is True, result
         assert result["answer_key_loaded"] is False and result["source_unchanged"] is True
         assert peak == 2 and active == 0
-        assert len(inference.dispatches) == 16
+        assert len(inference.dispatches) == 12
 
         @asynccontextmanager
         async def never_start_api(*_):
@@ -244,7 +246,7 @@ def test_four_cases_two_real_api_processes_review_export_and_frozen_resume(works
 
         resumed = await answerbench.run_batch(problems, output, CONFIG, limits(), source,
             resume=True, api_factory=never_start_api, transport_factory=inference.factory)
-        assert resumed["all_completed"] is True and len(inference.dispatches) == 16
+        assert resumed["all_completed"] is True and len(inference.dispatches) == 12
         for config, frozen_limits in [(replace(CONFIG, model="different-model"), limits()),
                                       (CONFIG, limits(reasoning_effort="high"))]:
             with pytest.raises(ValueError, match="exact frozen"):
@@ -263,11 +265,14 @@ def test_four_cases_two_real_api_processes_review_export_and_frozen_resume(works
         directory = output / case["id"]
         report = read_json(directory / "report.json")
         assert report["completed"] and report["final_answer"] == "2"
-        assert report["requests"] == 4 and report["independent_reviews"] == 1
-        assert len(report["calls"]) == 4 and len(report["steps"]) == 3
+        assert report["requests"] == 3 and report["independent_reviews"] == 0
+        assert len(report["calls"]) == 3 and len(report["steps"]) == 2
         assert report["human_interventions"] == 0 and not report["model_web_tools"]
-        assert all(call["call_config"]["parameters"]["reasoning_effort"] == "max" for call in report["calls"])
-        assert len(list(directory.glob("dispatch-*.json"))) == 4
+        parameters = [call["call_config"]["parameters"] for call in report["calls"]]
+        assert sum(p["thinking"] == {"type": "enabled"} for p in parameters) == 1
+        assert sum(p["thinking"] == {"type": "disabled"} for p in parameters) == 2
+        assert all(p["reasoning_effort"] == "max" for p in parameters if p["thinking"]["type"] == "enabled")
+        assert len(list(directory.glob("dispatch-*.json"))) == 3
         assert (directory / "api.log").exists()
         with sqlite3.connect(directory / "research.sqlite3") as database:
             assert database.execute("SELECT title FROM projects").fetchall() == [(case["id"],)]
@@ -290,7 +295,7 @@ def test_one_rejected_case_does_not_stop_the_other_three(workspace, tmp_path):
     failure = read_json(output / "case-1/report.json")
     assert failure["state"] == "failed" and failure["final_answer"] is None
     assert len(failure["calls"]) == 1 and failure["calls"][0]["complete"] is False
-    assert len(inference.dispatches) == 13
+    assert len(inference.dispatches) == 10
     assert all((output / f"case-{index}/research-export.zip").exists() for index in range(4))
 
 
@@ -319,15 +324,15 @@ def test_resume_after_export_failure_preserves_paid_results_and_dispatch_total(w
         partial = read_json(output / "case-0/report.json")
         assert partial["state"] == "runner_error" and partial["previous_state"] == "completed"
         assert not partial.get("finished_at") and partial["retry_requires_resume"] is True
-        assert len(partial["calls"]) == 4 and len(partial["steps"]) == 3
+        assert len(partial["calls"]) == 3 and len(partial["steps"]) == 2
         assert partial["final_answer"] == "2"
-        assert len(inference.dispatches) == 4
+        assert len(inference.dispatches) == 3
         resumed = await answerbench.run_batch(problems, output, CONFIG, frozen_limits, source,
             resume=True, transport_factory=inference.factory)
         assert resumed["all_completed"] is True
-        assert len(inference.dispatches) == 4
+        assert len(inference.dispatches) == 3
         report = read_json(output / "case-0/report.json")
-        assert report["requests"] == report["network_dispatches"] == 4
+        assert report["requests"] == report["network_dispatches"] == 3
         assert report["finished_at"] and report["final_answer"] == "2"
         assert [call["request_id"] for call in report["calls"]] == [call["request_id"] for call in partial["calls"]]
         assert (output / "case-0/research-export.zip").exists()
@@ -357,11 +362,11 @@ def test_case_deadline_preserves_prior_step_and_unknown_request_without_redispat
             nonlocal dispatched
             dispatched += 1
             if dispatched == 1:
-                return completion("A durable candidate step before the deadline.", next_action="continue")
+                return completion("A durable candidate step before the deadline.", actions=[("read_material", {"ref": "original"})])
             return httpx.Response(200, stream=WaitingStream(), headers={"content-type": "text/event-stream"})
         return httpx.MockTransport(handle)
 
-    frozen_limits = limits(case_timeout_seconds=4, parallel_cases=1)
+    frozen_limits = limits(case_timeout_seconds=12, request_timeout_seconds=30, parallel_cases=1)
 
     async def scenario():
         result = await answerbench.run_batch(problems, output, CONFIG, frozen_limits, source,
@@ -370,7 +375,8 @@ def test_case_deadline_preserves_prior_step_and_unknown_request_without_redispat
         report = read_json(output / "case-0/report.json")
         assert report["terminal_reason"] == "case_timeout", report
         assert report["completed"] is False and report["final_answer"] is None
-        assert report["final_body"] == "A durable candidate step before the deadline."
+        assert report["final_body"] is None  # Earlier progress is not a final submission.
+        assert report["steps"][0]["body"] == "A durable candidate step before the deadline."
         assert len(report["steps"]) == 1 and len(report["calls"]) == 2
         assert report["budget"]["spent"] == 1 and report["budget"]["unknown"] == 1
         assert report["interventions"][0]["actor"] == "benchmark_scheduler"

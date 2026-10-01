@@ -53,9 +53,13 @@ def paired_comparison(baseline_dirs, agent_dirs, *, bootstrap_seed=20260913, boo
         for field in ("answer_key_sha256", "scorer_sha256", "grading_method"):
             if scores[0][field] != scores[1][field]:
                 raise ValueError("Both arms must use the same frozen grader and answer key")
-        for field in ("problems_sha256", "provider", "requested_model", "submission_rule"):
+        for field in ("problems_sha256", "provider", "requested_model"):
             if plans[0][field] != plans[1][field]:
                 raise ValueError("Unmatched problem/model/submission configuration: " + field)
+        if (plans[0]["submission_rule"] != plans[1]["submission_rule"] and
+                {plans[0]["submission_rule"], plans[1]["submission_rule"]} != {
+                    "last-root-step-explicit-finish-single-box-v1", "explicit-root-research-submission-v1"}):
+            raise ValueError("Unmatched submission configuration")
         if plans[0]["source"] != plans[1]["source"]:
             raise ValueError("Both arms must use the same frozen harness source")
         if sorted(plans[0]["case_ids"]) != sorted(plans[1]["case_ids"]):
@@ -136,8 +140,8 @@ def paired_comparison(baseline_dirs, agent_dirs, *, bootstrap_seed=20260913, boo
                                               ls.get("code_sandbox") != rs.get("code_sandbox")))
     return {"comparison": "agent_controller_ablation" if agent_ablation else ("single_call_reference" if ls["solver"] == "direct" else "matched_output_budget"),
         "agent_ablation": agent_ablation,
-        "arm_configuration": {"baseline": {"solver": ls["solver"], "solver_controller": ls.get("solver_controller", "legacy"), "search_config": ls.get("search_config", {})},
-                               "agent": {"solver": rs["solver"], "solver_controller": rs.get("solver_controller", "legacy"), "search_config": rs.get("search_config", {})}},
+        "arm_configuration": {"baseline": {"solver": ls["solver"], "solver_controller": ls.get("solver_controller", "legacy"), "search_config": ls.get("search_config", {}), "discussion": ls.get("discussion", False)},
+                               "agent": {"solver": rs["solver"], "solver_controller": rs.get("solver_controller", "legacy"), "search_config": rs.get("search_config", {}), "discussion": rs.get("discussion", False)}},
         "tools_ablation": tools_ablation,
         "unique_problems": len(clusters), "repeats": len(baseline_dirs), "observations": n,
         "baseline_accuracy": b/n, "agent_accuracy": a/n, "accuracy_delta": (a-b)/n,

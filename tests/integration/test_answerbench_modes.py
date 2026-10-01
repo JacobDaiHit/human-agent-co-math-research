@@ -79,13 +79,13 @@ def test_agent_answer_mode_can_submit_without_claiming_proof_review(tmp_path):
     def factory(case):
         async def respond(request):
             payload = json.loads(request.content)
-            task = json.loads(payload["messages"][-1]["content"])
-            assert task["completion_requirements"]["policy"] == "draft"
-            assert '"calculate": {' not in payload["messages"][0]["content"]
-            result = {"mode": "research", "body": r"Candidate $\boxed{2}$; proof incomplete.",
-                "findings": ["Synthetic gap."], "verdict": None, "next_action": "finish", "actions": []}
+            assert "response_format" not in payload
+            assert "compute" not in [tool["function"]["name"] for tool in payload["tools"]]
+            result = {"content": r"Candidate $\boxed{2}$; proof incomplete.",
+                "tool_calls": [{"id": "submission", "type": "function", "function": {
+                    "name": "submit_solution", "arguments": json.dumps({"outcome": "unresolved", "answer": "2"})}}]}
             return httpx.Response(200, json={"id": "synthetic", "choices": [{"finish_reason": "stop",
-                "message": {"content": json.dumps(result)}}],
+                "message": result}],
                 "usage": {"prompt_tokens": 20, "completion_tokens": 32, "total_tokens": 52}})
         return httpx.MockTransport(respond)
 

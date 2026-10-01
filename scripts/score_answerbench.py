@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KEY = ROOT / "fixtures" / "imo_answerbench" / "answer-key.json"
 METHOD = "local_conservative_answer_equivalence"
-SCORER_REVISION = "3"
+SCORER_REVISION = "4"
 MAX_ANSWER_LENGTH = 512
 MAX_AST_NODES = 96
 MAX_AST_DEPTH = 14
@@ -82,7 +82,8 @@ def final_from_report(report: dict) -> tuple[str | None, str]:
             return None, "no_declared_submission"
         body = report.get("final_body") or ""
         answer = selected.get("answer")
-        if (selected.get("selection_rule") != "last-root-step-explicit-finish-single-box-v1"
+        if (selected.get("selection_rule") not in {
+                "last-root-step-explicit-finish-single-box-v1", "explicit-root-research-submission-v1"}
                 or selected.get("body_sha256") != hashlib.sha256(body.encode()).hexdigest()
                 or not isinstance(answer, str) or not answer.strip()):
             raise UnsupportedAnswer("Invalid frozen submission receipt")
@@ -257,6 +258,10 @@ def compare_worker(candidate: str, golden: str, answer_type: str) -> dict:
         normalized = re.sub(r"\s+", " ", unwrap(candidate)).strip().lower()
         if normalized in EMPTY_SET_FORMS:
             return {"grade": "correct", "reason": "explicit_empty_solution_set"}
+        compact = (normalized.replace(" ", "").replace(r"\,", "")
+                   .replace(r"\left", "").replace(r"\right", ""))
+        if re.fullmatch(r"(?:\([a-z]+,[a-z]+\)=)?\([-+]?\d+,[-+]?\d+\)", compact):
+            return {"grade": "incorrect", "reason": "nonempty_pair_claim_against_empty_solution_set"}
         return {"grade": "ungraded", "reason": "unsupported_or_ambiguous_set_answer"}
     if answer_type not in {"integer", "symbolic_exponential"}:
         return {"grade": "ungraded", "reason": "unsupported_answer_type"}
@@ -410,9 +415,10 @@ def score_batch(batch_dir: Path, answer_key: Path = DEFAULT_KEY, *, case_ids=Non
         "grading_method": METHOD,
         "scorer_revision": SCORER_REVISION,
         "scorer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "scorer_revision_note": "Revision 3 grades predeclared schema-v2 answer submissions independently "
-        "of internal proof review and workflow status. Legacy report completion gates remain unchanged; "
-        "no earlier candidate is promoted into a final answer. Equivalence rules are unchanged.",
+        "scorer_revision_note": "Revision 4 grades predeclared schema-v2 answer submissions independently "
+        "of internal proof review and workflow status. A recognizable nonempty integer-pair claim is incorrect "
+        "when the declared reference answer is an empty solution set. Legacy completion gates remain unchanged; "
+        "no earlier candidate is promoted into a final answer.",
         "official_answer_autograder": False,
         "method_notice": "Local conservative offline check, not official Gemini AnswerAutoGrader. "
         "Only final-answer equivalence is assessed; proofs are not graded. "

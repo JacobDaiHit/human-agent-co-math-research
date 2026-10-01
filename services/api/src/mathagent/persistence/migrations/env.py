@@ -4,6 +4,7 @@ from mathagent.persistence import (  # noqa: F401
     research_models,
     runtime_models,
     search_models,
+    solver_models,
     workspace_models,
 )
 from mathagent.persistence.models import Base

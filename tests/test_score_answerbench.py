@@ -18,6 +18,20 @@ grader = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(grader)
 
 
+def test_native_submission_uses_explicit_answer_not_boxes_or_proof_approval(monkeypatch):
+    monkeypatch.setattr(grader, "compare", grader.compare_worker)
+    body = r"Unfinished proof; earlier guesses $\boxed{3}$ and $\boxed{4}$."
+    report = {"problem_id": "native", "report_schema_version": "2.0",
+        "completed": False, "state": "completed", "final_body": body,
+        "proof_assessment": {"status": "not_reviewed"},
+        "answer_submission": {"status": "submitted", "answer": "2",
+            "selection_rule": "explicit-root-research-submission-v1",
+            "body_sha256": hashlib.sha256(body.encode()).hexdigest()}}
+    scored = grader.score_report(report, {"id": "native", "short_answer": "2", "answer_type": "integer"})
+    assert scored["grade"] == "correct"
+    assert scored["proof_assessment"]["status"] == "not_reviewed"
+
+
 @pytest.mark.parametrize("answer", ["58", "$58$", r"\boxed{58}", "116/2", "58.0", r"\frac{116}{2}", "a+b=58"])
 def test_numeric_equivalence(answer):
     assert grader.compare_worker(answer, "58", "integer")["grade"] == "correct"
@@ -52,6 +66,12 @@ def test_explicit_empty_set_equivalence(answer):
 ])
 def test_ambiguous_set_answers_are_ungraded(answer):
     assert grader.compare_worker(answer, "no solutions", "empty_solution_set")["grade"] == "ungraded"
+
+
+@pytest.mark.parametrize("answer", [r"(M,N)=(2014,4028)", r"\left(2014,\,4028\right)"])
+def test_nonempty_pair_claim_is_incorrect_against_empty_solution_set(answer):
+    result = grader.compare_worker(answer, "no solutions", "empty_solution_set")
+    assert result == {"grade": "incorrect", "reason": "nonempty_pair_claim_against_empty_solution_set"}
 
 
 @pytest.mark.parametrize("answer", [

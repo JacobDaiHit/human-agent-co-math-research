@@ -15,12 +15,13 @@ SPEC.loader.exec_module(module)
 
 
 def arm(tmp_path, name, solver, grades, *, controller="legacy", search_config=None,
-        builtin_calculator=False, code_sandbox=False, search_state=None):
+        builtin_calculator=False, code_sandbox=False, search_state=None, discussion=True):
     path = tmp_path / name
     path.mkdir()
     settings = asdict(Limits(evaluation_mode="answer", completion_policy="draft", solver=solver,
         cumulative_output_token_budget=32768, builtin_calculator=builtin_calculator,
-        code_sandbox=code_sandbox, solver_controller=controller, search_config=search_config or {}))
+        code_sandbox=code_sandbox, solver_controller=controller, search_config=search_config or {},
+        discussion=discussion))
     plan = {"configuration": {"provider": "deepseek", "requested_model": "frozen-model",
         "problems_sha256": "problems", "case_ids": list(grades), "submission_rule": "frozen-rule",
         "source": "frozen-source", "limits": settings}}
@@ -93,3 +94,27 @@ def test_agent_ablation_is_required_for_agent_vs_agent(tmp_path):
     agent = arm(tmp_path, "bounded-agent", "agent", {"a": "correct"})
     with pytest.raises(ValueError, match="Left arm"):
         module.paired_comparison([baseline], [agent], bootstrap_samples=20)
+
+
+def test_discussion_ablation_keeps_equal_problem_budgets(tmp_path):
+    baseline = arm(tmp_path, "solo", "agent", {"a": "correct"},
+                   controller="continuous_research", discussion=False)
+    agent = arm(tmp_path, "discussion", "agent", {"a": "correct"},
+                controller="continuous_research", discussion=True)
+    result = module.paired_comparison([baseline], [agent], bootstrap_samples=20, agent_ablation=True)
+    assert result["arm_configuration"]["baseline"]["discussion"] is False
+    assert result["arm_configuration"]["agent"]["discussion"] is True
+    assert result["tools_ablation"] is False
+    assert result["accuracy_delta"] == 0
+
+
+def test_native_explicit_answer_can_be_compared_with_plain_baseline(tmp_path):
+    baseline = arm(tmp_path, "plain", "self_refine", {"a": "correct"})
+    agent = arm(tmp_path, "research", "agent", {"a": "correct"}, controller="continuous_research")
+    for path, rule in ((baseline, "last-root-step-explicit-finish-single-box-v1"),
+                       (agent, "explicit-root-research-submission-v1")):
+        plan = json.loads((path / "plan.json").read_text())
+        plan["configuration"]["submission_rule"] = rule
+        (path / "plan.json").write_text(json.dumps(plan))
+    result = module.paired_comparison([baseline], [agent], bootstrap_samples=20)
+    assert result["accuracy_delta"] == 0

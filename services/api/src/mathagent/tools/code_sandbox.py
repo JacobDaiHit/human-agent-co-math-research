@@ -15,7 +15,6 @@ import time
 from pathlib import Path
 
 TOOL_VERSION = "docker-python-sandbox-v1"
-MAX_EXECUTIONS_PER_PROJECT = 32
 MAX_CODE_BYTES = 64 * 1024
 MAX_HOST_DIAGNOSTIC_BYTES = 32 * 1024
 _DIGEST = re.compile(r"(?:^|@)sha256:[0-9a-f]{64}$")
@@ -62,7 +61,7 @@ class CodeSandbox:
         code_hash = _hash(code.encode("utf-8"))
         provenance = {"tool_version": TOOL_VERSION, "image_id": self.image_id, "timeout_seconds": timeout,
                       "code_hash": code_hash, "limits": {"code_bytes": MAX_CODE_BYTES, "output_bytes": 32768,
-                      "project_executions": MAX_EXECUTIONS_PER_PROJECT}}
+                      "timeout_seconds": timeout}}
         job_key = _hash(json.dumps([project_id, attempt_id, provenance], sort_keys=True).encode("utf-8"))
         project_path = self.jobs_path / _hash(project_id.encode("utf-8"))
         journal_path = project_path / (job_key + ".json")
@@ -93,11 +92,11 @@ class CodeSandbox:
                 return _failure("journal_unavailable")
         except OSError:
             return _failure("journal_unavailable")
-        # A slot is the atomic project budget. A crash after this point consumes it,
-        # deliberately preferring a safe unknown over a potentially duplicate run.
+        # Reserve this execution identity once. Resource bounds belong to each
+        # execution and the research budget, not a lifetime project counter.
         slot, newly_reserved = self._reserve_slot(project_path, job_key)
         if slot is None:
-            return _failure("project_execution_limit")
+            return _failure("journal_unavailable")
         if not newly_reserved:
             return _failure("execution_unknown", code_hash=code_hash)
         record = {
@@ -161,26 +160,18 @@ class CodeSandbox:
         return {"redacted": redacted, "pending": pending}
 
     def _reserve_slot(self, project_path, job_key):
-        for index in range(MAX_EXECUTIONS_PER_PROJECT):
-            slot = project_path / f"budget-{index:02d}"
-            try:
-                fd = os.open(slot, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            except FileExistsError:
-                try:
-                    _plain(slot)
-                    if slot.read_text(encoding="ascii") == job_key:
-                        return slot, False
-                except OSError:
-                    pass
-                continue
-            except OSError:
-                return None, False
-            with os.fdopen(fd, "w", encoding="ascii") as handle:
-                handle.write(job_key)
-                handle.flush()
-                os.fsync(handle.fileno())
-            return slot, True
-        return None, False
+        slot = project_path / ("execution-" + job_key)
+        try:
+            fd = os.open(slot, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return slot, False
+        except OSError:
+            return None, False
+        with os.fdopen(fd, "w", encoding="ascii") as handle:
+            handle.write(job_key)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return slot, True
 
     def _run(self, code, timeout):
         command = [

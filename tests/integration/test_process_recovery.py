@@ -7,6 +7,7 @@ held by this test's Popen; no running user service or external API is contacted.
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import sysconfig
@@ -315,7 +316,7 @@ def test_recovery_of_autonomous_response_quarantines_draft_and_skips_old_actions
         f"/runs/{workspace.run['run_id']}/options",
         {
             "request_budget": 1,
-            "autonomous": True,
+            "autonomous": False,
             "max_steps": 2,
             "max_review_rounds": 0,
             "max_children": 0,
@@ -327,6 +328,10 @@ def test_recovery_of_autonomous_response_quarantines_draft_and_skips_old_actions
     )
     process, marker, log = workspace.spawn("worker", "autonomous_observation")
     assert workspace.wait_boundary(process, marker, log)["phase"] == "observed"
+    # Reproduce an already-paid pre-migration run, without enabling a retired
+    # workflow through today's API or buying any additional response.
+    with sqlite3.connect(workspace.environment["MATHAGENT_DATABASE"]) as database:
+        database.execute("UPDATE agent_runs SET autonomous=1 WHERE run_id=?", (workspace.run["run_id"],))
     workspace.restart_after_crash(process)
     workspace.run_worker()
     assert workspace.accepted_count() == 1

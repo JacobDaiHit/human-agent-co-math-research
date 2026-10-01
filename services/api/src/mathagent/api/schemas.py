@@ -120,8 +120,12 @@ class RunCreate(Command):
     reasoning_effort: ReasoningEffort = "provider_default"
     completion_policy: Literal["draft", "reviewed_answer"] = "draft"
     length_recovery: Literal["none", "high"] = "none"
+    answer_submission_recovery: bool = False
+    answer_requires_exhaustiveness: bool = False
     unknown_recovery: Literal["stop", "once"] = "stop"
-    solver_controller: Literal["legacy", "bounded_search_v1"] = "legacy"
+    solver_controller: Literal["legacy", "bounded_search_v1", "continuous_research"] = "continuous_research"
+    discussion: bool = True
+    research_deadline_seconds: int = Field(default=1800, ge=1, le=86400)
     search_config: SearchConfig = Field(default_factory=SearchConfig)
 
 

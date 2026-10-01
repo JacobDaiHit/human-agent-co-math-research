@@ -74,6 +74,19 @@ def test_output_is_bounded_and_program_error_is_not_success(sandbox):
     assert not failed["ok"] and failed["reason"] == "program_error", failed
 
 
+def test_general_symbolic_mathematics_is_preinstalled(sandbox):
+    source = """from sympy import Matrix, Rational, symbols, factor, integrate
+x = symbols('x')
+assert Rational(1, 3) + Rational(2, 5) == Rational(11, 15)
+assert factor(x**2 - 1) == (x - 1)*(x + 1)
+assert integrate(3*x**2, x) == x**3
+assert Matrix([[1, 2], [3, 4]]).det() == -2
+print('SYMPY_OK')
+"""
+    result = sandbox.execute("isolation", "symbolic-math", source, 5)
+    assert result["ok"] and result["stdout"].strip() == "SYMPY_OK", result
+
+
 def test_benchmark_api_receives_pinned_image_without_model_dispatch(tmp_path):
     asyncio.run(_check_benchmark_api(tmp_path))
 

@@ -25,7 +25,13 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 import httpx
-from mathagent.evaluation.outcomes import SUBMISSION_RULE, agent_outcomes, usage_summary
+from mathagent.evaluation.outcomes import (
+    RESEARCH_SUBMISSION_RULE,
+    SUBMISSION_RULE,
+    agent_outcomes,
+    usage_summary,
+)
+from mathagent.providers import research
 from mathagent.providers.remote import DEFAULT_URLS, RemoteProvider
 from mathagent.runtime.completion import boxed_answers
 from mathagent.runtime.worker import HTTPWorker
@@ -35,68 +41,31 @@ OPERATIONS = [
     "record_failure", "record_source", "create_branch", "spawn_task", "request_review",
     "discuss", "calculate",
 ]
-INSTRUCTION = r"""Solve the given short-answer Olympiad problem autonomously without human help.
-No internet search, external references, hidden answer key, or solution hints are available.
-Choose your own mathematical approach. Use the permitted operations when useful.
-Before finalizing, obtain an independent review of your proposed solution: first save the
-full proposed solution including exactly one boxed answer as a claim or artifact with
-write_draft, then request_review using
-the actual revision_id returned in the next step. A review is advice, not an oracle.
-Read the review, correct any demonstrated issues, and give your own final conclusion.
-Do not repeatedly request the same review or invent IDs. Budget includes all descendants
-and any format repair. A completed task is not an automatically adopted theorem.
-Use LaTeX for all mathematical expressions. In the final research body give a concise
-complete justification and exactly one final answer in \boxed{...}. For no solution use
-\boxed{\varnothing}. If unresolved, explicitly say so and do not invent an answer.
-Always explicitly provide next_action. Set it to finish only for a reviewed final answer;
-an unresolved draft needs further investigation within the available budget. Cite the
-reviewed candidate revision in cited_revision_ids and copy that candidate's boxed answer
-unchanged. The reviewed candidate is the proof artifact; the final body is its summary,
-not a place for unreviewed new mathematical claims. Claims resting on an unproved or
-unverified remembered theorem must retain that gap; do not call the claim established.
-research verdict must remain null, even if the independent review passed.
-"""
 TERMINAL = {
     "completed", "failed", "cancelled", "paused", "interrupted", "budget_exhausted",
     "step_limit", "reconciliation_required",
 }
 
-ANSWER_INSTRUCTION = r"""Solve the given short-answer Olympiad problem autonomously without human help.
-No internet search, external references, hidden answer key, or solution hints are available.
-Choose your own approach and use permitted operations when useful. All calls, children,
-reviews and repairs share the budget. An independent review is optional in answer mode.
-Use LaTeX for all mathematics. When ready to submit, put exactly one final answer in
-\boxed{...} in body and explicitly set next_action=finish. If you have a candidate but
-an incomplete proof, you may submit it while clearly stating the proof gap; this does not
-establish a theorem. If you have no answer, explicitly abstain without a boxed guess.
-Only the last validated root step explicitly marked finish is an answer submission.
-Earlier guesses and child outputs are never selected as the final answer. Do not invent IDs.
-research verdict must remain null. A finished answer submission is not a passed proof.
-"""
-
-
 def instruction_for(limits):
     if limits.solver != "agent":
         from mathagent.evaluation.direct import DIRECT_INSTRUCTION
         return DIRECT_INSTRUCTION
-    if limits.solver_controller == "bounded_search_v1":
-        return r"""Solve the original problem closed-book with the bounded search controller.
-Do exactly the work assigned by search_context.kind. Analysis proposes route cards,
-not a complete solution. Advance and repair save actual progress and report_progress.
-The server dispatches independent reviews; never call legacy request_review or spawn_task.
-Use only the published operations and actual returned revision IDs. Preserve original
-quantifiers and hypotheses. Extra unproved assumptions remain conditional.
-All calls, reviews, repairs and recovery share the frozen budget. Prefer a concise valid
-structured response to an unfinished long derivation; do not solve the entire problem
-inside the planning stage. No internet search, external references, old solutions,
-hidden answer key or human mathematical hints are available.
-Use LaTeX for mathematical expressions. In final work, summarize only the selected
-candidate, cite its revision and reproduce its single boxed answer unchanged; explicitly
-abstain without a box if there is no deliverable answer. Never invent a proof or claim
-an unverified remembered theorem is established. Follow the stage contract, including
-next_action and allowed actions. Research verdict must remain null.
+    if limits.solver_controller == "continuous_research":
+        return r"""Solve the original mathematical problem closed-book, without human help,
+internet access, hidden answers or solution hints. Work on the actual local task.
+Use calculations, saved worknotes, new local tasks and a research peer when useful.
+Keep the original assumptions and quantifiers. Present mathematical reasoning as
+ordinary text with LaTeX. The peer is a researcher, not an approving authority.
+For the peer's first task provide the original problem and a neutral research goal,
+not your candidate answer. Exchange actual arguments, failures and open questions
+after that independent attempt; do not seek votes or agreement.
+All members and tools share the problem's request and output budgets.
+When ready, explicitly submit your selected solution body and its short answer.
+For tasks asking for all solutions, explain both membership and exhaustiveness.
+If unresolved, save the remaining obstacle and submit an unresolved outcome.
+A submitted solution is not program-verified mathematical truth.
 """
-    return INSTRUCTION if limits.evaluation_mode == "research" else ANSWER_INSTRUCTION
+    raise ValueError("Retired solvers cannot dispatch new research")
 
 
 def stamp():
@@ -146,21 +115,23 @@ class Limits:
     parallel_cases: int = 2
     thinking_mode: str = "enabled"
     reasoning_effort: str = "max"
-    completion_policy: str = "reviewed_answer"
+    completion_policy: str = "draft"
     length_recovery: str = "none"
     unknown_recovery: str = "stop"
     code_sandbox: bool = False
     evaluation_mode: str = "research"
     solver: str = "agent"
-    solver_controller: str = "legacy"
+    solver_controller: str = "continuous_research"
+    discussion: bool = True
+    research_deadline_seconds: int = 1800
     search_config: dict = field(default_factory=dict)
     cumulative_output_token_budget: int | None = None
-    builtin_calculator: bool = True
+    builtin_calculator: bool = False
     case_order_seed: int = 0
 
     def validate(self):
-        if not 1 <= self.request_budget <= 100 or not 1 <= self.max_steps <= 40:
-            raise ValueError("Invalid request/step budget")
+        if not 1 <= self.request_budget <= 100:
+            raise ValueError("Invalid request budget")
         if self.parallel_cases not in {1, 2} or not 1 <= self.case_timeout_seconds <= 7200:
             raise ValueError("Invalid batch concurrency/deadline")
         if not 256 <= self.max_output_tokens <= 65536 or not 1 <= self.request_timeout_seconds <= 600:
@@ -169,27 +140,12 @@ class Limits:
             raise ValueError("This pilot requires an explicit high/max thinking setting")
         if self.evaluation_mode not in {"answer", "research"}:
             raise ValueError("Invalid evaluation mode")
-        expected_policy = "reviewed_answer" if self.evaluation_mode == "research" else "draft"
-        if self.completion_policy != expected_policy:
-            raise ValueError("Completion policy differs from evaluation mode")
         if self.solver not in {"agent", "direct", "self_refine", "independent_samples"}:
             raise ValueError("Invalid solver")
-        if self.solver_controller not in {"legacy", "bounded_search_v1"}:
-            raise ValueError("Invalid solver controller")
-        if self.solver_controller == "bounded_search_v1":
-            if self.solver != "agent" or self.cumulative_output_token_budget is None:
-                raise ValueError("bounded_search_v1 requires the autonomous agent and a cumulative output token budget")
-            if not isinstance(self.search_config, dict):
-                raise ValueError("Invalid search configuration")
-            try:
-                from mathagent.providers.search_contract import SearchConfig
-                normalized = SearchConfig.model_validate(self.search_config).model_dump(mode="json")
-            except (ImportError, TypeError, ValueError) as error:
-                raise ValueError("Invalid search configuration") from error
-            self.search_config.clear()
-            self.search_config.update(normalized)
-        elif self.search_config:
-            raise ValueError("Search configuration requires bounded_search_v1")
+        if self.solver == "agent" and self.solver_controller != "continuous_research":
+            raise ValueError("Retired solvers are read-only; new runs use continuous_research")
+        if self.search_config:
+            raise ValueError("Search configuration belongs to retired historical workflows")
         if self.solver != "agent" and (self.evaluation_mode != "answer" or self.code_sandbox):
             raise ValueError("Plain baselines require answer mode without tools")
         if self.solver == "direct" and self.request_budget != 1:
@@ -200,6 +156,8 @@ class Limits:
             raise ValueError("Invalid unknown outcome recovery policy")
         if type(self.code_sandbox) is not bool:
             raise ValueError("Invalid sandbox policy")
+        if type(self.discussion) is not bool or not 1 <= self.research_deadline_seconds <= 86400:
+            raise ValueError("Invalid discussion/deadline configuration")
         if type(self.builtin_calculator) is not bool:
             raise ValueError("Invalid calculator policy")
         if type(self.case_order_seed) is not int:
@@ -222,8 +180,11 @@ class CompletionOnlyTransport(httpx.AsyncBaseTransport):
             raise httpx.UnsupportedProtocol("Benchmark external endpoint is not permitted")
         self.number += 1
         payload = json.loads(request.content)
-        if "tools" in payload or "functions" in payload:
-            raise httpx.UnsupportedProtocol("Native or remote tools are not permitted")
+        if "functions" in payload or any(
+            tool.get("type") != "function" or tool.get("function", {}).get("name") not in research.ARGUMENT_MODELS
+            for tool in payload.get("tools", [])
+        ):
+            raise httpx.UnsupportedProtocol("Only locally executed research tools are permitted")
         # Headers (including Authorization) are deliberately never serialized.
         write_json(self.directory / f"dispatch-{time.time_ns()}-{self.number}.json", {
             "created_at": stamp(), "endpoint": self.endpoint, "payload": payload,
@@ -356,20 +317,17 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
         await write(f"/projects/{project_id}/runtime-settings", {
             "request_budget": limits.request_budget, "allow_real_api": True,
             "allowed_providers": [config.name]}, "PUT")
-        operations = [name for name in OPERATIONS if limits.builtin_calculator or name != "calculate"]
-        if limits.solver_controller == "bounded_search_v1":
-            from mathagent.runtime.search import SEARCH_ACTIONS
-            operations.extend(sorted(SEARCH_ACTIONS))
+        operations = [name for name in OPERATIONS if limits.code_sandbox or name != "calculate"]
         await write(f"/projects/{project_id}/agent-policy", {"allowed_operations": operations}, "PUT")
         if limits.code_sandbox:
             sandbox = await write(f"/projects/{project_id}/code-sandbox", {"enabled": True}, "PUT")
             if not sandbox.get("ready") or sandbox.get("image_id") != sandbox_image:
                 raise RuntimeError("Sandbox differs from frozen preflight; no inference dispatched")
-        options = {k: v for k, v in asdict(limits).items() if k not in {
-            "case_timeout_seconds", "parallel_cases", "code_sandbox", "evaluation_mode", "solver",
-            "solver_controller", "search_config", "builtin_calculator", "case_order_seed"}}
-        if limits.solver_controller == "bounded_search_v1":
-            options.update(solver_controller=limits.solver_controller, search_config=limits.search_config)
+        options = {k: v for k, v in asdict(limits).items() if k in {
+            "request_budget", "max_output_tokens", "request_timeout_seconds",
+            "thinking_mode", "reasoning_effort", "unknown_recovery",
+            "discussion", "research_deadline_seconds", "cumulative_output_token_budget"}}
+        options["solver_controller"] = limits.solver_controller
         research = await write("/runs", {"branch_id": branch_id,
             "goal_object_id": project["object_id"], "provider": config.name,
             "autonomous": True, "instruction": instruction_for(limits), **options})
@@ -411,7 +369,8 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
                         await work
         snapshot = await read(f"/projects/{project_id}/snapshot")
         root = next(run for run in snapshot["runs"] if run["id"] == run_id)
-        search_state = None if limits.solver_controller == "legacy" else await read(f"/runs/{run_id}/search")
+        search_state = await read(f"/runs/{run_id}/search") if limits.solver_controller == "bounded_search_v1" else None
+        research_state = await read(f"/runs/{run_id}/research") if limits.solver_controller == "continuous_research" else None
         all_runs = {run["id"]: run for run in snapshot["runs"]}
         all_reviews = {review["id"]: review for review in snapshot["reviews"]}
         branches = (await read(f"/projects/{project_id}/branches"))["branches"]
@@ -438,7 +397,10 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
         completion_checks = steps[-1]["receipt"].get("completion_checks", {}) if steps else {}
         finalized_after_review = completion_checks.get("policy") == "reviewed_answer" and completion_checks.get("passed") is True
         workflow_completed = root["state"] == "completed" and answer is not None and review_completed and finalized_after_review and not timed_out
-        outcomes = agent_outcomes(steps, calls, reviews, workflow_completed)
+        if research_state is not None:
+            final_body = (research_state.get("solution") or {}).get("body")
+            workflow_completed = root["state"] == "completed" and research_state["session"]["outcome"] == "solved" and not timed_out
+        outcomes = agent_outcomes(steps, calls, reviews, workflow_completed, research_state)
         answer = outcomes["answer_submission"]["answer"]
         mode_completed = workflow_completed if limits.evaluation_mode == "research" else (
             answer is not None and root["state"] == "completed" and not timed_out)
@@ -451,7 +413,7 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
                 break
         audit = intervention_audit(events, journal.get("scheduler_cancel_receipt"))
         report = {**base, **audit, "state": root["state"],
-            "terminal_reason": "case_timeout" if timed_out else "missing_final_answer" if root["state"] == "completed" and answer is None else "review_missing" if limits.evaluation_mode == "research" and root["state"] == "completed" and not review_completed else root["state"],
+            "terminal_reason": "case_timeout" if timed_out else "unresolved" if research_state and research_state["session"]["outcome"] == "unresolved" else "missing_final_answer" if root["state"] == "completed" and answer is None else "review_missing" if not research_state and limits.evaluation_mode == "research" and root["state"] == "completed" and not review_completed else root["state"],
             "runtime_terminal": root["state"] in TERMINAL, "runtime_completed": root["state"] == "completed",
             "final_answer_present": answer is not None, "review_completed": review_completed,
             "finalized_after_review": finalized_after_review, "completion_checks": completion_checks,
@@ -473,6 +435,9 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
             "evaluation_kind": "unattended_agent_short_answer" if audit["unattended_eligible"] else "intervened_agent_short_answer", "scored": False}
         if search_state is not None:
             report["search_state"] = search_state
+        if research_state is not None:
+            report["research_state"] = research_state
+            report["discussion_enabled"] = limits.discussion
         write_json(report_path, report)
         export = await write("/exports", {"project_id": project_id, "branch_id": branch_id})
         response = await client.get(f"/exports/{export['export_id']}/download", headers=headers)
@@ -549,9 +514,10 @@ async def run_batch(problems_file, directory, config, limits, root, *, resume=Fa
         stable = {"problems_sha256": digest(Path(problems_file).read_bytes()),
             "provider": config.name, "requested_model": config.model, "limits": asdict(limits),
             "source": fingerprint, "instruction_sha256": digest(instruction_for(limits).encode()),
-            "submission_rule": SUBMISSION_RULE,
+            "submission_rule": RESEARCH_SUBMISSION_RULE if limits.solver == "agent" and limits.solver_controller == "continuous_research" else SUBMISSION_RULE,
             "selection_rule": ("independent-single-box-whitespace-vote-earliest-v1"
-                               if limits.solver == "independent_samples" else SUBMISSION_RULE),
+                               if limits.solver == "independent_samples" else RESEARCH_SUBMISSION_RULE
+                               if limits.solver == "agent" and limits.solver_controller == "continuous_research" else SUBMISSION_RULE),
             "code_sandbox": sandbox_configuration,
             "scope": "targeted_retest" if case_ids is not None else "full_fixture",
             "case_ids": [case["id"] for case in problems["problems"]]}

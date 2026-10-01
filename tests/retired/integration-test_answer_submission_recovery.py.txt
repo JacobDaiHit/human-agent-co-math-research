@@ -1,0 +1,93 @@
+"""A short-answer run gets one compact submission attempt after two length caps."""
+
+import asyncio
+import json
+
+import httpx
+
+from mathagent.providers.remote import ProviderConfig, RemoteProvider
+from mathagent.runtime.worker import HTTPWorker
+from test_autonomous_agent import app as app
+from test_autonomous_agent import exercise
+
+
+def test_answer_submission_recovery_is_bounded_and_disables_thinking(app, monkeypatch):
+    monkeypatch.setenv("MATHAGENT_ENABLE_REAL_API", "1")
+    monkeypatch.setenv("MATHAGENT_DEEPSEEK_API_KEY", "synthetic-key")
+    monkeypatch.setenv("MATHAGENT_DEEPSEEK_MODEL", "synthetic-model")
+
+    async def scenario(api, client):
+        project = await api.write("/projects", {"title": "短答案恢复", "body": "计算 $1+1$。"})
+        await api.write(f"/projects/{project['project_id']}/runtime-settings", {
+            "request_budget": 3, "allow_real_api": True, "allowed_providers": ["deepseek"],
+        }, method="PUT")
+        run = await api.write("/runs", {
+            "branch_id": project["branch_id"], "goal_object_id": project["object_id"],
+            "provider": "deepseek", "autonomous": True, "request_budget": 3,
+            "thinking_mode": "enabled", "reasoning_effort": "max", "length_recovery": "high",
+            "answer_submission_recovery": True, "max_output_tokens": 256,
+        })
+        payloads = []
+
+        def transport(request):
+            payload = json.loads(request.content)
+            payloads.append(payload)
+            if len(payloads) < 3:
+                return httpx.Response(200, json={"usage": {"completion_tokens": 256}, "choices": [{
+                    "message": {"content": "", "reasoning_content": "hidden"}, "finish_reason": "length",
+                }]})
+            task = json.loads(payload["messages"][1]["content"])
+            assert task["output_limit_recovery"]["stage"] == "answer_submission"
+            content = json.dumps({"mode": "research", "body": r"$\boxed{2}$", "findings": ["完成。"],
+                                  "cited_revision_ids": [], "verdict": None, "actions": [], "next_action": "finish"})
+            return httpx.Response(200, json={"usage": {"completion_tokens": 32}, "choices": [{
+                "message": {"content": content}, "finish_reason": "stop",
+            }]})
+
+        config = ProviderConfig("deepseek", "synthetic-key", "synthetic-model", "https://mock.invalid", True)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as wire:
+            worker = HTTPWorker(client, providers=["deepseek"], provider_factory=lambda _: RemoteProvider(config, wire))
+            task = await worker._post("/worker/claim-next", {"providers": ["deepseek"]})
+            await worker.execute(task["task"])
+        assert len(payloads) == 3
+        assert payloads[0]["thinking"] == {"type": "enabled"}
+        assert payloads[1]["thinking"] == {"type": "enabled"}
+        assert payloads[2]["thinking"] == {"type": "disabled"}
+        calls = (await api.get(f"/runs/{run['run_id']}/calls"))["calls"]
+        assert [call["complete"] for call in calls] == [False, False, True]
+
+    exercise(app, scenario)
+
+
+def test_enumerative_answer_with_declared_gap_is_queued_for_another_step(app):
+    class Script:
+        async def generate(self, task):
+            assert task["completion_requirements"]["requires_exhaustiveness"] is True
+            if not task["previous_steps"]:
+                return {"result": {
+                    "mode": "research", "body": r"Candidate $\boxed{(1,2)}$; proof incomplete.",
+                    "findings": ["Completeness is open."], "cited_revision_ids": [], "verdict": None,
+                    "scope": None, "structured_gaps": [], "actions": [], "next_action": "finish",
+                }, "usage": {}, "provider_request_id": None}
+            return {"result": {
+                "mode": "research", "body": r"The solution set is $\boxed{\varnothing}$.",
+                "findings": ["The final argument is complete."], "cited_revision_ids": [], "verdict": None,
+                "scope": None, "structured_gaps": [], "actions": [], "next_action": "finish",
+            }, "usage": {}, "provider_request_id": None}
+
+    async def scenario(api, client):
+        project = await api.write("/projects", {"title": "枚举答案", "body": "Find all pairs."})
+        run = await api.write("/runs", {
+            "branch_id": project["branch_id"], "goal_object_id": project["object_id"],
+            "provider": "fake", "autonomous": True, "request_budget": 2, "max_steps": 2,
+            "answer_requires_exhaustiveness": True,
+        })
+        await HTTPWorker(client, provider_factory=lambda _: Script(), fake_delay_seconds=0).run(once=True)
+        snapshot = await api.get(f"/projects/{project['project_id']}/snapshot")
+        root = next(item for item in snapshot["runs"] if item["id"] == run["run_id"])
+        steps = (await api.get(f"/runs/{run['run_id']}/steps"))["steps"]
+        assert root["state"] == "completed"
+        assert len(steps) == 2
+        assert steps[0]["actions"][-1]["issues"] == ["enumerative_answer_has_self_admitted_completeness_gap"]
+
+    exercise(app, scenario)

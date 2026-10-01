@@ -3,7 +3,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve, join } from 'node:path'
 
-const data=mkdtempSync(join(tmpdir(),'mathagent-browser-'))
+const data=process.env.MATHAGENT_TEST_DATA_DIR||mkdtempSync(join(tmpdir(),'mathagent-browser-'))
 export default defineConfig({
   testDir:'./e2e',fullyParallel:false,workers:1,timeout:45000,
   expect:{timeout:10000},retries:0,

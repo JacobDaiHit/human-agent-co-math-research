@@ -38,6 +38,8 @@ class Runtime:
         self.max_active_attempts = max_active_attempts
         self.provider = FakeProvider()
         self.agent = AgentRuntime(self)
+        from mathagent.runtime.research import ResearchRuntime
+        self.research = ResearchRuntime(self)
         from mathagent.runtime.search import SearchController
         self.search = SearchController(self)
 
@@ -160,6 +162,8 @@ class Runtime:
         branch = self.service.require_branch(session, run.branch_id)
         current = self.service.read_set(session, branch.id)
         return (
+            self.research.inputs_stale(session, run, attempt)
+            or
             self.search.inputs_stale(session, run, attempt)
             or attempt.control_epoch != run.control_epoch
             or branch.control_epoch != attempt.checkpoint.get("branch_control_epoch")
@@ -218,31 +222,16 @@ class Runtime:
         attempt.lease_until = (
             datetime.now(UTC) + timedelta(seconds=self.lease_seconds)
         ).isoformat()
-        search_capacity = {}
-        search = self.search.session_for(session, run.id)
-        if payload.get("boundary") and search and search.config.get("budget_policy") == "adaptive":
-            try:
-                cap = self.search.admit(session, run)
-            except DomainError as error:
-                if error.response.get("error") != "search_pool_exhausted":
-                    raise
-                cap = 0
-            work = self.search.work_for(session, run.id)
-            search_capacity = {"search_output_cap": cap,
-                               "search_min_output_tokens": self.search.minimum_output_tokens(
-                                   session, search, work.kind if work else "advance")}
         return 200, {
             "attempt_id": attempt.id,
             "state": run.state,
             "continue": True,
             "control_pending": run.state != "running",
             "lease_until": attempt.lease_until,
-            **search_capacity,
         }
 
     def claim_next(self, session, payload):
-        self.search.tick(session)
-        self.agent.wake_waiting(session)
+        self.research.tick(session)
         # Reconcile every expired lease first, including tasks for offline providers.
         for run in session.scalars(
             select(Run).where(
@@ -270,6 +259,9 @@ class Runtime:
 
     def reserve_request(self, session, payload):
         attempt, run = self._attempt(session, payload, active=True)
+        config = session.get(AgentRun, run.id)
+        if config and config.autonomous and not self.research.session_for(session, run.id):
+            run.state = "pause_requested"
         if self._boundary(session, attempt, run):
             return 200, {"continue": False, "state": run.state}
         branch = self.service.require_branch(session, run.branch_id)
@@ -293,6 +285,7 @@ class Runtime:
         )["occupied"] >= (options.request_budget if options else 5) or self.agent.additional_budget_exhausted(session, run, requests):
             attempt.state = "failed"
             run.state = "budget_exhausted"
+            self.research.stop(session, run, "budget_exhausted")
             attempt.checkpoint = {**attempt.checkpoint, "end_reason": "request_budget_exhausted"}
             self._emit(session, run, "run.budget_exhausted", {"attempt_id": attempt.id})
             return 200, {"continue": False, "state": run.state}
@@ -302,18 +295,10 @@ class Runtime:
             # exact cap they will pass to the provider.
             requested_output_tokens = self.agent.options(session, run.id)["max_output_tokens"]
         output_budget = self.agent.output_token_budget_status(session, run)
-        try:
-            self.search.admit(session, run, requested_output_tokens)
-        except DomainError as error:
-            if error.response.get("error") != "search_pool_exhausted":
-                raise
-            attempt.state, run.state = "failed", "budget_exhausted"
-            attempt.checkpoint = {**attempt.checkpoint, "end_reason": "search_pool_exhausted"}
-            self._emit(session, run, "run.budget_exhausted", {"reason": "search_pool_exhausted"})
-            return 200, {"continue": False, "state": run.state}
         if output_budget["enabled"] and requested_output_tokens > output_budget["remaining_output_tokens"]:
             attempt.state = "failed"
             run.state = "budget_exhausted"
+            self.research.stop(session, run, "budget_exhausted")
             attempt.checkpoint = {**attempt.checkpoint, "end_reason": "cumulative_output_token_budget_exhausted"}
             self._emit(session, run, "run.budget_exhausted", {
                 "attempt_id": attempt.id, "output_token_budget": output_budget,
@@ -347,6 +332,9 @@ class Runtime:
 
     def start_request(self, session, payload):
         row, attempt, run = self._request(session, payload, active=True)
+        config = session.get(AgentRun, run.id)
+        if config and config.autonomous and not self.research.session_for(session, run.id):
+            run.state = "pause_requested"
         if row.state != "reserved":
             raise DomainError(409, "request_not_reserved", "请求只能从预留状态登记发送")
         if self._boundary(session, attempt, run):
@@ -364,12 +352,15 @@ class Runtime:
                 or self._inputs_stale(session, attempt, run)):
             return False
         config = session.get(AgentRun, run.id)
+        if config and config.autonomous and not self.research.session_for(session, run.id):
+            return False
         root = session.get(AgentRun, config.root_run_id) if config else None
+        native = self.research.session_for(session, run.id)
         if (not root or root.options.get("unknown_recovery", "stop") != "once"
-                or config.options.get("unknown_recovery", "stop") != "once"):
+                or (not native and config.options.get("unknown_recovery", "stop") != "once")):
             return False
         root_run = session.get(Run, root.run_id)
-        if root_run.state not in {"running", "waiting_children", "queued"}:
+        if root_run.state not in {"running", "waiting_children", "waiting_discussion", "idle", "queued"}:
             return False
         observation = session.get(ProviderCall, row.id)
         if not observation or observation.complete or observation.result is not None:
@@ -463,6 +454,11 @@ class Runtime:
             "end_reason": payload["reason"],
             "boundary": "failed",
         }
+        if self.research.session_for(session, run.id):
+            if unknown:
+                self.research.stop(session, run, "paused")
+            elif run.state == "failed":
+                self.research.member_failed(session, run, payload["reason"])
         self._emit(
             session,
             run,
@@ -528,7 +524,14 @@ class Runtime:
         if provider not in {"fake", "deepseek", "glm"}:
             raise DomainError(422, "provider_not_available", "不支持的提供方")
         self._check_permission(session, branch.project_id, provider)
+        payload = {**payload}
+        if payload.get("autonomous") and payload.get("mode", "research") == "research":
+            if payload.get("solver_controller", "continuous_research") != "continuous_research":
+                raise DomainError(422, "solver_retired", "新自主任务只使用连续研究。旧格式仅保留历史读取。")
+            payload["solver_controller"] = "continuous_research"
         mode = payload.get("mode", "research")
+        if mode == "review":
+            payload["autonomous"] = False
         if mode not in {"research", "review"}:
             raise DomainError(422, "invalid_mode", "运行类型必须是 research 或 review")
         budget = payload.get("request_budget", 5)
@@ -546,7 +549,7 @@ class Runtime:
         session.flush()
         session.add(RunOptions(run_id=run.id, mode=mode, request_budget=budget))
         self.agent.register(session, run.id, payload)
-        self.search.initialize(session, run, payload)
+        self.research.initialize(session, run, payload)
         self.agent.branch_allowed(session, run)
         response = {
             "run_id": run.id,
@@ -621,7 +624,9 @@ class Runtime:
 
     def claim(self, session, payload):
         run = self._run(session, payload["run_id"])
-        self.search.admit(session, run)
+        research = self.research.session_for(session, run.id)
+        if research and research.state != "researching":
+            return 200, {"run_id": run.id, "state": research.state, "effect": "blocked"}
         self.agent.branch_allowed(session, run)
         before = run.state
         self._reconcile_expired(session, run)
@@ -640,13 +645,11 @@ class Runtime:
             return 200, {"run_id": run.id, "state": run.state, "effect": "applied"}
         if run.state != "queued":
             raise DomainError(409, "run_not_queued", "当前运行不能领取", state=run.state)
-        from mathagent.persistence.agent_models import AgentRun, AgentStep
         config = session.get(AgentRun, run.id)
-        if config and config.autonomous and session.scalar(select(func.count()).select_from(AgentStep).where(
-                AgentStep.run_id == run.id)) >= config.options["max_steps"]:
-            run.state = "step_limit"
-            self._emit(session, run, "run.step_limit", {"run_id": run.id})
-            return 200, {"run_id": run.id, "state": run.state, "effect": "blocked"}
+        if config and config.autonomous and not research:
+            run.state = "paused"
+            self._emit(session, run, "run.solver_retired", {"run_id": run.id})
+            return 200, {"run_id": run.id, "state": "paused", "effect": "blocked", "reason": "solver_retired"}
         branch = self.service.require_branch(session, run.branch_id)
         self._check_permission(session, branch.project_id, run.provider)
         active = session.scalars(select(Attempt).where(Attempt.state == "running")).all()
@@ -842,11 +845,8 @@ class Runtime:
             raise DomainError(410, "material_deleted", "相关材料已永久删除，产物不能写回。")
         if not secrets.compare_digest(attempt.token, payload["token"]):
             raise DomainError(409, "invalid_execution_token", "执行令牌已失效或不匹配")
-        config = session.get(AgentRun, attempt.run_id)
-        if config and config.autonomous and self.search.session_for(session, attempt.run_id) and not agent_step:
-            raise DomainError(422, "autonomous_step_required", "受控任务必须经步骤端点应用与核对派发合同。")
-        if config and config.autonomous and config.options.get("completion_policy") == "reviewed_answer" and not agent_step:
-            raise DomainError(422, "autonomous_step_required", "此任务必须经研究步骤端点检查完成条件")
+        if self.research.session_for(session, attempt.run_id):
+            raise DomainError(422, "research_turn_required", "连续研究通过步骤和工具端点保存正文与提交。")
         body = payload["body"]
         if not isinstance(body, str) or not body.strip() or len(body) > 200_000:
             raise DomainError(422, "invalid_output", "执行产物应为非空文本，且不超过 200000 字符")
@@ -1026,7 +1026,7 @@ class Runtime:
         }
         self._emit(session, run, "attempt.completed", response, run.provider)
         if not agent_step:
-            self.search.completed(session, run, attempt, result or {})
+            pass  # Retired controller records do not schedule new requests.
         return 200, response
 
     def intervene(self, session, payload):
@@ -1048,6 +1048,7 @@ class Runtime:
         run.control_epoch += 1
         if action == "steer":
             run.instruction = payload["instruction"]
+            self.research.redirect(session, run, payload["instruction"])
             # Steering a paused run changes its next inputs but does not resume it.
             if in_flight and run.state != "pause_requested":
                 run.state = "steer_requested"
@@ -1055,6 +1056,9 @@ class Runtime:
             run.state = "pause_requested" if in_flight else "paused"
         else:
             run.state = "cancel_requested" if in_flight else "cancelled"
+        research = self.research.session_for(session, run.id)
+        if research and run.id == research.root_run_id and action in {"pause", "cancel"}:
+            self.research.stop(session, run, "paused" if action == "pause" else "cancelled")
         response = {
             "run_id": run.id,
             "state": run.state,
@@ -1076,6 +1080,9 @@ class Runtime:
 
     def resume(self, session, payload):
         run = self._run(session, payload["run_id"])
+        config = session.get(AgentRun, run.id)
+        if config and config.autonomous and not self.research.session_for(session, run.id):
+            raise DomainError(409, "solver_retired", "历史任务不再派发新请求；请从原题新建连续研究。")
         self._reconcile_expired(session, run)
         unsettled = session.scalars(
             select(ProviderRequest).where(
@@ -1092,6 +1099,7 @@ class Runtime:
         run.state = "queued"
         run.control_epoch += 1
         run.current_attempt_id = None
+        self.research.resume(session, run)
         response = {"run_id": run.id, "state": run.state, "control_epoch": run.control_epoch}
         self._emit(session, run, "run.resumed", response, "human")
         return 200, response

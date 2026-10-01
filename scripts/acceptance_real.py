@@ -29,6 +29,7 @@ async def execute(directory, provider_name):
     app.state.database.migrate()
     report = {"checked_at": datetime.now(UTC).isoformat(), "provider": provider_name,
               "simulated": False, "request_cap": 6, "model_web_tools": False,
+              "mathematical_correctness_verified": False,
               "api_transport": "isolated ASGI HTTP; OS-process recovery tested separately",
               "provider_status": provider_status(), "checks": {}}
     try:
@@ -54,14 +55,12 @@ async def execute(directory, provider_name):
             await write(f"/projects/{project_id}/runtime-settings", {"request_budget": 6,
                 "allow_real_api": True, "allowed_providers": [provider_name]}, "PUT")
             research = await write("/runs", {"branch_id": branch_id, "goal_object_id": claim["object_id"],
-                "provider": provider_name, "autonomous": True, "request_budget": 4, "max_steps": 3,
-                "max_children": 1, "max_depth": 1, "max_review_rounds": 1, "max_output_tokens": 8192,
-                "instruction": "这是功能验收，不是IMO。最多三次主任务调用和一次独立审查，共四次请求。"
-                "第一步请实际调用 calculate 的 polynomial_identity，验证两倍差式等于三项平方差之和，"
-                "并用 propose_proof 为输入命题提交简洁完整证明（不要另建命题），next_action=continue。"
-                "第二步读取回执，用实际返回的论证 revision_id 请求 request_review，next_action=wait。"
-                "第三步核对实际审查结果，给出有局限说明的总结并finish。若工具或证明提交失败，明确报告，"
-                "不要假装完成。所有数学内容用LaTeX；不允许网页检索或任意代码。"})
+                "provider": provider_name, "autonomous": True, "request_budget": 4,
+                "solver_controller": "continuous_research", "discussion": True, "max_output_tokens": 8192,
+                "instruction": "这是功能验收，不是 IMO。主研究者与同伴共用四次请求。"
+                "保存简洁的个人工作稿，用原题和中立目标邀请一名同伴先独立探索，随后交换具体推导。"
+                "依据实际推导交付普通数学正文；已有完整结果时直接提交，不需要审批或复制式收尾。"
+                "没有解决就明确提交未完成的研究，不要冒充证明。不开放网页检索或宿主代码执行。" })
             print("Real research started; shared cap is four requests.", flush=True)
             await HTTPWorker(client, providers=[provider_name], concurrency=1).run(once=True)
             snapshot = await read(f"/projects/{project_id}/snapshot")
@@ -69,11 +68,12 @@ async def execute(directory, provider_name):
             report["project_id"] = project_id
             report["research_run_id"] = research["run_id"]
             report["research_steps"] = steps
-            actions = [a for s in steps for a in s["actions"]]
+            state = await read(f"/runs/{research['run_id']}/research")
             report["checks"].update({
-                "actual_calculation": any(a["type"] == "calculate" and a["status"] == "completed" and a["result"].get("status") == "ok" for a in actions),
-                "model_proof_saved": any(a["type"] == "propose_proof" and a["status"] == "completed" for a in actions),
-                "separate_review": any(r["kind"] == "llm_review" for r in snapshot["reviews"]),
+                "worknote_saved": any(member["personal_note"] for member in state["members"]),
+                "persistent_independent_peer": len(state["members"]) == 2 and
+                    any(work["independent"] for work in state["work"]),
+                "explicit_submission": state["session"]["solution_revision_id"] is not None,
                 "research_completed": next(r for r in snapshot["runs"] if r["id"] == research["run_id"])["state"] == "completed",
                 "no_automatic_adoption": all(o["adoption_state"] == "draft" for o in snapshot["objects"]),
             })

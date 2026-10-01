@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from urllib.parse import urlparse
 
 import httpx
-from mathagent.providers import protocol
+from mathagent.providers import protocol, research
 from mathagent.providers.observability import MAX_WIRE_BYTES, RequestObservation, empty_observation
 from mathagent.providers.options import MAX_OUTPUT_TOKENS
 
@@ -31,7 +31,7 @@ class Capabilities:
     streaming: bool = True
     json_output: bool = True
     native_json_schema: bool = False
-    executable_tools: bool = False
+    executable_tools: bool = True
     cancellation: bool = False
     request_retrieval: bool = False
     server_idempotency: bool = False
@@ -164,12 +164,18 @@ class RemoteProvider:
             raise ProviderFailure("incompatible_thinking_options", outcome="unaccepted")
         if config.name != "deepseek" and (thinking != "provider_default" or effort != "provider_default"):
             raise ProviderFailure("unsupported_thinking_options", outcome="unaccepted")
-        messages = protocol.messages_for(task)
+        native = task.get("research_protocol") is True
+        messages = research.messages_for(task) if native else protocol.messages_for(task)
         parameters = {
             "stream": True,
-            "response_format": {"type": "json_object"},
             "max_tokens": max_tokens,
         }
+        if native:
+            parameters["tools"] = copy.deepcopy(task["tools"])
+            if "tool_choice" in task:
+                parameters["tool_choice"] = copy.deepcopy(task["tool_choice"])
+        else:
+            parameters["response_format"] = {"type": "json_object"}
         if thinking != "provider_default":
             parameters["thinking"] = {"type": thinking}
         if effort != "provider_default":
@@ -189,7 +195,7 @@ class RemoteProvider:
                 "write": min(120, deadline),
                 "pool": min(120, deadline),
             },
-            "prompt_template_version": protocol.PROMPT_VERSION,
+            "prompt_template_version": research.PROMPT_VERSION if native else protocol.PROMPT_VERSION,
             "prompt_template_sha256": hashlib.sha256(template.encode("utf-8")).hexdigest(),
             "prompt_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
         }
@@ -225,7 +231,7 @@ class RemoteProvider:
                 or parsed.fragment
             ):
                 raise ProviderFailure("invalid_provider_url", outcome="unaccepted")
-            if sum(len(m["content"]) for m in payload["messages"]) > 200_000:
+            if not task.get("research_protocol") and sum(len(m["content"]) for m in payload["messages"]) > 200_000:
                 raise ProviderFailure("input_too_large", outcome="unaccepted")
             deadline = call_config["request_timeout_seconds"]
             timeout = httpx.Timeout(min(120, deadline), connect=min(10, deadline))
@@ -258,19 +264,26 @@ class RemoteProvider:
                     content = await self._decode(
                         response, observation,
                         wire_limit=max(MAX_WIRE_BYTES, payload["max_tokens"] * 1024),
+                        native=task.get("research_protocol") is True,
                     )
                 try:
-                    result = protocol.validate_result(
-                        json.loads(observation.redact(content)),
-                        mode=task["mode"],
-                        read_set=task["read_set"],
-                        context_revision_ids=task.get("context_revision_ids", []),
-                        autonomous=bool(task.get("autonomous")),
-                    )
+                    if task.get("research_protocol"):
+                        message = research.parse_message(json.loads(observation.redact(
+                            json.dumps(content, ensure_ascii=False))))
+                        result = {"message": message}
+                    else:
+                        result = protocol.validate_result(
+                            json.loads(observation.redact(content)),
+                            mode=task["mode"],
+                            read_set=task["read_set"],
+                            context_revision_ids=task.get("context_revision_ids", []),
+                            autonomous=bool(task.get("autonomous")),
+                        ).model_dump()
                 except (ValueError, TypeError):
-                    raise ProviderFailure("invalid_structured_output", outcome="spent") from None
+                    raise ProviderFailure("invalid_provider_response" if task.get("research_protocol")
+                                          else "invalid_structured_output", outcome="spent") from None
                 return {
-                    "result": result.model_dump(),
+                    "result": result,
                     "usage": copy.deepcopy(observation.usage),
                     "provider_request_id": observation.provider_request_id,
                     "observation": observation.snapshot(),
@@ -337,7 +350,9 @@ class RemoteProvider:
             yield buffer.rstrip("\r")
 
     @staticmethod
-    async def _decode(response, observation, *, wire_limit=MAX_WIRE_BYTES):
+    async def _decode(response, observation, *, wire_limit=MAX_WIRE_BYTES, native=False):
+        if native:
+            return await RemoteProvider._decode_research(response, observation, wire_limit=wire_limit)
         content_type = response.headers.get("content-type", "")
         if "text/event-stream" not in content_type:
             raw, overflow = await RemoteProvider._read_body(response, observation, wire_limit=wire_limit)
@@ -404,6 +419,84 @@ class RemoteProvider:
             raise ProviderFailure("stream_interrupted")
         observation.complete = True
         return "".join(parts)
+
+    @staticmethod
+    async def _decode_research(response, observation, *, wire_limit=MAX_WIRE_BYTES):
+        """Retain complete assistant/tool messages, including provider continuation.
+
+        Tool arguments may arrive in many fragments. Assemble by call index and
+        return them as-is; argument errors are handled by the research tools.
+        """
+        if "text/event-stream" not in response.headers.get("content-type", ""):
+            raw, overflow = await RemoteProvider._read_body(response, observation, wire_limit=wire_limit)
+            if overflow:
+                raise ProviderFailure("response_too_large", outcome="spent")
+            try:
+                data = json.loads(raw)
+                observation.metadata(data)
+                choice = data["choices"][0]
+                observation.finish_reason = choice.get("finish_reason")
+                observation.set_raw(json.dumps(choice["message"], ensure_ascii=False))
+                if observation.finish_reason not in {"stop", "tool_calls"}:
+                    raise ProviderFailure("incomplete_output", outcome="spent")
+                message = research.parse_message(choice["message"])
+            except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+                raise ProviderFailure("invalid_provider_response", outcome="spent") from None
+            observation.set_raw(json.dumps(message, ensure_ascii=False))
+            observation.complete = True
+            return message
+
+        content, reasoning, calls, done = [], [], {}, False
+        try:
+            async for line in RemoteProvider._lines(response, observation, wire_limit=wire_limit):
+                if not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if raw == "[DONE]":
+                    done = True
+                    break
+                data = json.loads(raw)
+                observation.metadata(data)
+                if data.get("error"):
+                    raise ProviderFailure("stream_provider_error")
+                for choice in data.get("choices", []):
+                    if choice.get("index", 0) != 0:
+                        continue
+                    delta = choice.get("delta") or {}
+                    if delta.get("content"):
+                        content.append(delta["content"])
+                        observation.append_raw(delta["content"])
+                    if delta.get("reasoning_content"):
+                        reasoning.append(delta["reasoning_content"])
+                    for part in delta.get("tool_calls") or []:
+                        index = part["index"]
+                        call = calls.setdefault(index, {"id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""}})
+                        if part.get("id"):
+                            call["id"] = part["id"]
+                        function = part.get("function") or {}
+                        call["function"]["name"] += function.get("name") or ""
+                        call["function"]["arguments"] += function.get("arguments") or ""
+                    if choice.get("finish_reason"):
+                        observation.finish_reason = choice["finish_reason"]
+            message = {"role": "assistant", "content": "".join(content)}
+            if reasoning:
+                message["reasoning_content"] = "".join(reasoning)
+            if calls:
+                message["tool_calls"] = [calls[index] for index in sorted(calls)]
+            # The provider has already charged for this material. Preserve it
+            # even when the response ends before a complete tool request.
+            observation.set_raw(json.dumps(message, ensure_ascii=False))
+            if observation.finish_reason not in {"stop", "tool_calls"}:
+                raise ProviderFailure("incomplete_output", outcome="spent")
+            if not done:
+                raise ProviderFailure("stream_interrupted")
+            message = research.parse_message(message)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise ProviderFailure("invalid_stream", outcome="unknown") from None
+        observation.set_raw(json.dumps(message, ensure_ascii=False))
+        observation.complete = True
+        return message
 
 
 class DeepSeekProvider(RemoteProvider):

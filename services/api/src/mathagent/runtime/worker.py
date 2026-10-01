@@ -98,12 +98,15 @@ class HTTPWorker:
             )
 
     async def execute(self, task):
+        if task.get("research_protocol"):
+            return await self.execute_research(task)
         ended = asyncio.Event()
         heartbeat = asyncio.create_task(self._heartbeat(task, ended))
         attempt_path = f"/attempts/{task['attempt_id']}"
         execution = {"token": task["token"]}
         repaired = False
         length_recovered = False
+        answer_submission_recovered = False
         length_failed_cap = None
         try:
             provider = self.provider_factory(task["provider"]) if task["provider"] != "fake" or self.custom_provider else None
@@ -199,8 +202,14 @@ class HTTPWorker:
                         and error.code == "incomplete_output" and error.outcome == "spent"
                         and observation.get("finish_reason") == "length" and not length_recovered
                     )
+                    recover_answer_submission = (
+                        task["provider"] == "deepseek" and task.get("answer_submission_recovery") is True
+                        and error.code == "incomplete_output" and error.outcome == "spent"
+                        and observation.get("finish_reason") == "length" and length_recovered
+                        and not answer_submission_recovered
+                    )
                     repair_format = error.code == "invalid_structured_output" and error.outcome == "spent" and not repaired
-                    if (recover_length or repair_format) and retry < 2:
+                    if (recover_length or recover_answer_submission or repair_format) and retry < 2:
                         from mathagent.runtime.context import compact_task
 
                         if recover_length:
@@ -216,6 +225,18 @@ class HTTPWorker:
                             if "provider_options" in task:
                                 task["provider_options"] = {**task["provider_options"],
                                     "thinking_mode": thinking, "reasoning_effort": effort}
+                            task.pop("repair_output", None)
+                            task.pop("repair_feedback", None)
+                        elif recover_answer_submission:
+                            answer_submission_recovered = True
+                            length_failed_cap = reservation.get("output_token_reservation", task["max_output_tokens"])
+                            task = {**task, "thinking_mode": "disabled", "reasoning_effort": "provider_default",
+                                "output_limit_recovery": {"reason": "length", "attempt": 2,
+                                    "stage": "answer_submission",
+                                    "visible_fragment": observation.get("raw_text", "")[:30000]}}
+                            if "provider_options" in task:
+                                task["provider_options"] = {**task["provider_options"],
+                                    "thinking_mode": "disabled", "reasoning_effort": "provider_default"}
                             task.pop("repair_output", None)
                             task.pop("repair_feedback", None)
                         else:
@@ -244,7 +265,9 @@ class HTTPWorker:
                                 scope["remaining"] = max(0, scope["limit"] - scope["occupied"])
                             budget["remaining"] = min(scope["remaining"] for scope in budget["scopes"])
                             budget["after_this_request"] = max(0, budget["remaining"] - 1)
-                            budget["snapshot"] = "adjusted_after_length_failure" if recover_length else "adjusted_after_format_failure"
+                            budget["snapshot"] = ("adjusted_after_length_failure" if recover_length
+                                else "adjusted_after_answer_submission_recovery" if recover_answer_submission
+                                else "adjusted_after_format_failure")
                             budget["stale"] = True
                             budget["known_consumed_since_snapshot"] = budget.get("known_consumed_since_snapshot", 0) + 1
                         continue
@@ -293,6 +316,113 @@ class HTTPWorker:
             # Never log exception text: SDK/transport errors may embed credentials.
             await self._safe_fail(task, "worker_execution_error")
             log.error("Worker execution failed; the ledger preserves dispatch outcome.")
+        finally:
+            ended.set()
+            await heartbeat
+
+    async def execute_research(self, task):
+        """One claimed task can make multiple dependent tool/model turns."""
+        from mathagent.providers import research
+
+        ended = asyncio.Event()
+        heartbeat = asyncio.create_task(self._heartbeat(task, ended))
+        attempt_path = f"/attempts/{task['attempt_id']}"
+        execution = {"token": task["token"]}
+        failures = 0
+        try:
+            provider = self.provider_factory(task["provider"]) if task["provider"] != "fake" or self.custom_provider else None
+            while True:
+                context = await self._post(attempt_path + "/research-context", execution)
+                pending = context.get("pending_tools", [])
+                if context.get("task"):
+                    task = context["task"]
+                    pending = task["pending_research_tools"]
+                if pending:
+                    for tool in pending:
+                        await self._post(attempt_path + "/research-tool", {**execution, **tool})
+                    continue
+                if not context["continue"]:
+                    return
+                boundary = await self._post(attempt_path + "/heartbeat", {**execution, "boundary": True})
+                if not boundary["continue"]:
+                    return
+                reservation = await self._post(attempt_path + "/requests", {
+                    **execution, "requested_output_tokens": max(256, task["max_output_tokens"]),
+                })
+                if not reservation["continue"]:
+                    return
+                request_path = f"/requests/{reservation['request_id']}"
+                config = provider.describe(task) if provider and hasattr(provider, "describe") else {
+                    "provider": task["provider"], "model": "synthetic-fixture",
+                    "parameters": {}, "prompt_template_version": research.PROMPT_VERSION,
+                    "simulated": task["provider"] == "fake",
+                }
+                await self._post(request_path + "/observation", {**execution,
+                    "observation": {"call_config": config, "raw_text": "", "complete": False}})
+                if not (await self._post(request_path + "/start", execution))["continue"]:
+                    return
+                try:
+                    if provider:
+                        output = await provider.generate(task)
+                    else:
+                        await asyncio.sleep(self.fake_delay_seconds)
+                        lead = task["research_member"] == "lead"
+                        message = {"role": "assistant", "content": "模拟执行记录；没有调用真实模型或验证数学。",
+                            "tool_calls": [{"id": "fake-call-" + reservation["request_id"],
+                                "type": "function", "function": {
+                                    "name": "submit_solution" if lead else "finish_work",
+                                    "arguments": json.dumps({"outcome": "unresolved"} if lead else {})}}]}
+                        output = {"result": {"message": message}, "usage": {}, "provider_request_id": None}
+                except ProviderFailure as error:
+                    observation = {**(error.observation or {}), "call_config": config}
+                    fragment = research.partial_message(observation) if (
+                        error.code == "incomplete_output" and error.outcome == "spent") else None
+                    if fragment is not None:
+                        # Continue from the purchased work, never retry the same
+                        # request or execute a possibly truncated tool call.
+                        output = {"result": {"message": fragment, "truncated": True},
+                            "usage": observation.get("usage", {}),
+                            "provider_request_id": observation.get("provider_request_id"),
+                            "observation": observation}
+                    else:
+                        await self._post(request_path + "/observation", {**execution, "observation": observation})
+                        settlement = await self._post(request_path + "/settle", {**execution,
+                            "outcome": error.outcome, "reason": error.code,
+                            "usage": {k: v for k, v in observation.get("usage", {}).items()
+                                      if isinstance(v, int) and not isinstance(v, bool) and v >= 0},
+                            "provider_request_id": observation.get("provider_request_id"),
+                            "retry_unknown": error.outcome == "unknown" and error.code in UNKNOWN_TRANSPORT_FAILURES})
+                        failures += 1
+                        if settlement.get("unknown_retry_allowed") or (
+                            error.outcome == "unaccepted" and error.retryable and failures < 3):
+                            continue
+                        await self._safe_fail(task, error.code)
+                        return
+                failures = 0
+                observation = output.get("observation") or {
+                    "raw_text": json.dumps(output["result"], ensure_ascii=False)[:200000],
+                    "complete": True,
+                    "finish_reason": "tool_calls" if output["result"]["message"].get("tool_calls") else "stop",
+                    "usage": output.get("usage", {}), "provider_request_id": output.get("provider_request_id"),
+                }
+                await self._post(request_path + "/observation", {**execution,
+                    "observation": {**observation, "call_config": config}, "result": output["result"]})
+                await self._post(request_path + "/settle", {**execution, "outcome": "spent",
+                    **({"reason": "incomplete_output"} if output["result"].get("truncated") else {}),
+                    "usage": {k: v for k, v in output.get("usage", {}).items()
+                              if isinstance(v, int) and not isinstance(v, bool) and v >= 0},
+                    "provider_request_id": output.get("provider_request_id")})
+                await self._post(attempt_path + "/steps", {**execution,
+                    "request_id": reservation["request_id"], "result": output["result"]})
+        except asyncio.CancelledError:
+            await asyncio.shield(self._safe_fail(task, "worker_shutdown"))
+            raise
+        except WorkerAPIError as error:
+            log.error("Continuous research request failed: %s", error)
+            await self._safe_fail(task, "worker_api_unavailable")
+        except Exception:
+            log.error("Continuous research execution failed", exc_info=False)
+            await self._safe_fail(task, "worker_execution_error")
         finally:
             ended.set()
             await heartbeat

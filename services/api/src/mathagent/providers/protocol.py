@@ -179,6 +179,21 @@ def messages_for(task):
             "无须在一次响应中解决全部困难。可参考 visible_fragment，但它不是已保存或已验证的状态。"
             "保留不确定性，不得为结束任务编造证明或答案。"
         )
+        if task.get("completion_requirements", {}).get("policy") == "draft":
+            instruction += (
+                "\n当前任务允许短答案草稿提交。若已有可辩护的候选，优先在本次给出恰好一个"
+                "\\boxed{...} 并设 next_action=finish；用简短文字说明尚未补齐的证明，"
+                "不要因追求完整长证明而再次耗尽输出。"
+            )
+        if task["output_limit_recovery"].get("stage") == "answer_submission":
+            instruction += (
+                "\n此前两次完整推理均在可见正文前达到长度上限，且其中的隐藏推理不会保留。"
+                "本次已关闭长推理，须采用简短的独立论证并提交当前最佳可辩护短答案；"
+                "若问题要求全部解或全部整数对，只有同时验证成员资格与完备性时才能提交非空集合；"
+                "不得把自己承认未证完备性的猜测成员写成最终答案。满足提交条件时，正文只能有一个"
+                "\\boxed{...} 且 next_action=finish；若关键完备性论证尚缺，明确该论证并设 "
+                "next_action=continue，以便下一步集中完成它。"
+            )
     example = {"body": r"公式示例：行内 $a\ge b$；独立公式 $$\frac{a+b}{2}$$。",
                "findings": [r"所有出现的数学符号，例如 $a,b$，均放入数学环境。"]}
     if task.get("repair_output") is not None:

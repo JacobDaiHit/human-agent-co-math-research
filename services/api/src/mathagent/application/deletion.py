@@ -37,6 +37,7 @@ from mathagent.persistence.search_models import (
     SearchSession,
     SearchWork,
 )
+from mathagent.persistence.solver_models import ResearchMessage, ResearchSession, ResearchWork
 from mathagent.persistence.workspace_models import Annotation, BlockRevision
 from sqlalchemy import select
 
@@ -195,6 +196,12 @@ class DeletionService:
             call.raw_sha256 = hashlib.sha256(b"").hexdigest()
         for step in session.scalars(select(AgentStep).where(AgentStep.run_id.in_(run_ids))):
             step.body, step.actions, step.receipt = "", [], {"material_erased": True}
+        for research in session.scalars(select(ResearchSession).where(ResearchSession.root_run_id.in_(run_ids))):
+            research.answer, research.outcome, research.state = None, None, "cancelled"
+        for work in session.scalars(select(ResearchWork).where(ResearchWork.member_run_id.in_(run_ids))):
+            work.goal, work.materials, work.state = "", [], "cancelled"
+        for message in session.scalars(select(ResearchMessage).where(ResearchMessage.sender_run_id.in_(run_ids))):
+            message.topic = ""
         roots = set(session.scalars(select(SearchSession.root_run_id).where(
             SearchSession.project_id == project_id
         )))

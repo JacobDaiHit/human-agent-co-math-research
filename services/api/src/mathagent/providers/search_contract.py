@@ -34,6 +34,8 @@ class SearchConfig(BaseModel):
     enable_tools: bool = True
     enable_memory: bool = True
     enable_multi_route: bool = True
+    route_schedule: Literal["first_pass", "evidence_first"] = "first_pass"
+    require_passed_check_for_final: bool = True
 
     @model_validator(mode="after")
     def validate_bounds(self):

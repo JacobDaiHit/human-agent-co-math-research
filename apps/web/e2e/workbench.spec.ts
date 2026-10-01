@@ -1,8 +1,8 @@
 import { test, expect } from '@playwright/test'
 import type { Page, APIRequestContext } from '@playwright/test'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
-import { resolve } from 'node:path'
+import { delimiter, resolve } from 'node:path'
 
 let worker:ChildProcess
 const auth={Authorization:'Bearer browser-test-user'}
@@ -11,7 +11,10 @@ async function snapshot(api:APIRequestContext,project:string,branch?:string){con
 async function openProject(page:Page,title:string){await page.goto('/');await page.getByRole('button',{name:`◇ ${title}`,exact:true}).click();await expect(page.getByRole('heading',{name:title,exact:true})).toBeVisible()}
 async function selectClaim(page:Page,body:string){await page.getByLabel('研究工作稿').getByTestId('manuscript-block').filter({hasText:body}).click();await expect(page.getByLabel('对象详情',{exact:true})).toBeVisible()}
 
-test.beforeAll(()=>{worker=spawn(resolve('../../.venv/Scripts/python.exe'),['-m','mathagent.runtime.worker','--api-url','http://127.0.0.1:18081','--fake-delay','4'],{windowsHide:true,stdio:'ignore',env:{...process.env,MATHAGENT_WORKER_TOKEN:'browser-test-worker',MATHAGENT_LOAD_ENV:'0',MATHAGENT_ENABLE_REAL_API:'0'}})})
+test.beforeAll(()=>{
+  const python=JSON.parse(execFileSync(resolve('../../.venv/Scripts/python.exe'),['-c','import json,sys,sysconfig; print(json.dumps([sys._base_executable,sysconfig.get_paths()["purelib"]]))'],{encoding:'utf8',windowsHide:true}))
+  worker=spawn(python[0],['-m','mathagent.runtime.worker','--api-url','http://127.0.0.1:18081','--fake-delay','4'],{windowsHide:true,stdio:'ignore',env:{...process.env,PYTHONPATH:[resolve('../../services/api/src'),python[1]].join(delimiter),PYTHONNOUSERSITE:'1',MATHAGENT_WORKER_TOKEN:'browser-test-worker',MATHAGENT_LOAD_ENV:'0',MATHAGENT_ENABLE_REAL_API:'0'}})
+})
 test.afterAll(()=>worker?.kill())
 
 test('manual research, annotations, manuscript CAS, browser drafts, and branch switching',async({page,request})=>{
@@ -38,7 +41,7 @@ test('editing a lemma during independent worker execution preserves old input an
   const c=await command(request,'/objects',{branch_id:p.branch_id,kind:'claim',body:'结论 C 依赖于 L'})
   const proof=await command(request,'/proof-plans',{branch_id:p.branch_id,conclusion_revision_id:c.revision_id,body:'由 L 推得 C；这是工作流测试夹具。',premise_revision_ids:[l.revision_id]})
   await openProject(page,'运行中修改引理');await selectClaim(page,'引理 L_v1：原始陈述')
-  await page.getByRole('button',{name:'从此处研究',exact:true}).click();await page.getByRole('dialog').getByRole('button',{name:'开始执行',exact:true}).click()
+  await page.getByRole('button',{name:'从此处研究',exact:true}).click();await page.getByRole('dialog').getByRole('checkbox',{name:'连续研究：允许根据计算结果继续推导、调整任务和按需讨论'}).uncheck();await page.getByRole('dialog').getByRole('button',{name:'开始执行',exact:true}).click()
   await expect.poll(async()=>{const s=await snapshot(request,p.project_id);return s.runs[0]?.state}).toBe('running')
   await page.getByTestId('run-card').getByRole('button',{name:'引理 L_v1：原始陈述',exact:true}).click();const inspector=page.getByLabel('对象详情',{exact:true});await inspector.getByRole('button',{name:'编辑正文',exact:true}).click();await inspector.getByLabel('编辑对象正文').fill('引理 L_v2：补充条件后的陈述');await inspector.getByRole('button',{name:'保存新版本'}).click();await expect(page.getByRole('status')).toContainText('1 个运行仍读取旧版')
   await expect.poll(async()=>{const s=await snapshot(request,p.project_id);return s.runs[0].attempts[0].state},{timeout:15000}).toBe('quarantined')
@@ -85,8 +88,8 @@ test('request settings and completed fake ledger are visible at mobile width',as
   await command(request,'/projects',{title:'请求账本界面',body:'请求账本验收问题'})
   await openProject(page,'请求账本界面');await page.setViewportSize({width:390,height:844});await page.getByRole('tab',{name:'运行',exact:true}).click();await page.getByRole('button',{name:'运行设置',exact:true}).click()
   const dialog=page.getByRole('dialog');await dialog.getByLabel('项目累计请求上限').fill('2');await dialog.getByRole('button',{name:'保存设置',exact:true}).click();await expect(page.getByLabel('请求额度与调用账本')).toContainText('剩余 2 / 2')
-  await page.getByRole('button',{name:'启动研究',exact:true}).click();await dialog.getByLabel('本任务请求上限').fill('1');await dialog.getByRole('button',{name:'开始执行',exact:true}).click();await expect(page.getByTestId('run-card')).toContainText('本次执行完成',{timeout:15000});await expect(page.getByLabel('请求额度与调用账本')).toContainText('剩余 1 / 2');await page.getByText('查看请求记录',{exact:true}).click();await expect(page.locator('.ledger')).toContainText('模拟执行');await expect(page.locator('.ledger')).toContainText('已使用')
-  await page.getByText('执行记录与输入版本',{exact:true}).click();await page.getByRole('button',{name:'查看本次研究产物',exact:true}).click();await expect(page.getByLabel('对象详情',{exact:true})).toContainText('模拟执行产物')
+  await page.getByRole('button',{name:'启动研究',exact:true}).click();await dialog.getByLabel('整题累计请求上限').fill('1');await dialog.getByRole('button',{name:'开始执行',exact:true}).click();await expect(page.getByTestId('run-card')).toContainText('本次执行完成',{timeout:15000});await expect(page.getByLabel('请求额度与调用账本')).toContainText('剩余 1 / 2');await page.getByText('查看请求记录',{exact:true}).click();await expect(page.locator('.ledger')).toContainText('模拟执行');await expect(page.locator('.ledger')).toContainText('已使用')
+  await page.getByText('执行记录与输入版本',{exact:true}).click();await page.getByRole('button',{name:'查看本次研究产物',exact:true}).click();await expect(page.getByLabel('对象详情',{exact:true})).toContainText('模拟执行记录')
 })
 
 test('open annotation and review dialogs keep their original target through SSE revision updates',async({page,request})=>{

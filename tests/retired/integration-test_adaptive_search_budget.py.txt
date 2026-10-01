@@ -116,7 +116,9 @@ def test_adaptive_continues_one_route_then_reviews_candidate(app):
             return response
 
     async def scenario():
-        client, _, _, root = await setup(app, config={"budget_policy": "adaptive"}, policy="reviewed_answer")
+        client, _, _, root = await setup(app, config={
+            "budget_policy": "adaptive", "max_routes": 1, "active_routes": 1,
+        }, policy="reviewed_answer")
         solver = ProgressSolver()
         worker = HTTPWorker(client, providers=["deepseek"], provider_factory=lambda _: solver)
         try:
@@ -135,6 +137,35 @@ def test_adaptive_continues_one_route_then_reviews_candidate(app):
                 assert session.get(Run, root["run_id"]).state == "completed"
         finally:
             await client.aclose()
+    asyncio.run(scenario())
+
+
+def test_adaptive_first_pass_gives_each_route_one_attempt_before_continuing(app):
+    class ProgressSolver(Solver):
+        async def generate(self, task):
+            response = await super().generate(task)
+            if task["search_context"]["kind"] == "advance":
+                response["result"].update(body="A route-local result that remains incomplete.",
+                                           actions=[op("report_progress", status="progress")])
+            return response
+
+    async def scenario():
+        client, _, _, _ = await setup(app, config={
+            "budget_policy": "adaptive", "max_routes": 3, "active_routes": 1,
+            "max_route_steps": 2, "route_schedule": "first_pass",
+        })
+        solver = ProgressSolver()
+        worker = HTTPWorker(client, providers=["deepseek"], provider_factory=lambda _: solver)
+        try:
+            for _ in range(4):
+                await worker.run(once=True)
+            advances = [task for task in solver.tasks if task["search_context"]["kind"] == "advance"]
+            # ``Solver`` proposes two route cards. Each receives its first
+            # advance before either one receives a second.
+            assert [task["search_context"]["route"]["ordinal"] for task in advances[:2]] == [0, 1]
+        finally:
+            await client.aclose()
+
     asyncio.run(scenario())
 
 

@@ -22,6 +22,7 @@ from mathagent.persistence.artifacts import (
 from mathagent.persistence.models import (
     Adoption,
     Attempt,
+    Branch,
     CommandReceipt,
     Dependency,
     Event,
@@ -44,6 +45,7 @@ from mathagent.persistence.search_models import (
     SearchSession,
     SearchWork,
 )
+from mathagent.persistence.solver_models import ResearchSession
 from mathagent.persistence.workspace_models import Annotation, ConflictResolution
 from sqlalchemy import or_, select
 
@@ -262,6 +264,20 @@ class ExportService:
             sessions.append(item)
         return required, {"scope": "all_project_search_sessions_at_snapshot", "sessions": sessions}
 
+    def _research_snapshot(self, session, project_id):
+        from mathagent.runtime.service import Runtime
+
+        research = Runtime(self.service).research
+        roots = session.scalars(select(ResearchSession).join(
+            Run, Run.id == ResearchSession.root_run_id).join(Branch, Branch.id == Run.branch_id)
+            .where(Branch.project_id == project_id).order_by(ResearchSession.created_at)).all()
+        snapshots = [research.snapshot(session, root.root_run_id) for root in roots]
+        required = {root.goal_revision_id for root in roots}
+        required.update(given["revision_id"] for root in roots for given in root.config.get("background", []))
+        required.update(session.scalars(select(Revision.id).where(
+            Revision.payload["research_root_id"].as_string().in_([root.root_run_id for root in roots]))))
+        return required, {"scope": "all_project_research_sessions_at_snapshot", "sessions": snapshots}
+
     def create(self, session, payload):
         project = session.get(Project, payload["project_id"])
         if project is None:
@@ -301,6 +317,8 @@ class ExportService:
         required.update(self._runtime_snapshot(session, snapshot))
         search_required, snapshot["search_state"] = self._search_snapshot(session, project.id)
         required.update(search_required)
+        research_required, snapshot["research_state"] = self._research_snapshot(session, project.id)
+        required.update(research_required)
         for conflict in snapshot["conflicts"]:
             required.update(
                 conflict[key]
@@ -556,6 +574,9 @@ def markdown(bundle):
                 "",
             ]
         )
+    if snapshot.get("research_state", {}).get("sessions"):
+        lines.extend(["## 连续研究、工作稿与话题讨论", "", "~~~json",
+                      json_bytes(snapshot["research_state"]).decode().rstrip(), "~~~", ""])
     return "\n".join(lines).encode("utf-8")
 
 
