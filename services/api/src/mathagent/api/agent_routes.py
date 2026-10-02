@@ -85,6 +85,10 @@ class PolicyUpdate(Command):
 
 
 def mount_agent_routes(app, runtime, human, worker, key, command):
+    @app.post("/worker/computations", dependencies=[Depends(worker)])
+    async def refresh_computations():
+        return await asyncio.to_thread(runtime.research.refresh_computations)
+
     @app.get("/runs/{run_id}/research", dependencies=[Depends(human)])
     def research_status(run_id: str):
         with runtime.service.db.sessions() as session:

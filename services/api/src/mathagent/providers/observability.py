@@ -41,6 +41,7 @@ class RequestObservation:
         self.complete = False
         self.usage = {}
         self.provider_request_id = None
+        self.response_metadata = {}
 
     def redact(self, text):
         for secret in self._secrets:
@@ -84,6 +85,8 @@ class RequestObservation:
                 self.usage.pop(next(reversed(self.usage)))
         if isinstance(data.get("id"), str):
             self.provider_request_id = self.redact(data["id"])[:300]
+        if isinstance(data.get("model"), str):
+            self.response_metadata["model"] = self.redact(data["model"])[:300]
 
     def snapshot(self):
         raw_text = self.raw_text
@@ -103,6 +106,7 @@ class RequestObservation:
             "complete": self.complete,
             "usage": copy.deepcopy(self.usage),
             "provider_request_id": self.provider_request_id,
+            "response_metadata": copy.deepcopy(self.response_metadata),
             "call_config": self._safe_value(self.call_config),
         }
 
@@ -115,6 +119,7 @@ def empty_observation():
         "complete": False,
         "usage": {},
         "provider_request_id": None,
+        "response_metadata": {},
         "call_config": {},
     }
 

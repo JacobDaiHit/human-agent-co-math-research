@@ -98,8 +98,8 @@ def test_disabled_capabilities_are_absent_not_described_as_forbidden_roles():
     tools = research.tools_for(compute=False, discussion=False)
     names = {tool["function"]["name"] for tool in tools}
     assert "compute" not in names and "send_message" not in names
-    assign = next(tool for tool in tools if tool["function"]["name"] == "assign_work")
-    assert assign["function"]["parameters"]["properties"]["member"]["enum"] == ["self"]
+    assert "assign_work" not in names
+    assert "continue_research" in names
     assert "verdict" not in research.INSTRUCTION
     assert "completion_requirements" not in research.INSTRUCTION
 

@@ -476,6 +476,8 @@ class AgentRuntime:
         row.complete = bool(observation.get("complete", False))
         row.usage = {k: v for k, v in observation.get("usage", {}).items() if isinstance(v, int) and not isinstance(v, bool) and v >= 0}
         row.provider_request_id = observation.get("provider_request_id")
+        metadata = observation.get("response_metadata") or {}
+        row.response_metadata = {"model": metadata["model"][:300]} if isinstance(metadata.get("model"), str) else {}
         row.result = payload.get("result")
         self.runtime._emit(session, run, "request.observation_saved", {"request_id": request.id, "raw_sha256": row.raw_sha256, "complete": row.complete})
         return 200, {"request_id": row.request_id, "saved": True}

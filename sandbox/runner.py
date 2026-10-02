@@ -26,9 +26,9 @@ def main():
         emit(reason="code_too_large")
         return
     try:
-        timeout = max(1, min(604800, int(os.environ.get("MATHAGENT_TIMEOUT_SECONDS", "5"))))
+        timeout = max(1, min(604800, int(os.environ.get("MATHAGENT_TIMEOUT_SECONDS", "3600"))))
     except ValueError:
-        timeout = 5
+        timeout = 3600
     program = Path("/work/program.py")
     program.write_bytes(code)
     # The untrusted uid needs read access to execute it, but cannot modify the
@@ -40,7 +40,7 @@ def main():
     child = subprocess.Popen(
         command, cwd="/work", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=True, env={"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONIOENCODING": "utf-8"},
-        preexec_fn=lambda: _drop_privileges(timeout),
+        preexec_fn=_drop_privileges,
     )
     stdout, stderr, overflow, timed_out = _collect(child, timeout)
     if timed_out:
@@ -48,12 +48,12 @@ def main():
     elif overflow:
         emit(reason="output_limit_exceeded", stdout=stdout, stderr=stderr)
     else:
-        emit(reason=None if child.returncode == 0 else "program_error",
-             exit_code=child.returncode, stdout=stdout, stderr=stderr)
+        killed = child.returncode is not None and child.returncode < 0
+        emit(reason=None if child.returncode == 0 else "signal_exit" if killed else "program_error",
+             exit_code=child.returncode, signal=-child.returncode if killed else None, stdout=stdout, stderr=stderr)
 
 
-def _drop_privileges(timeout):
-    resource.setrlimit(resource.RLIMIT_CPU, (timeout, timeout + 1))
+def _drop_privileges():
     resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
     os.setgroups([])

@@ -434,6 +434,18 @@ class HTTPWorker:
         stop = stop or asyncio.Event()
         idle_slots = set()
         drained = False
+        observer_stopped = asyncio.Event()
+
+        async def observe_computations():
+            while not observer_stopped.is_set():
+                try:
+                    await self._post("/worker/computations", {})
+                except WorkerAPIError:
+                    log.warning("Computation status unavailable; existing jobs are retained.")
+                try:
+                    await asyncio.wait_for(observer_stopped.wait(), timeout=1)
+                except TimeoutError:
+                    pass
 
         async def slot(index):
             nonlocal drained
@@ -462,7 +474,12 @@ class HTTPWorker:
                 except TimeoutError:
                     pass
 
-        await asyncio.gather(*(slot(index) for index in range(self.concurrency)))
+        observer = asyncio.create_task(observe_computations())
+        try:
+            await asyncio.gather(*(slot(index) for index in range(self.concurrency)))
+        finally:
+            observer_stopped.set()
+            await observer
 
 
 def main():

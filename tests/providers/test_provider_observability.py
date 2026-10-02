@@ -159,6 +159,26 @@ def test_default_parameters_remain_4096_tokens_with_finite_180_second_deadline()
     }
 
 
+def test_response_model_is_separate_from_immutable_requested_model_and_redacted():
+    response = call(lambda request: httpx.Response(200, json=envelope(
+        json.dumps(result()), model="provider-actual-model")))
+    observation = response["observation"]
+    assert observation["call_config"]["model"] == "synthetic-model"
+    assert observation["response_metadata"] == {"model": "provider-actual-model"}
+    missing = call(lambda request: httpx.Response(200, json=envelope(json.dumps(result()))))
+    assert missing["observation"]["response_metadata"] == {}
+    private = call(lambda request: httpx.Response(200, json=envelope(json.dumps(result()), model=SECRET)))
+    assert private["observation"]["response_metadata"] == {"model": "[redacted]"}
+
+
+def test_streamed_model_label_survives_a_later_transport_failure():
+    with pytest.raises(ProviderFailure) as error:
+        call(lambda request: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Chunks([
+            frame("A partial argument", model="provider-streamed-model"), httpx.ReadError("interrupted")
+        ])))
+    assert error.value.observation["response_metadata"] == {"model": "provider-streamed-model"}
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 def test_invalid_json_retains_complete_response_usage_id_and_configuration(streaming):
     raw = '{"mode":"research","body":not valid JSON'

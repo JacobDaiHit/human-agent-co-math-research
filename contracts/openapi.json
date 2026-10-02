@@ -3046,6 +3046,27 @@
         }
       }
     },
+    "/worker/computations": {
+      "post": {
+        "summary": "Refresh Computations",
+        "operationId": "refresh_computations_worker_computations_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
     "/runs/{run_id}/research": {
       "get": {
         "summary": "Research Status",
@@ -5399,6 +5420,7 @@
             "maximum": 16.0,
             "minimum": 1.0,
             "title": "Max Researchers",
+            "description": "Maximum simultaneously executing researchers, including the lead; not a lifetime member count.",
             "default": 4
           },
           "literature": {

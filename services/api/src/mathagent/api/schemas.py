@@ -132,7 +132,7 @@ class RunCreate(Command):
     solver_controller: Literal["legacy", "bounded_search_v1", "continuous_research"] = "continuous_research"
     discussion: bool = True
     research_deadline_seconds: int = Field(default=86400, ge=1, le=MAX_RESEARCH_SECONDS)
-    max_researchers: int = Field(default=4, ge=1, le=16)
+    max_researchers: int = Field(default=4, ge=1, le=16, description="Maximum simultaneously executing researchers, including the lead; not a lifetime member count.")
     literature: bool = True
     search_config: SearchConfig = Field(default_factory=SearchConfig)
 

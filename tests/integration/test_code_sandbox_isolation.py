@@ -69,7 +69,7 @@ def test_escaped_process_and_closed_pipes_cannot_defeat_timeout(sandbox):
 def test_output_is_bounded_and_program_error_is_not_success(sandbox):
     flood = sandbox.execute("isolation", "output-flood", "while True: print('x' * 8192)", 2)
     assert not flood["ok"] and flood["reason"] == "output_limit_exceeded", flood
-    assert len(flood["stdout"].encode()) <= 32768
+    assert len(flood["stdout"].encode()) <= 1048576
     failed = sandbox.execute("isolation", "program-error", "raise ValueError('synthetic failure')", 2)
     assert not failed["ok"] and failed["reason"] == "program_error", failed
 
@@ -111,6 +111,18 @@ def test_human_stop_cancels_only_this_researchs_background_computations(sandbox)
     assert len(stopped) == 1 and stopped[0]["reason"] == "cancelled"
     assert sandbox.poll("isolation", other["job_id"])["status"] == "running"
     sandbox.cancel("isolation", other["job_id"])
+
+
+def test_same_computation_can_use_more_than_five_cpu_seconds_and_reports_signals(sandbox):
+    code = "import time\nstarted=time.process_time()\nwhile time.process_time()-started < 6: pass\nprint('CPU_WORK_COMPLETE')"
+    job = sandbox.execute("isolation", "cpu-work", code, 30, wait_seconds=0)
+    assert job["status"] == "running"
+    restarted = CodeSandbox(sandbox.database_path, sandbox.image_id)
+    result = restarted.wait("isolation", job["job_id"], 40)
+    assert result["ok"] and result["stdout"].strip() == "CPU_WORK_COMPLETE", result
+    killed = sandbox.execute("isolation", "signal-exit", "import os, signal\nos.kill(os.getpid(), signal.SIGXCPU)", 5)
+    assert not killed["ok"] and killed["reason"] == "signal_exit", killed
+    assert killed["exit_code"] == -24 and killed["signal"] == 24
 
 
 def test_benchmark_api_receives_pinned_image_without_model_dispatch(tmp_path):

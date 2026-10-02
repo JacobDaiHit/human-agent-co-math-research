@@ -1,14 +1,17 @@
 """Resource and input tests only: synthetic providers do not evaluate mathematics."""
 import asyncio
+import copy
 import json
 from collections import defaultdict
 
 import httpx
 import pytest
 from mathagent.persistence.agent_models import AgentRun
-from mathagent.persistence.models import Revision
+from mathagent.persistence.models import Attempt, Project, Revision
+from mathagent.providers import research
 from mathagent.providers.remote import DeepSeekProvider, ProviderConfig
 from mathagent.runtime.worker import HTTPWorker
+from mathagent.tools.code_sandbox import CodeSandbox
 from sqlalchemy import select
 from test_continuous_research import app as app
 from test_continuous_research import exercise, output, read, setup, worker_write, write
@@ -165,9 +168,9 @@ def test_named_team_members_first_work_independently_then_message_each_other(app
             assert results[0]["result"]["materials"] == []
             await worker_write(client, f"/attempts/{task['attempt_id']}/research-context", {"token": task["token"]})
         results = await save_turn(client, lead, "Organize a concrete discussion.",
-            ("assign_work", {"member": "gamma", "goal": "Over the chosen team size."}),
+            ("assign_work", {"member": "gamma", "goal": "Fresh work after earlier independent attempts."}),
             ("assign_work", {"member": "alpha", "goal": "Discuss your derivation with beta."}))
-        assert results[0]["result"]["error"] == "tool_arguments"
+        assert results[0]["result"]["member"] == "gamma"
         alpha = (await worker_write(client, "/worker/claim-next", {"providers": ["fake"]}))["task"]
         assert alpha["research_member"] == "alpha"
         assert "send_message" in {tool["function"]["name"] for tool in alpha["tools"]}
@@ -179,7 +182,7 @@ def test_named_team_members_first_work_independently_then_message_each_other(app
         await save_turn(client, beta, "A reply with actual mathematics.", ("finish_work", {}))
         await save_turn(client, lead, "Organized result.", ("submit_solution", {"outcome": "unresolved"}))
         state = await read(client, f"/runs/{run['run_id']}/research")
-        assert {member["name"] for member in state["members"]} == {"lead", "alpha", "beta"}
+        assert {member["name"] for member in state["members"]} == {"lead", "alpha", "beta", "gamma"}
         assert any(message["sender_run_id"] == peers["alpha"]["run_id"]
                    and message["recipient_run_id"] == peers["beta"]["run_id"]
                    for message in state["messages"])
@@ -464,4 +467,189 @@ def test_assigning_a_waiting_peer_a_new_goal_releases_its_old_wait_and_continues
         assert peer["run_id"] not in state["session"]["config"]["waiting_for"]
         old = next(work for work in state["work"] if work["id"] == peer["research_work_id"])
         assert old["state"] == "replaced"
+    exercise(app, scenario)
+
+
+def test_one_continuation_saves_note_goal_materials_and_only_deliberately_reopens(app):
+    async def scenario(client):
+        _, run = await setup(client)
+        task = (await worker_write(client, "/worker/claim-next", {"providers": ["fake"]}))["task"]
+        saved = await save_turn(client, task, "Long derivation is retained separately.",
+            ("save_note", {"scope": "material", "body": "SELECTED_FULL_DERIVATION"}),
+            ("save_note", {"scope": "shared", "body": "PUBLIC_NOT_SELECTED"}))
+        ref = saved[0]["result"]["ref"]
+        before = (await worker_write(client, f"/attempts/{task['attempt_id']}/research-context",
+            {"token": task["token"]}))["task"]
+        await save_turn(client, before, "Choose the next mathematical question.", ("continue_research", {
+            "note": "CURRENT_NOTE", "goal": "NEXT_LOCAL_QUESTION", "materials": [ref]}))
+        continued = (await worker_write(client, f"/attempts/{task['attempt_id']}/research-context",
+            {"token": task["token"]}))["task"]
+        assert continued["research_dialogue_id"] == before["research_dialogue_id"]
+        assert continued["conversation"][:len(before["conversation"])] == before["conversation"]
+        assert "NEXT_LOCAL_QUESTION" in json.dumps(continued["conversation"])
+        first_note = (await read(client, f"/runs/{run['run_id']}/research"))["members"][0]["personal_note"]
+        await save_turn(client, continued, "Change the focus without deleting mathematics.", ("continue_research", {
+            "note": "REOPENED_NOTE", "materials": [ref], "new_dialogue": True}))
+        reopened = (await worker_write(client, f"/attempts/{task['attempt_id']}/research-context",
+            {"token": task["token"]}))["task"]
+        assert reopened["research_dialogue_id"] != continued["research_dialogue_id"]
+        visible = json.dumps(reopened["conversation"])
+        assert "REOPENED_NOTE" in visible and "SELECTED_FULL_DERIVATION" in visible
+        assert "PUBLIC_NOT_SELECTED" not in visible
+        state = await read(client, f"/runs/{run['run_id']}/research")
+        assert state["members"][0]["personal_note"]["object_id"] == first_note["object_id"]
+        with app.state.database.sessions() as session:
+            assert session.get(Revision, first_note["id"]).body == "CURRENT_NOTE"
+        await save_turn(client, reopened, "", ("submit_solution", {
+            "outcome": "solved", "body": "FULL_PROOF_ONLY_SUBMITTED_ONCE"}))
+        state = await read(client, f"/runs/{run['run_id']}/research")
+        assert state["solution"]["body"] == "FULL_PROOF_ONLY_SUBMITTED_ONCE"
+        assert state["session"]["answer"] is None
+        finished = next(work for work in state["work"] if work["output_revision_id"] == state["solution"]["id"])
+        assert finished["state"] == "completed"
+        assert (await read(client, f"/runs/{run['run_id']}/budget"))["spent"] == 4
+    exercise(app, scenario)
+
+
+def test_concurrency_limit_is_not_a_lifetime_member_limit(app):
+    async def scenario(client):
+        _, run = await setup(client, max_researchers=2)
+        lead = (await worker_write(client, "/worker/claim-next", {"providers": ["fake"]}))["task"]
+        await save_turn(client, lead, "Request different approaches.", *[
+            ("assign_work", {"member": name, "goal": "Independent local question", "independent": True})
+            for name in ("alpha", "beta", "gamma")])
+        for name in ("alpha", "beta", "gamma"):
+            peer = (await worker_write(client, "/worker/claim-next", {"providers": ["fake"]}))["task"]
+            assert peer["research_member"] == name
+            blocked = await worker_write(client, "/worker/claim-next", {"providers": ["fake"]})
+            assert blocked["task"] is None and blocked["work_pending"]
+            await save_turn(client, peer, "", ("finish_work", {
+                "body": name + " full derivation", "summary": name + " summary"}))
+            await worker_write(client, f"/attempts/{peer['attempt_id']}/research-context", {"token": peer["token"]})
+        await save_turn(client, lead, "Need a fresh independent approach.",
+            ("assign_work", {"member": "delta", "goal": "New independent question", "independent": True}))
+        fresh = (await worker_write(client, "/worker/claim-next", {"providers": ["fake"]}))["task"]
+        assert fresh["research_member"] == "delta"
+        state = await read(client, f"/runs/{run['run_id']}/research")
+        assert len(state["members"]) == 5
+        alpha = next(member for member in state["members"] if member["name"] == "alpha")
+        work = next(work for work in state["work"] if work["member_run_id"] == alpha["run_id"])
+        with app.state.database.sessions() as session:
+            assert session.get(Revision, work["output_revision_id"]).body == "alpha full derivation"
+        message = next(message for message in state["messages"] if message["sender_run_id"] == alpha["run_id"])
+        assert message["body"].startswith("alpha summary")
+        assert "revision:" + work["output_revision_id"] in message["body"]
+    exercise(app, scenario)
+
+
+def test_independent_explicit_givens_and_shared_updates_have_distinct_information_scope(app):
+    async def scenario(client):
+        _, run = await setup(client)
+        lead = (await worker_write(client, "/worker/claim-next", {"providers": ["fake"]}))["task"]
+        materials = await save_turn(client, lead, "Set a neutral local problem.",
+            ("save_note", {"scope": "material", "body": "EXPLICIT_NEUTRAL_GIVEN"}),
+            ("save_note", {"scope": "shared", "body": "PRIVATE_INITIAL_CONCLUSION"}))
+        await save_turn(client, lead, "Choose two information scopes.",
+            ("assign_work", {"member": "independent", "goal": "Neutral problem", "independent": True,
+                              "materials": [materials[0]["result"]["ref"]]}),
+            ("assign_work", {"member": "targeted", "goal": "Examine the current argument"}))
+        peers = {}
+        for _ in range(2):
+            peer = (await worker_write(client, "/worker/claim-next", {"providers": ["fake"]}))["task"]
+            peers[peer["research_member"]] = peer
+        visible = json.dumps(peers["independent"]["conversation"])
+        assert "EXPLICIT_NEUTRAL_GIVEN" in visible and "PRIVATE_INITIAL_CONCLUSION" not in visible
+        await save_turn(client, lead, "Update the public research note.",
+            ("save_note", {"scope": "shared", "body": "NEW_PUBLIC_VERSION"}))
+        updated = {}
+        for name, peer in peers.items():
+            updated[name] = (await worker_write(client, f"/attempts/{peer['attempt_id']}/research-context",
+                {"token": peer["token"]}))["task"]
+            assert updated[name]["conversation"][:len(peer["conversation"])] == peer["conversation"]
+        assert "公共工作稿已有新版本" in json.dumps(updated["targeted"]["conversation"], ensure_ascii=False)
+        assert "公共工作稿已有新版本" not in json.dumps(updated["independent"]["conversation"], ensure_ascii=False)
+        state = await read(client, f"/runs/{run['run_id']}/research")
+        notices = [message for message in state["messages"] if message["topic"] == "公共工作稿更新"]
+        assert {message["recipient_run_id"] for message in notices} == {peers["targeted"]["run_id"]}
+    exercise(app, scenario)
+
+
+@pytest.mark.parametrize("paused", [False, True])
+def test_background_completion_is_not_model_polling_and_respects_human_pause(app, monkeypatch, paused):
+    job_id, completed, executions = "c" * 64, False, []
+    full_output = "FULL_COMPUTATION_RESULT" * 1000
+
+    def execute(self, project_id, execution_id, code, timeout, **options):
+        executions.append(execution_id)
+        assert timeout == 3600 and options["wait_seconds"] == 2
+        return {"job_id": job_id, "status": "running", "code": code}
+
+    def poll(self, project_id, requested_job):
+        assert requested_job == job_id
+        return {"job_id": job_id, "status": "complete" if completed else "running",
+                "ok": completed, "reason": None, "stdout": full_output if completed else ""}
+
+    monkeypatch.setattr(CodeSandbox, "execute", execute)
+    monkeypatch.setattr(CodeSandbox, "poll", poll)
+
+    async def scenario(client):
+        nonlocal completed
+        project, run = await setup(client, discussion=False)
+        with app.state.database.sessions.begin() as session:
+            row = session.get(Project, project["project_id"])
+            row.policies = {**row.policies, "agent_operations": ["run_code"],
+                            "code_sandbox": {"enabled": True, "image_id": "fixture"}}
+        task = (await worker_write(client, "/worker/claim-next", {"providers": ["fake"]}))["task"]
+        await save_turn(client, task, "Start one calculation.", ("compute", {"code": "print(1)"}))
+        await save_turn(client, task, "Wait without buying more model requests.",
+            ("poll_computation", {"job_id": job_id, "wait": True}))
+        yielded = await worker_write(client, f"/attempts/{task['attempt_id']}/research-context", {"token": task["token"]})
+        assert not yielded["continue"] and yielded["state"] == "waiting_discussion"
+        for _ in range(3):
+            assert (await worker_write(client, "/worker/computations", {}))["completed"] == 0
+        if paused:
+            await write(client, f"/runs/{run['run_id']}/interventions", {"action": "pause"})
+        completed = True
+        assert (await worker_write(client, "/worker/computations", {}))["completed"] == 1
+        assert (await worker_write(client, "/worker/computations", {}))["observed"] == 0
+        state = await read(client, f"/runs/{run['run_id']}/research")
+        assert (await read(client, f"/runs/{run['run_id']}/budget"))["spent"] == 2
+        assert len(executions) == 1
+        assert len([message for message in state["messages"] if message["topic"] == "计算任务完成"]) == 1
+        with app.state.database.sessions() as session:
+            revision = session.get(Revision, state["computations"][0]["ref"].removeprefix("revision:"))
+            assert json.loads(revision.body)["stdout"] == full_output
+        if paused:
+            assert state["session"]["state"] == "paused" and state["members"][0]["state"] == "paused"
+            await write(client, f"/runs/{run['run_id']}/resume", {})
+        resumed = (await worker_write(client, "/worker/claim-next", {"providers": ["fake"]}))["task"]
+        assert resumed["research_dialogue_id"] == task["research_dialogue_id"]
+        assert "FULL_COMPUTATION_RESULT" in json.dumps(resumed["conversation"])
+    exercise(app, scenario)
+
+
+def test_saved_tool_catalog_survives_source_upgrade_until_a_new_dialogue(app, monkeypatch):
+    async def scenario(client):
+        _, _ = await setup(client)
+        task = (await worker_write(client, "/worker/claim-next", {"providers": ["fake"]}))["task"]
+        await save_turn(client, task, "Already purchased mathematical progress.", ("read_material", {"ref": "original"}))
+        original = copy.deepcopy(task["tools"])
+        tools_for = research.tools_for
+
+        def upgraded(**options):
+            tools = tools_for(**options)
+            tools[0]["function"]["description"] = "New source description"
+            return tools
+
+        monkeypatch.setattr(research, "tools_for", upgraded)
+        with app.state.database.sessions.begin() as session:
+            attempt = session.get(Attempt, task["attempt_id"])
+            checkpoint = copy.deepcopy(attempt.checkpoint)
+            checkpoint["research_dialogue"]["fixed"].pop("capabilities")
+            attempt.checkpoint = checkpoint
+        updated = (await worker_write(client, f"/attempts/{task['attempt_id']}/research-context",
+            {"token": task["token"]}))["task"]
+        assert updated["tools"] == original
+        assert updated["research_dialogue_id"] == task["research_dialogue_id"]
+        assert updated["research_system"] == task["research_system"]
     exercise(app, scenario)

@@ -30,7 +30,7 @@ def main():
                         help="direct: one call; self_refine: fixed refinement; independent_samples: independent vote")
     parser.add_argument("--solver-controller", choices=["continuous_research"], default="continuous_research")
     parser.add_argument("--no-discussion", action="store_true", help="Disable the research peer for a same-budget comparison")
-    parser.add_argument("--max-researchers", type=int, default=4, help="Maximum team size, including the lead; shared case budget")
+    parser.add_argument("--max-researchers", type=int, default=4, help="Maximum simultaneously executing researchers, including the lead; historical member count is unlimited")
     parser.add_argument("--cumulative-output-token-budget", type=int,
                         help="Shared output/thinking token cap; unknown usage keeps its reservation. Input tokens reported separately.")
     parser.add_argument("--case-order-seed", type=int, default=0,

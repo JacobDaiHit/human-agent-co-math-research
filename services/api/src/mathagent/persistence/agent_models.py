@@ -51,5 +51,6 @@ class ProviderCall(Base):
     complete: Mapped[bool] = mapped_column(Boolean, default=False)
     usage: Mapped[dict] = mapped_column(JSON, default=dict)
     provider_request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    response_metadata: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}")
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[str] = mapped_column(String, default=now)

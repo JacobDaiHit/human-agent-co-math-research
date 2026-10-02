@@ -12,7 +12,7 @@ import pytest
 from mathagent.api.app import create_app
 from mathagent.exports.service import ExportService
 from mathagent.persistence.models import Attempt, Project, Revision, RevisionParent, Run
-from mathagent.persistence.solver_models import ResearchMember
+from mathagent.persistence.solver_models import ResearchMember, ResearchSession
 from mathagent.providers.remote import DeepSeekProvider, ProviderConfig, ProviderFailure
 from mathagent.runtime.service import Runtime
 from mathagent.runtime.worker import HTTPWorker
@@ -70,7 +70,7 @@ def exercise(app, scenario):
 def test_dependent_computations_use_one_attempt_and_submit_without_review(app, monkeypatch):
     attempts, code = [], []
 
-    def computation(self, project_id, execution_id, source, timeout):
+    def computation(self, project_id, execution_id, source, timeout, **options):
         code.append(source)
         return {"ok": True, "stdout": "2" if len(code) == 1 else "5"}
 
@@ -427,7 +427,7 @@ def test_independent_peer_then_two_way_topic_discussion_without_consensus_gate(a
                 return output("LEAD_SECRET_CONCLUSION：主研究者自己的初步判断。",
                     ("save_note", {"scope": "shared", "body": "LEAD_SECRET_CONCLUSION"}),
                     ("assign_work", {"member": "peer", "goal": "独立从原题研究变量范围。",
-                                     "independent": True, "materials": ["shared_note"]}))
+                                     "independent": True, "materials": []}))
             if number == 2:
                 return output("请求同伴研究后交流。", ("send_message", {
                     "recipient": "peer", "topic": "变量范围", "body": "LEAD_SECRET_CONCLUSION", "wait": True}))
@@ -508,7 +508,7 @@ def test_computation_does_not_hold_the_database_write_lock(app, monkeypatch):
     started, release = threading.Event(), threading.Event()
     calls = 0
 
-    def computation(self, project_id, execution_id, source, timeout):
+    def computation(self, project_id, execution_id, source, timeout, **options):
         started.set()
         assert release.wait(5), "A separate database write was blocked by computation"
         return {"ok": True, "stdout": "2"}
@@ -536,4 +536,104 @@ def test_computation_does_not_hold_the_database_write_lock(app, monkeypatch):
             release.set()
         await worker
         assert (await read(client, f"/runs/{run['run_id']}/research"))["session"]["answer"] == "2"
+    exercise(app, scenario)
+
+
+def test_returned_model_label_is_saved_without_overwriting_frozen_requested_model(app):
+    alias, returned = "synthetic-api-alias", "synthetic-provider-version"
+
+    def transport(request):
+        assert json.loads(request.content)["model"] == alias
+        return httpx.Response(200, json={"model": returned, "id": "synthetic-model-receipt",
+            "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28},
+            "choices": [{"message": output("", ("submit_solution", {
+                "outcome": "solved", "body": "Synthetic full proof"}))["result"]["message"],
+                "finish_reason": "tool_calls"}]})
+
+    async def scenario(client):
+        _, run = await setup(client)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as model_client:
+            provider = DeepSeekProvider(ProviderConfig("deepseek", "synthetic-unused", alias,
+                "https://mock.invalid", True), model_client)
+            await HTTPWorker(client, provider_factory=lambda _: provider, fake_delay_seconds=0).run(once=True)
+        calls = (await read(client, f"/runs/{run['run_id']}/calls"))["calls"]
+        assert len(calls) == 1
+        assert calls[0]["call_config"]["model"] == alias
+        assert calls[0]["response_metadata"] == {"model": returned}
+        frozen = calls[0]["call_config"]
+        with app.state.database.engine.begin() as connection:
+            connection.exec_driver_sql("ALTER TABLE provider_calls DROP COLUMN response_metadata")
+            connection.exec_driver_sql("UPDATE alembic_version SET version_num='0009_continuous_research'")
+        app.state.database.migrate()
+        historical = (await read(client, f"/runs/{run['run_id']}/calls"))["calls"][0]
+        assert historical["response_metadata"] == {} and historical["call_config"] == frozen
+        assert historical["raw_text"] == calls[0]["raw_text"]
+    exercise(app, scenario)
+
+
+def test_worker_notifies_finished_background_calculation_without_paid_polling(app, monkeypatch):
+    job_id, polls, calls, attempts = "e" * 64, 0, 0, []
+
+    def computation(self, project_id, execution_id, source, timeout, **options):
+        return {"job_id": job_id, "status": "running", "code": source}
+
+    def poll(self, project_id, requested_job):
+        nonlocal polls
+        polls += 1
+        done = polls >= 4
+        return {"job_id": job_id, "status": "complete" if done else "running",
+                "ok": done, "reason": None, "stdout": "BACKGROUND_RESULT" if done else ""}
+
+    monkeypatch.setattr(CodeSandbox, "execute", computation)
+    monkeypatch.setattr(CodeSandbox, "poll", poll)
+
+    class Model:
+        async def generate(self, task):
+            nonlocal calls
+            calls += 1
+            attempts.append(task["attempt_id"])
+            if calls == 1:
+                return output("Start a computation.", ("compute", {"code": "print(1)"}))
+            if calls == 2:
+                return output("Let the backend wait.", ("poll_computation", {"job_id": job_id, "wait": True}))
+            assert calls == 3 and "BACKGROUND_RESULT" in json.dumps(task["conversation"])
+            return output("", ("submit_solution", {"body": "Proof based on the saved computation", "outcome": "solved"}))
+
+    async def scenario(client):
+        project, run = await setup(client, discussion=False)
+        with app.state.database.sessions.begin() as session:
+            row = session.get(Project, project["project_id"])
+            row.policies = {**row.policies, "agent_operations": ["run_code"],
+                            "code_sandbox": {"enabled": True, "image_id": "fixture"}}
+        worker = HTTPWorker(client, provider_factory=lambda _: Model(), fake_delay_seconds=0, poll_seconds=0.05)
+        await asyncio.wait_for(worker.run(once=True), timeout=15)
+        state = await read(client, f"/runs/{run['run_id']}/research")
+        assert state["session"]["state"] == "completed" and calls == 3
+        assert attempts[0] == attempts[1] and attempts[2] != attempts[1]
+        assert len(state["computations"]) == 1 and state["computations"][0]["status"] == "complete"
+    exercise(app, scenario)
+
+
+def test_late_background_result_cannot_recreate_permanently_deleted_material(app):
+    job_id = "d" * 64
+
+    async def scenario(client):
+        project, run = await setup(client)
+        with app.state.database.sessions.begin() as session:
+            root = session.get(ResearchSession, run["run_id"])
+            root.config = {**root.config, "computations": {job_id: {"job_id": job_id,
+                "run_id": run["run_id"], "project_id": project["project_id"], "image_id": "fixture", "status": "running"}}}
+        preview = await read(client, f"/objects/{project['object_id']}/deletion-preview")
+        await write(client, f"/objects/{project['object_id']}/permanent-delete", {
+            "preview_token": preview["preview_token"], "confirmation": "永久删除"})
+        runtime = Runtime(app.state.service)
+        _, receipt = app.state.service.execute("research.computation_ready", "synthetic-late-result", {
+            "root_id": run["run_id"], "job_id": job_id,
+            "result": {"status": "complete", "stdout": "PRIVATE_LATE_COMPUTATION_RESULT"}},
+            runtime.research._computation_ready)
+        assert receipt == {"saved": False}
+        state = await read(client, f"/runs/{run['run_id']}/research")
+        assert state["session"]["state"] == "cancelled" and state["computations"] == []
+        with app.state.database.sessions() as session:
+            assert not session.scalar(select(Revision.id).where(Revision.body.contains("PRIVATE_LATE_COMPUTATION_RESULT")))
     exercise(app, scenario)

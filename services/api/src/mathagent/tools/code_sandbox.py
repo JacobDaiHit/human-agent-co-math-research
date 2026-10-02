@@ -7,6 +7,7 @@ never controls an image, a path, a mount, or the Docker command line.
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -15,7 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 
-TOOL_VERSION = "docker-python-sandbox-v2"
+TOOL_VERSION = "docker-python-sandbox-v3"
 MAX_CODE_BYTES = 64 * 1024
 MAX_HOST_DIAGNOSTIC_BYTES = 32 * 1024
 _DIGEST = re.compile(r"(?:^|@)sha256:[0-9a-f]{64}$")
@@ -47,83 +48,46 @@ class CodeSandbox:
         except (OSError, subprocess.TimeoutExpired):
             return {"ready": False, "reason": "docker_unavailable", "image_id": self.image_id}
         if inspected.returncode:
-            return {"ready": False, "reason": "image_not_local", "image_id": self.image_id}
+            try:
+                engine = subprocess.run(["docker", "version", "--format", "{{.Server.Version}}"],
+                    capture_output=True, text=True, timeout=3, check=False, env=_docker_environment())
+            except (OSError, subprocess.TimeoutExpired):
+                engine = None
+            reason = "image_not_local" if engine and engine.returncode == 0 and engine.stdout.strip() else "docker_unavailable"
+            return {"ready": False, "reason": reason, "image_id": self.image_id}
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", inspected.stdout.strip()):
             return {"ready": False, "reason": "image_inspect_invalid", "image_id": self.image_id}
         return {"ready": True, "reason": None, "image_id": self.image_id}
 
-    def execute(self, project_id, attempt_id, code, timeout_seconds=5):
-        """Reserve once, run once, and return a durable result or an explicit unknown."""
-        if not isinstance(project_id, str) or not project_id or not isinstance(attempt_id, str) or not attempt_id:
+    def execute(self, project_id, attempt_id, code, timeout_seconds=3600, *, research_root_id=None, wait_seconds=None):
+        """Quick and long calculations share one durable execution."""
+        if not project_id or not attempt_id:
             return _failure("invalid_identity")
         if not isinstance(code, str) or len(code.encode("utf-8")) > MAX_CODE_BYTES:
             return _failure("code_too_large")
-        timeout = _bounded_timeout(timeout_seconds)
-        code_hash = _hash(code.encode("utf-8"))
-        provenance = {"tool_version": TOOL_VERSION, "image_id": self.image_id, "timeout_seconds": timeout,
-                      "code_hash": code_hash, "limits": {"code_bytes": MAX_CODE_BYTES, "output_bytes": 32768,
-                      "timeout_seconds": timeout}}
-        job_key = _hash(json.dumps([project_id, attempt_id, provenance], sort_keys=True).encode("utf-8"))
-        project_path = self.jobs_path / _hash(project_id.encode("utf-8"))
-        journal_path = project_path / (job_key + ".json")
-        try:
-            for path in (self.jobs_path, project_path):
-                _plain(path, directory=True)
-            _plain(journal_path)
-        except OSError:
+        timeout = max(1, min(604800, int(timeout_seconds)))
+        # Read v2 synchronous receipts without relaunching an interrupted job.
+        old_provenance = {"tool_version": "docker-python-sandbox-v2", "image_id": self.image_id,
+            "timeout_seconds": timeout, "code_hash": _hash(code.encode()),
+            "limits": {"code_bytes": MAX_CODE_BYTES, "output_bytes": 32768, "timeout_seconds": timeout}}
+        key = _hash(json.dumps([project_id, attempt_id, old_provenance], sort_keys=True).encode())
+        path = self._job_path(project_id, key)
+        if path is None:
             return _failure("journal_unavailable")
-        if journal_path.exists() and (journal_path.is_symlink() or _read_json(journal_path) is None):
-            return _failure("execution_unknown", code_hash=code_hash)
-        existing = _read_json(journal_path)
-        if existing is not None:
-            return _duplicate(existing, code_hash)
+        if path.exists():
+            return _duplicate(_read_json(path), old_provenance["code_hash"])
+        result = self.start(project_id, attempt_id, code, timeout, research_root_id=research_root_id)
+        if result.get("status") != "running":
+            return result
+        return self.wait(project_id, result["job_id"], timeout + 2 if wait_seconds is None else wait_seconds)
 
-        ready = self.status()
-        if not ready["ready"]:
-            return _failure(ready["reason"], image_id=ready["image_id"])
-
-        try:
-            if self.jobs_path.is_symlink() or project_path.is_symlink():
-                return _failure("journal_unavailable")
-            self.jobs_path.mkdir(parents=True, exist_ok=True)
-            if self.jobs_path.is_symlink():
-                return _failure("journal_unavailable")
-            project_path.mkdir(exist_ok=True)
-            if project_path.is_symlink():
-                return _failure("journal_unavailable")
-        except OSError:
-            return _failure("journal_unavailable")
-        # Reserve this execution identity once. Resource bounds belong to each
-        # execution and the research budget, not a lifetime project counter.
-        slot, newly_reserved = self._reserve_slot(project_path, job_key)
-        if slot is None:
-            return _failure("journal_unavailable")
-        if not newly_reserved:
-            return _failure("execution_unknown", code_hash=code_hash)
-        record = {
-            "version": TOOL_VERSION,
-            "project_id": project_id,
-            "attempt_id": attempt_id,
-            "code": code,
-            "code_hash": code_hash,
-            "job_key": job_key,
-            "provenance": provenance,
-            "budget_slot": slot.name,
-            "status": "reserved",
-            "created_at": time.time(),
-        }
-        if not _atomic_json(journal_path, record):
-            existing = _read_json(journal_path)
-            return _duplicate(existing, code_hash) if existing else _failure("execution_unknown")
-
-        result = self._run(code, timeout)
-        result["provenance"] = provenance
-        record["status"] = "complete"
-        record["result"] = result
-        record["completed_at"] = time.time()
-        if not _replace_json(journal_path, record):
-            return _failure("execution_unknown", image_id=self.image_id, code_hash=code_hash)
-        return result
+    def wait(self, project_id, job_id, seconds):
+        deadline = time.monotonic() + max(0, seconds)
+        while True:
+            result = self.poll(project_id, job_id)
+            if result.get("status") != "running" or time.monotonic() >= deadline:
+                return result
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
     def erase_project(self, project_id):
         """Redact source and output while retaining hashes and consumed budget slots."""
@@ -176,7 +140,14 @@ class CodeSandbox:
         path = self._job_path(project_id, job_id)
         if path is None:
             return _failure("journal_unavailable")
+        old_provenance = {**provenance, "tool_version": "docker-python-sandbox-v2"}
+        old_job_id = _hash(json.dumps([project_id, execution_id, old_provenance], sort_keys=True).encode())
+        old_path = self._job_path(project_id, old_job_id)
+        if old_path and old_path.exists():
+            return self.poll(project_id, old_job_id)
         existing = _read_json(path)
+        if path.exists() and existing is None:
+            return _failure("execution_unknown", job_id=job_id)
         if existing:
             return self.poll(project_id, job_id)
         ready = self.status()
@@ -212,11 +183,10 @@ class CodeSandbox:
                 source.write_text("MATHAGENT_SOURCE_BASE64=" + base64.b64encode(code.encode("utf-8")).decode("ascii"), encoding="ascii")
                 command[2:2] = ["--env-file", str(source)]
                 self._docker(command)
-            record["status"] = "starting"
-            _replace_json(path, record)
             self._docker(["docker", "start", container])
-            record["status"] = "running"
-            _replace_json(path, record)
+            # The durable intent already identifies this container. Its live
+            # state comes from Docker; intermediate file replacements add no
+            # recovery information and contend with concurrent readers.
         except (OSError, subprocess.SubprocessError):
             # An ambiguous start is queried, never automatically launched twice.
             return self.poll(project_id, job_id)
@@ -259,9 +229,10 @@ class CodeSandbox:
                 return {"job_id": job_id, "status": "not_started", "reason": "start_interrupted",
                         "detail": _cap(state.get("Error"))}
             output = self._docker(["docker", "logs", record["container"]])
-            result = json.loads(output)
+            result = _failure("memory_limit_exceeded") if state.get("OOMKilled") else json.loads(output)
             result.update(ok=result.get("reason") is None, code=record.get("code"),
-                          provenance=record["provenance"])
+                          provenance=record["provenance"], image_id=record["provenance"]["image_id"],
+                          tool_version=record["provenance"]["tool_version"])
         except (OSError, subprocess.SubprocessError, ValueError):
             return _failure("execution_unknown", job_id=job_id)
         record.update(status="complete", result=result, completed_at=time.time())
@@ -306,47 +277,6 @@ class CodeSandbox:
                 results.append(self.cancel(project_id, record["job_key"]))
         return results
 
-    def _reserve_slot(self, project_path, job_key):
-        slot = project_path / ("execution-" + job_key)
-        try:
-            fd = os.open(slot, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            return slot, False
-        except OSError:
-            return None, False
-        with os.fdopen(fd, "w", encoding="ascii") as handle:
-            handle.write(job_key)
-            handle.flush()
-            os.fsync(handle.fileno())
-        return slot, True
-
-    def _run(self, code, timeout):
-        command = [
-            "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only",
-            "--tmpfs", "/work:rw,noexec,nosuid,nodev,size=16m", "--memory", "256m", "--memory-swap", "256m", "--cpus", "1",
-            "--pids-limit", "32", "--cap-drop", "ALL", "--cap-add", "SETUID", "--cap-add", "SETGID",
-            "--cap-add", "KILL", "--security-opt", "no-new-privileges", "--log-driver", "none", "--user", "0:0", "--workdir", "/work",
-            "-e", f"MATHAGENT_TIMEOUT_SECONDS={timeout}", "-i", self.image_id, "python", "/opt/mathagent/runner.py",
-        ]
-        try:
-            completed = subprocess.run(
-                command, input=code, capture_output=True, text=True, timeout=timeout + 2,
-                check=False, encoding="utf-8", errors="replace", env=_docker_environment(),
-            )
-        except subprocess.TimeoutExpired:
-            return _failure("docker_timeout", image_id=self.image_id)
-        except OSError:
-            return _failure("docker_unavailable", image_id=self.image_id)
-        if completed.returncode:
-            return _failure("container_failed", image_id=self.image_id, stderr=_cap(completed.stderr))
-        try:
-            payload = json.loads(completed.stdout)
-        except (TypeError, json.JSONDecodeError):
-            return _failure("invalid_supervisor_result", image_id=self.image_id, stderr=_cap(completed.stderr))
-        if not isinstance(payload, dict):
-            return _failure("invalid_supervisor_result", image_id=self.image_id)
-        payload.update({"ok": payload.get("reason") is None, "image_id": self.image_id, "tool_version": TOOL_VERSION})
-        return payload
 
 
 def _docker_environment():
@@ -376,13 +306,6 @@ def _failure(reason, **extra):
 
 def _hash(value):
     return hashlib.sha256(value).hexdigest()
-
-
-def _bounded_timeout(value):
-    try:
-        return max(1, min(60, int(value)))
-    except (TypeError, ValueError):
-        return 5
 
 
 def _cap(value):
@@ -427,12 +350,14 @@ def _replace_json(path, value):
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         return True
-    except OSError:
+    except OSError as error:
         if temporary is not None:
             try:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
+        logging.getLogger(__name__).warning("Calculation receipt could not be replaced (errno=%s, winerror=%s)",
+            error.errno, getattr(error, "winerror", None))
         return False
 
 

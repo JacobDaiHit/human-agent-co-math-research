@@ -7,6 +7,7 @@ import time
 import httpx
 from mathagent.evaluation.outcomes import submission, usage_summary
 from mathagent.providers.mathematical_guidance import SOLUTION_SET_GUIDANCE
+from mathagent.providers.observability import RequestObservation
 from mathagent.runtime.completion import boxed_answers
 
 INDEPENDENT_SELECTION_RULE = "independent-single-box-whitespace-vote-earliest-v1"
@@ -76,7 +77,10 @@ async def run_direct_case(case, directory, config, limits, *, transport_factory=
                 usage = value.get("usage") or {}
                 if not isinstance(usage, dict):
                     raise ValueError("Invalid usage object")
-                call.update(state="spent", usage=usage, provider_request_id=value.get("id"))
+                observation = RequestObservation(config)
+                observation.metadata(value)
+                call.update(state="spent", usage=usage, provider_request_id=value.get("id"),
+                            response_metadata=observation.snapshot()["response_metadata"])
                 used = usage.get("completion_tokens")
                 if type(used) is int and 0 <= used <= maximum:
                     occupied_output -= maximum - used
@@ -94,7 +98,8 @@ async def run_direct_case(case, directory, config, limits, *, transport_factory=
                     break
                 final_body = content
                 write_json(directory / f"response-{index + 1}.json", {"body": content, "usage": usage,
-                    "finish_reason": choice["finish_reason"], "provider_request_id": value.get("id")})
+                    "finish_reason": choice["finish_reason"], "provider_request_id": value.get("id"),
+                    "response_metadata": call["response_metadata"]})
                 if limits.solver == "self_refine" and index + 1 < limits.request_budget:
                     messages.extend([{"role": "assistant", "content": content},
                                      {"role": "user", "content": REFINE_INSTRUCTION}])
@@ -177,7 +182,10 @@ async def run_independent_samples_case(case, directory, config, limits, *, trans
                 if not isinstance(value, dict) or not isinstance(value.get("usage") or {}, dict):
                     raise ValueError("Invalid completion object")
                 usage = value.get("usage") or {}
-                call.update(state="spent", usage=usage, provider_request_id=value.get("id"))
+                observation = RequestObservation(config)
+                observation.metadata(value)
+                call.update(state="spent", usage=usage, provider_request_id=value.get("id"),
+                            response_metadata=observation.snapshot()["response_metadata"])
                 used = usage.get("completion_tokens")
                 if type(used) is int and 0 <= used <= maximum:
                     occupied_output -= maximum - used
@@ -196,7 +204,8 @@ async def run_independent_samples_case(case, directory, config, limits, *, trans
                     runtime_terminal = "incomplete_output"
                     continue
                 write_json(directory / f"response-{index + 1}.json", {"body": content, "usage": usage,
-                    "finish_reason": choice["finish_reason"], "provider_request_id": value.get("id")})
+                    "finish_reason": choice["finish_reason"], "provider_request_id": value.get("id"),
+                    "response_metadata": call["response_metadata"]})
                 answers = boxed_answers(content)
                 if len(answers) == 1:
                     candidates.append({"number": index + 1, "body": content,

@@ -185,8 +185,7 @@ def test_no_discussion_ablation_emits_explicit_submission_and_frozen_choice(work
             payload = json.loads(request.content)
             names = [tool["function"]["name"] for tool in payload["tools"]]
             assert "send_message" not in names
-            assign = next(tool["function"] for tool in payload["tools"] if tool["function"]["name"] == "assign_work")
-            assert assign["parameters"]["properties"]["member"]["enum"] == ["self"]
+            assert "assign_work" not in names and "continue_research" in names
             assert SECRET not in json.dumps(payload)
             return completion(r"$1+1=2$, $\boxed{2}$.")
         return httpx.MockTransport(handle)

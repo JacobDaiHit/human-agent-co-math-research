@@ -198,6 +198,7 @@ class DeletionService:
             step.body, step.actions, step.receipt = "", [], {"material_erased": True}
         for research in session.scalars(select(ResearchSession).where(ResearchSession.root_run_id.in_(run_ids))):
             research.answer, research.outcome, research.state = None, None, "cancelled"
+            research.config = {**research.config, "computations": {}, "waiting_for": {}}
         for work in session.scalars(select(ResearchWork).where(ResearchWork.member_run_id.in_(run_ids))):
             work.goal, work.materials, work.state = "", [], "cancelled"
         for message in session.scalars(select(ResearchMessage).where(ResearchMessage.sender_run_id.in_(run_ids))):

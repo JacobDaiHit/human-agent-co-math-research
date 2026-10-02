@@ -46,6 +46,15 @@ class ResearchRuntime:
         member = session.get(ResearchMember, run_id)
         return session.get(ResearchSession, member.root_run_id) if member else None
 
+    def can_claim(self, session, run):
+        root = self.session_for(session, run.id)
+        if not root:
+            return True
+        attempts = session.scalars(select(Attempt).join(ResearchMember,
+            ResearchMember.run_id == Attempt.run_id).where(
+                ResearchMember.root_run_id == root.root_run_id, Attempt.state == "running"))
+        return sum(not self.runtime._expired(row) for row in attempts) < root.config.get("max_researchers", 4)
+
     def inputs_stale(self, session, run, attempt):
         root = self.session_for(session, run.id)
         if not root:
@@ -109,7 +118,7 @@ class ResearchRuntime:
         self._clear_wait(root, member_id)
         for previous in session.scalars(select(ResearchWork).where(
             ResearchWork.member_run_id == member_id, ResearchWork.state.in_(OPEN_WORK))):
-            if previous.state == "waiting" or run.state == "failed":
+            if previous.state in {"waiting", "queued"} or run.state == "failed":
                 previous.state = "replaced"
         work = ResearchWork(root_run_id=root.root_run_id, member_run_id=member_id,
             goal=goal, independent=bool(independent), materials=list(materials))
@@ -132,10 +141,6 @@ class ResearchRuntime:
             ResearchMember.root_run_id == root.root_run_id, ResearchMember.name == name))
         if peer:
             return peer
-        count = session.scalar(select(func.count()).select_from(ResearchMember).where(
-            ResearchMember.root_run_id == root.root_run_id))
-        if count >= root.config.get("max_researchers", 4):
-            raise ValueError("The configured research team is full; reuse an existing member")
         lead = session.get(Run, root.root_run_id)
         config = session.get(AgentRun, lead.id)
         run = Run(branch_id=lead.branch_id, goal_object_id=lead.goal_object_id,
@@ -206,7 +211,9 @@ class ResearchRuntime:
         if not values["include_previous"]:
             query = query.where(Revision.payload["research_root_id"].as_string() == root.root_run_id)
         if work.independent:
-            query = query.where(Revision.payload["research_member_id"].as_string() == run.id)
+            given = [self._material(session, run, work, ref).id for ref in work.materials]
+            query = query.where(or_(Revision.payload["research_member_id"].as_string() == run.id,
+                                   Revision.id.in_(given)))
         if values["query"]:
             query = query.where(or_(Revision.body.contains(values["query"], autoescape=True),
                 Revision.payload["title"].as_string().contains(values["query"], autoescape=True)))
@@ -251,11 +258,11 @@ class ResearchRuntime:
                 Revision.payload["ref"].as_string() == ref).order_by(Revision.created_at.desc()))
         if not revision or revision.payload.get("deleted"):
             raise ValueError("Material is unavailable")
-        if work.independent and revision.payload.get("research_member_id") != run.id:
+        if work.independent and revision.payload.get("research_member_id") != run.id and ref not in work.materials:
             raise ValueError("This independent work receives the original problem and your own material first")
         return revision
 
-    def _opening(self, session, run, work):
+    def _opening(self, session, run, work, selected_materials=None):
         root = self.session_for(session, run.id)
         original = session.get(Revision, root.goal_revision_id)
         parts = ["原题：\n" + original.body, "当前任务：\n" + work.goal]
@@ -273,17 +280,20 @@ class ResearchRuntime:
             pass
         if work.independent:
             parts.append("这是独立探索。先形成自己的推导或尝试，再结束任务交换材料。")
+            if session.scalar(select(ResearchWork.id).where(ResearchWork.member_run_id == run.id,
+                    ResearchWork.id != work.id, ResearchWork.independent.is_(False)).limit(1)):
+                parts.append("你此前已经参与过合作。此次独立任务不代表你从未见过其他人的观点；需要全新视角时邀请新成员。")
         else:
-            for ref, label in (("shared_note", "公共工作稿"),):
+            for ref, label in (() if selected_materials is not None else (("shared_note", "公共工作稿"),)):
                 try:
                     parts.append(label + "：\n" + self._material(session, run, work, ref).body)
                 except ValueError:
                     pass
-            for ref in work.materials:
-                try:
-                    parts.append("任务材料 " + ref + "：\n" + self._material(session, run, work, ref).body)
-                except ValueError:
-                    parts.append("任务材料 " + ref + " 不存在，可先读取材料目录再继续。")
+        for ref in work.materials if selected_materials is None else selected_materials:
+            try:
+                parts.append("任务材料 " + ref + "：\n" + self._material(session, run, work, ref).body)
+            except ValueError:
+                parts.append("任务材料 " + ref + " 不存在，可先读取材料目录再继续。")
         directory = session.scalars(select(Revision).join(Head, Head.revision_id == Revision.id).where(
             Head.branch_id == run.branch_id,
             Revision.payload["research_root_id"].as_string() == root.root_run_id)
@@ -309,8 +319,8 @@ class ResearchRuntime:
 
     def _roster_text(self, session, root):
         roster = self._roster(session, root)
-        return ("研究成员：" + "、".join(roster["names"]) + "。可给新成员取名并安排任务；总人数最多 "
-                + str(roster["maximum"]) + "（含主研究者）。")
+        return ("研究成员：" + "、".join(roster["names"]) + "。可给新成员取名并安排任务；最多 "
+                + str(roster["maximum"]) + " 位同时执行（含主研究者）；历史成员不占累计邀请名额。")
 
     def enrich(self, session, task):
         run = session.get(Run, task["run_id"])
@@ -340,15 +350,26 @@ class ResearchRuntime:
             compute=settings.get("enabled", False) and "run_code" in permitted_operations(project),
             discussion=root.config["discussion"] and not work.independent,
             lead=member.name == "lead", literature=root.config.get("literature", True))
-        fixed = {"tools": tools, "independent": work.independent,
+        capabilities = {"compute": settings.get("enabled", False) and "run_code" in permitted_operations(project),
+                        "discussion": root.config["discussion"] and not work.independent,
+                        "literature": root.config.get("literature", True), "lead": member.name == "lead"}
+        fixed = {"tools": tools, "capabilities": capabilities, "independent": work.independent,
                  "thinking_mode": options["thinking_mode"], "reasoning_effort": options["reasoning_effort"]}
         dialogue = checkpoint.get("research_dialogue")
         reopen = checkpoint.pop("research_reopen_reason", None)
-        if dialogue and dialogue["fixed"] != fixed:
-            reopen = "information_scope_changed" if dialogue["fixed"]["independent"] != work.independent else "configuration_changed"
+        if dialogue:
+            old = dialogue["fixed"]
+            names = {tool["function"]["name"] for tool in old["tools"]}
+            old_capabilities = old.get("capabilities", {"compute": "compute" in names,
+                "discussion": "send_message" in names, "literature": "search_literature" in names,
+                "lead": "submit_solution" in names})
+            if (old_capabilities != capabilities or any(old.get(key) != fixed[key] for key in
+                    ("independent", "thinking_mode", "reasoning_effort"))):
+                reopen = "information_scope_changed" if old["independent"] != work.independent else "configuration_changed"
         if not dialogue or reopen:
             known_capacity = dialogue.get("capacity") if dialogue else None
-            dialogue = {"id": uid(), "opening": self._opening(session, run, work),
+            dialogue = {"id": uid(), "opening": self._opening(session, run, work,
+                            checkpoint.pop("research_selected_materials", None)),
                 "system": research.INSTRUCTION, "prompt_version": research.PROMPT_VERSION,
                 "fixed": fixed, "work_id": work.id, "roster": self._roster(session, root),
                 "events": [], "reason": reopen or "initial", "capacity": known_capacity,
@@ -373,22 +394,22 @@ class ResearchRuntime:
         after = rows[-1].number if rows else 0
         if dialogue["work_id"] != work.id:
             content = "当前任务更新：\n" + work.goal
-            if not work.independent:
-                for ref in work.materials:
-                    try:
-                        content += "\n任务材料 " + ref + "：\n" + self._material(session, run, work, ref).body
-                    except ValueError:
-                        content += "\n任务材料 " + ref + " 不存在，可先读取材料目录。"
+            for ref in work.materials:
+                try:
+                    content += "\n任务材料 " + ref + "：\n" + self._material(session, run, work, ref).body
+                except ValueError:
+                    content += "\n任务材料 " + ref + " 不存在，可先读取材料目录。"
             dialogue["events"].append({"after_step": after, "content": content})
             dialogue["work_id"] = work.id
         roster = self._roster(session, root)
         if not work.independent and root.config["discussion"] and dialogue["roster"] != roster:
             dialogue["events"].append({"after_step": after, "content": self._roster_text(session, root)})
             dialogue["roster"] = roster
-        if not work.independent:
-            for message in session.scalars(select(ResearchMessage).where(
-                ResearchMessage.recipient_run_id == run.id, ResearchMessage.delivered_work_id.is_(None))
+        for message in session.scalars(select(ResearchMessage).where(
+                    ResearchMessage.recipient_run_id == run.id, ResearchMessage.delivered_work_id.is_(None))
                 .order_by(ResearchMessage.created_at, ResearchMessage.id)):
+            if not work.independent or (message.sender_run_id == run.id
+                    and session.get(Revision, message.revision_id).author == "runtime"):
                 dialogue["events"].append({"message_id": message.id, "after_step": after})
                 message.delivered_work_id = work.id
         if dialogue.get("balance_step") != after and rows:
@@ -452,7 +473,7 @@ class ResearchRuntime:
                 conversation.append({"role": "user", "content": notice})
                 estimate += len(notice.encode("utf-8"))
         elif capacity:
-            estimate = len(json.dumps([dialogue["system"], tools, conversation], ensure_ascii=False).encode("utf-8"))
+            estimate = len(json.dumps([dialogue["system"], dialogue["fixed"]["tools"], conversation], ensure_ascii=False).encode("utf-8"))
         dialogue["capacity"] = capacity
         if capacity and estimate is not None and estimate >= capacity and rows:
             # A physical provider boundary, not a fixed research/round limit.
@@ -552,7 +573,7 @@ class ResearchRuntime:
             return
         if root and root.state == "researching" and root.config["discussion"] and run.id != root.root_run_id:
             recipients = {root.root_run_id, *(key for key, value in root.config.get("waiting_for", {}).items()
-                                            if value["recipient"] == run.id)}
+                                            if value.get("recipient") == run.id)}
             for recipient in recipients:
                 self._message(session, run, recipient, "同伴执行状态",
                     "同伴这次调用未完成，原因：" + reason + "。这不是对数学结论的判断，可调整任务或自行继续。",
@@ -565,23 +586,30 @@ class ResearchRuntime:
                 "用户已关闭同伴讨论，请独立继续当前局部任务，无需再等待同伴。",
                 runtime_notice=True)
 
-    def _finish_work(self, session, run, work, summary=""):
+    def _finish_work(self, session, run, work, summary="", body_ref=None, body=None):
         root = self.session_for(session, run.id)
         current = session.get(Revision, work.output_revision_id) if work.output_revision_id else None
-        if summary and (not current or current.body != summary):
+        if body:
+            current = self._save(session, run, body, title=work.goal)
+            work.output_revision_id = current.id
+        elif body_ref:
+            current = self._material(session, run, work, body_ref)
+            work.output_revision_id = current.id
+        if summary and not current:
             work.output_revision_id = self._save(session, run, summary, title=work.goal).id
         member = session.get(ResearchMember, run.id)
         if work.independent and not member.personal_note_id and work.output_revision_id:
-            revision = self._save(session, run, session.get(Revision, work.output_revision_id).body,
+            revision = self._save(session, run, summary or session.get(Revision, work.output_revision_id).body,
                                   kind="personal", title="独立探索工作稿")
             member.personal_note_id = revision.object_id
         work.state = "completed"
         if run.id != root.root_run_id:
             recipients = {root.root_run_id, *(key for key, value in root.config.get("waiting_for", {}).items()
-                                            if value["recipient"] == run.id)}
+                                             if value.get("recipient") == run.id)}
             for recipient in recipients:
                 self._message(session, run, recipient, work.goal,
-                    session.get(Revision, work.output_revision_id).body if work.output_revision_id
+                    (summary or session.get(Revision, work.output_revision_id).body) +
+                    "\n\n完整成果来源：revision:" + work.output_revision_id if work.output_revision_id
                     else "局部任务已结束，没有保存研究正文。")
         self._clear_wait(root, run.id)
         self.runtime._emit(session, run, "research.work_completed", record(work))
@@ -627,7 +655,15 @@ class ResearchRuntime:
             if not isinstance(values, dict):
                 raise ValueError("Tool arguments must be an object")
             kind = call["function"]["name"]
+            raw_values = values
             values = research.arguments_for(kind, values)
+            saved_call = session.get(ProviderCall, row.request_id)
+            version = saved_call.call_config.get("prompt_template_version") if saved_call else None
+            if (kind == "compute" and "timeout_seconds" not in raw_values
+                    and version in {"continuous-research-v" + str(number) for number in range(1, 7)}):
+                # An already-purchased v6 request keeps its original five-second
+                # default and identity; deployment must not rerun it as a new job.
+                values["timeout_seconds"] = 5
             if kind in {"compute", "start_computation", "poll_computation", "cancel_computation"}:
                 project = session.get(Project, self.state.require_branch(session, run.branch_id).project_id)
                 settings = project.policies.get("code_sandbox", {})
@@ -648,18 +684,22 @@ class ResearchRuntime:
                          "next_offset": offset + length if offset + length < len(revision.body) else None}
             elif kind == "list_materials":
                 value = self._list_materials(session, run, work, values)
-            elif kind == "compact_context":
-                revision = self._save(session, run, values["summary"], kind="personal",
+            elif kind in {"compact_context", "continue_research"}:
+                revision = self._save(session, run, values.get("note", values.get("summary")), kind="personal",
                     title="接续研究工作稿", object_id=member.personal_note_id)
                 member.personal_note_id = revision.object_id
-                for previous in session.scalars(select(ResearchWork).where(
-                    ResearchWork.member_run_id == run.id, ResearchWork.state.in_(OPEN_WORK))):
-                    previous.state = "replaced"
-                self._work(session, root, run.id, work.goal, independent=work.independent,
-                           materials=work.materials)
-                attempt.checkpoint = {**attempt.checkpoint, "research_reopen_reason": "researcher_compacted"}
-                value = {"ref": revision.payload["ref"], "context_reopened": True,
-                         "full_history_preserved": True}
+                reopen = kind == "compact_context" or values.get("new_dialogue", False)
+                if reopen or values.get("goal") is not None or values.get("materials") is not None:
+                    for previous in session.scalars(select(ResearchWork).where(
+                        ResearchWork.member_run_id == run.id, ResearchWork.state.in_(OPEN_WORK))):
+                        previous.state = "replaced"
+                    self._work(session, root, run.id, values.get("goal") or work.goal, independent=work.independent,
+                               materials=values.get("materials", work.materials))
+                if reopen:
+                    attempt.checkpoint = {**attempt.checkpoint, "research_reopen_reason": "researcher_compacted",
+                        "research_selected_materials": values.get("materials", work.materials)}
+                value = {"ref": revision.payload["ref"], "context_reopened": reopen,
+                          "full_history_preserved": True}
             elif kind == "save_note":
                 scope = values["scope"]
                 if scope not in {"personal", "shared", "material"}:
@@ -672,6 +712,12 @@ class ResearchRuntime:
                     member.personal_note_id = revision.object_id
                 elif scope == "shared":
                     root.shared_note_id = revision.object_id
+                    for peer in session.scalars(select(ResearchMember).where(
+                            ResearchMember.root_run_id == root.root_run_id, ResearchMember.run_id != run.id)):
+                        current = self.work_for(session, peer.run_id)
+                        if current and not current.independent:
+                            self._message(session, run, peer.run_id, "公共工作稿更新",
+                                "公共工作稿已有新版本，需要时读取 revision:" + revision.id, runtime_notice=True)
                 value = {"ref": revision.payload["ref"], "revision_id": revision.id}
             elif kind == "assign_work":
                 if not values["goal"].strip():
@@ -704,14 +750,20 @@ class ResearchRuntime:
                     root.config = {**root.config, "waiting_for": {**root.config.get("waiting_for", {}),
                         run.id: {"recipient": recipient, "topic": values["topic"], "work_id": work.id}}}
             elif kind == "finish_work":
-                self._finish_work(session, run, work, values.get("summary", ""))
+                self._finish_work(session, run, work, values.get("summary", ""), values.get("body_ref"), values.get("body"))
+                if work.output_revision_id:
+                    attempt.checkpoint = {**attempt.checkpoint, "last_research_output_id": work.output_revision_id}
                 value = {"task_finished": True}
             elif kind == "submit_solution":
                 if member.name != "lead":
                     raise ValueError("Finish your work and send its result to the lead")
-                revision = self._material(session, run, work, values["body_ref"]) if values.get("body_ref") else session.get(Revision, work.output_revision_id)
+                revision = (self._save(session, run, values["body"], title="提交正文") if values.get("body")
+                    else self._material(session, run, work, values["body_ref"]) if values.get("body_ref")
+                    else session.get(Revision, work.output_revision_id))
                 if not revision:
                     raise ValueError("Write the solution body or provide a saved body_ref")
+                work.output_revision_id, work.state = revision.id, "completed"
+                attempt.checkpoint = {**attempt.checkpoint, "last_research_output_id": revision.id}
                 if values["outcome"] not in {"solved", "unresolved"}:
                     raise ValueError("Outcome must be solved or unresolved")
                 if values.get("answer") is not None and not isinstance(values["answer"], str):
@@ -738,8 +790,7 @@ class ResearchRuntime:
 
     def compute(self, spec):
         """Deliberately outside the database write transaction."""
-        return CodeSandbox(self.state.db.path, image_id=spec["image_id"]).execute(
-            spec["project_id"], spec["execution_id"], spec["code"], spec["timeout_seconds"])
+        return self.external(spec)
 
     def external(self, spec):
         """Slow computation and literature I/O never hold the write transaction."""
@@ -749,14 +800,16 @@ class ResearchRuntime:
 
             return search_papers(spec["query"], spec["limit"]) if kind == "search_literature" else read_paper(spec["url"])
         sandbox = CodeSandbox(self.state.db.path, image_id=spec["image_id"])
-        if kind == "start_computation":
-            result = sandbox.start(spec["project_id"], spec["execution_id"], spec["code"], spec["timeout_seconds"],
-                                   research_root_id=spec["research_root_id"])
+        if kind in {"compute", "start_computation"}:
+            result = (sandbox.execute(spec["project_id"], spec["execution_id"], spec["code"], spec["timeout_seconds"],
+                research_root_id=spec["research_root_id"], wait_seconds=2) if kind == "compute"
+                else sandbox.start(spec["project_id"], spec["execution_id"], spec["code"], spec["timeout_seconds"],
+                    research_root_id=spec["research_root_id"]))
             # Human Stop can arrive while Docker is creating the container,
             # outside the write transaction. Do not leave that new job running.
             with self.state.db.sessions() as session:
                 root = session.get(ResearchSession, spec["research_root_id"])
-                cancelled = not root or root.state == "cancelled"
+                cancelled = not root or root.state in {"cancelled", "completed"}
             if cancelled and result.get("job_id"):
                 return sandbox.cancel(spec["project_id"], result["job_id"])
             return result
@@ -848,11 +901,34 @@ class ResearchRuntime:
         if call["id"] in row.receipt["tool_results"]:
             return 200, {"result": row.receipt["tool_results"][call["id"]]}
         kind = call["function"]["name"]
-        if kind in {"poll_computation", "cancel_computation"} and payload["result"].get("status") == "running":
-            return self._record_tool(session, run, row, call, payload["result"])
+        root = self.session_for(session, run.id)
+        result = payload["result"]
+        values = json.loads(call["function"]["arguments"])
+        if result.get("status") == "running":
+            job_id = result["job_id"]
+            project = session.get(Project, self.state.require_branch(session, run.branch_id).project_id)
+            jobs = root.config.get("computations", {})
+            if job_id not in jobs:
+                root.config = {**root.config, "computations": {**jobs, job_id: {
+                    "job_id": job_id, "run_id": run.id, "project_id": project.id,
+                    "image_id": project.policies["code_sandbox"].get("image_id"), "status": "running"}}}
+            if kind == "poll_computation":
+                if values.get("wait"):
+                    self.work_for(session, run.id).state = "waiting"
+                    root.config = {**root.config, "waiting_for": {**root.config.get("waiting_for", {}),
+                        run.id: {"job_id": job_id}}}
+                return self._record_tool(session, run, row, call, result)
         title = "文献材料" if kind in {"search_literature", "read_literature"} else "计算材料"
         revision = self._save(session, run, json.dumps(payload["result"], ensure_ascii=False, indent=2),
                               kind="literature" if title == "文献材料" else "computation", title=title)
+        job = root.config.get("computations", {}).get(result.get("job_id"))
+        if job and result.get("status") == "complete" and job["status"] != "complete":
+            root.config = {**root.config, "computations": {**root.config["computations"], job["job_id"]: {
+                **job, "status": "complete", "ref": "revision:" + revision.id, "reason": result.get("reason")}}}
+            if job["run_id"] != run.id:
+                owner = session.get(Run, job["run_id"])
+                self._message(session, owner, owner.id, "计算任务完成",
+                    "完整计算结果已保存，可读取 revision:" + revision.id, runtime_notice=True)
         visible = dict(payload["result"])
         for field in ("body", "code", "stdout", "stderr"):
             if isinstance(visible.get(field), str) and len(visible[field]) > 12000:
@@ -861,7 +937,47 @@ class ResearchRuntime:
         # Full source/output is in the material; a long result does not have to
         # occupy every subsequent model prompt.
         return self._record_tool(session, run, row, call,
-                                 {"ref": revision.payload["ref"], **visible})
+                                  {"ref": revision.payload["ref"], **visible})
+
+    def refresh_computations(self):
+        """Observe local jobs outside write transactions, without model calls."""
+        with self.state.db.sessions() as session:
+            jobs = [(root.root_run_id, root.state, dict(job)) for root in session.scalars(select(ResearchSession))
+                for job in root.config.get("computations", {}).values() if job["status"] == "running"]
+        completed = 0
+        for root_id, state, job in jobs:
+            sandbox = CodeSandbox(self.state.db.path, job["image_id"])
+            result = (sandbox.cancel(job["project_id"], job["job_id"]) if state in {"completed", "cancelled"}
+                else sandbox.poll(job["project_id"], job["job_id"]))
+            if result.get("status") != "complete":
+                continue
+            result = {key: value for key, value in result.items() if key != "cached"}
+            self.state.execute("research.computation_ready", "computation-ready:" + root_id + ":" + job["job_id"],
+                {"root_id": root_id, "job_id": job["job_id"], "result": result}, self._computation_ready)
+            completed += 1
+        return {"observed": len(jobs), "completed": completed}
+
+    def _computation_ready(self, session, payload):
+        root = session.get(ResearchSession, payload["root_id"])
+        jobs = root.config.get("computations", {})
+        job = jobs.get(payload["job_id"])
+        if not job:
+            # Permanent erasure can finish while Docker is being queried.
+            return 200, {"saved": False}
+        if job["status"] == "complete":
+            return 200, {"saved": True}
+        run = session.get(Run, job["run_id"])
+        revision = self._save(session, run, json.dumps(payload["result"], ensure_ascii=False, indent=2),
+                              kind="computation", title="计算任务完成")
+        root.config = {**root.config, "computations": {**jobs, job["job_id"]: {
+            **job, "status": "complete", "ref": "revision:" + revision.id,
+            "reason": payload["result"].get("reason")}}}
+        preview = {key: value[:12000] if isinstance(value, str) else value
+            for key, value in payload["result"].items() if key not in {"code", "provenance"}}
+        self._message(session, run, run.id, "计算任务完成",
+            "计算结果（长输出请读取完整材料）：\n" + json.dumps(preview, ensure_ascii=False) +
+            "\n完整结果来源：revision:" + revision.id, runtime_notice=True)
+        return 200, {"saved": True, "ref": "revision:" + revision.id}
 
     def continuation(self, session, payload):
         attempt, run = self.runtime._attempt(session, payload)
@@ -919,12 +1035,18 @@ class ResearchRuntime:
                     self._work(session, root, run.id, "阅读新到的话题材料，研究其中的问题并回复。")
                 elif run.id == root.root_run_id and run.state == "idle" and not current:
                     self._work(session, root, run.id, "接续原题研究，利用工作稿和已有材料推进证明。")
-                if run.state == "waiting_discussion" and unread and current and not current.independent:
+                own_notice = session.scalar(select(ResearchMessage.id).join(Revision,
+                    Revision.id == ResearchMessage.revision_id).where(
+                        ResearchMessage.recipient_run_id == run.id, ResearchMessage.sender_run_id == run.id,
+                        ResearchMessage.delivered_work_id.is_(None), Revision.author == "runtime").limit(1))
+                if (current and unread and (not current.independent or own_notice)
+                        and (run.state == "waiting_discussion" or (run.state == "queued" and current.state == "waiting"))):
                     current.state, run.state = "queued", "queued"
                     self._clear_wait(root, run.id)
             members = session.scalars(select(Run).join(ResearchMember, ResearchMember.run_id == Run.id).where(
                 ResearchMember.root_run_id == root.root_run_id)).all()
             if (root.state == "researching" and root.config["discussion"]
+                    and not any(job["status"] == "running" for job in root.config.get("computations", {}).values())
                     and any(row.state == "waiting_discussion" for row in members)
                     and not any(row.state in {"queued", "running", "waiting_budget"} for row in members)
                     and not session.scalar(select(ProviderRequest.id).join(AgentRun, AgentRun.run_id == ProviderRequest.run_id)
@@ -950,6 +1072,7 @@ class ResearchRuntime:
             .where(ResearchMember.root_run_id == root.root_run_id)
             .order_by(ProviderCall.created_at, ProviderCall.request_id))]
         return {"session": record(root), "shared_note": note(root.shared_note_id),
+                "computations": list(root.config.get("computations", {}).values()),
                 "solution": record(session.get(Revision, root.solution_revision_id)) if root.solution_revision_id else None,
                 "members": [{**record(row), "state": session.get(Run, row.run_id).state,
                              "personal_note": note(row.personal_note_id)} for row in session.scalars(

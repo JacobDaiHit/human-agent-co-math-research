@@ -7,8 +7,8 @@
 在项目根目录构建镜像，只使用本目录为构建上下文，不复制仓库、密钥或评测材料：
 
 ```powershell
-docker build --tag mathagent-python-sandbox:research-v2 sandbox
-$env:MATHAGENT_SANDBOX_IMAGE = (docker image inspect --format '{{.Id}}' mathagent-python-sandbox:research-v2).Trim()
+docker build --tag mathagent-python-sandbox:research-v3 sandbox
+$env:MATHAGENT_SANDBOX_IMAGE = (docker image inspect --format '{{.Id}}' mathagent-python-sandbox:research-v3).Trim()
 $env:MATHAGENT_TEST_CODE_SANDBOX = '1'
 .venv\Scripts\python.exe -X utf8 -m pytest tests/integration/test_code_sandbox_isolation.py
 ```
@@ -19,11 +19,13 @@ $env:MATHAGENT_TEST_CODE_SANDBOX = '1'
 
 启动服务时传入镜像配置，再在项目运行设置里显式启用。镜像不就绪时计算不可用，不退回宿主 Python。
 
-## 短计算与后台计算
+## 一条计算路径，短暂等待与实际时限分开
 
-短计算默认五秒、可设至六十秒，256 MiB 内存、一个处理器、32 个进程、16 MiB 临时工作目录，每路输出 32 KiB。
+所有新计算共用一条持久任务路径。实际运行默认一小时、可设至七天，1 GiB 内存、一个处理器、64 个进程、256 MiB 临时工作目录，每路输出最多 1 MiB。没有另一个五秒的短计算执行器，也没有重复的处理器时间终止器；监督程序按实际运行时限停止任务，容器限制处理器占用。
 
-较长计算默认一小时、可设至七天，1 GiB 内存、一个处理器、64 个进程、256 MiB 临时工作目录，每路输出最多 1 MiB。启动立即返回任务名称，模型可以继续推导，稍后查询或停止。容器不依赖当前服务或 worker 进程一直存活；重新连接会取回同一个任务，不自动重新计算。
+研究工具最多短暂等待两秒：完成了直接返回结果，否则返回同一任务名称，计算继续在后台运行。两秒只是本次接口等待，不是计算时限。模型可以先研究其他问题，也可以查询并选择等待，此时释放模型执行槽；worker 自动观察完成状态并把结果作为新消息送回原对话，不为等待额外调用模型。
+
+容器不依赖当前服务或 worker 进程一直存活；重新连接会取回同一个任务，不自动重新计算。人工暂停不丢弃在途计算，结果可以先保存，恢复后再读取；人工停止或整题交付后停止仍在运行的本题任务。旧计算回执仍可读取，不迁改旧实测材料。
 
 计算完整结果保存在材料中；返回模型的工具消息给出有限预览与材料名称，模型可以读回完整输出。执行次数没有项目终身限制，也不额外购买模型请求。
 
@@ -36,3 +38,7 @@ $env:MATHAGENT_TEST_CODE_SANDBOX = '1'
 数据库旁的 `sandbox-jobs` 保存源码、镜像、时限、结果与运行回执。同一执行身份恢复时使用原回执，启动结果不明不自动重复计算。永久删除项目会停止其后台计算并清除源码与输出，保留无正文的执行指纹；清理失败会报告尚未完成。
 
 计算在数据库写入事务外执行，不阻止工作台保存材料。数学结论仍由研究者解释：计算结果只说明实际算了什么，不自动成为一般命题的证明。
+
+镜像与监督程序是固定版本。修改本目录源码后需要构建新镜像，并把启动环境中的 `MATHAGENT_SANDBOX_IMAGE` 指向其实际 sha256；保留旧镜像不表示旧镜像获得了新程序。就绪检查区分引擎不可用与镜像不在本地，不自动重启 Docker、清理通信目录或恢复出厂设置。
+
+已有项目也保存了启用时的镜像身份。用新启动环境重启服务后，在项目计算设置中重新启用，才会将后续计算切到新镜像；旧任务继续按各自回执读取，不自动重跑。

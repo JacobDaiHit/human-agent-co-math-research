@@ -248,6 +248,8 @@ class Runtime:
             .where(Run.state == "queued", Run.provider.in_(payload["providers"]))
             .order_by(Run.created_at)
         ):
+            if not self.research.can_claim(session, run):
+                continue
             try:
                 _, task = self.claim(session, {"run_id": run.id})
                 if "attempt_id" in task:
@@ -674,6 +676,8 @@ class Runtime:
         # Pending stop/pause requests still hold a slot until a boundary or expiry.
         if sum(not self._expired(attempt) for attempt in active) >= self.max_active_attempts:
             raise DomainError(409, "concurrency_limit", "本地正在执行的任务已达并发上限")
+        if not self.research.can_claim(session, run):
+            raise DomainError(409, "research_concurrency_limit", "当前研究的同时执行名额已占满")
         read_set = self.service.read_set(session, branch.id)
         read_set = self.agent.initial_read_set(session, run, read_set)
         if run.goal_object_id not in read_set:
