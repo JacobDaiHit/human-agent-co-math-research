@@ -4,6 +4,7 @@ from typing import Annotated, Literal
 
 from fastapi import Depends
 from mathagent.api.schemas import Command, Id
+from mathagent.providers.options import MAX_OUTPUT_TOKENS
 from mathagent.providers.remote import provider_status
 from pydantic import Field
 
@@ -28,7 +29,7 @@ class RequestReservation(Execution):
     # The worker sends the exact cap it will give the provider.  The service
     # durably reserves this amount before dispatch, so concurrent descendants
     # cannot collectively exceed an enabled cumulative output budget.
-    requested_output_tokens: Annotated[int, Field(strict=True, ge=256, le=65_536)] | None = None
+    requested_output_tokens: Annotated[int, Field(strict=True, ge=1, le=MAX_OUTPUT_TOKENS)] | None = None
 
 
 class Heartbeat(Execution):

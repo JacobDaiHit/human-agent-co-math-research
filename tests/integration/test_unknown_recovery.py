@@ -100,7 +100,7 @@ def test_unknown_output_usage_keeps_the_full_pre_dispatch_reservation(app):
         with app.state.database.sessions.begin() as session:
             session.scalars(select(ProviderRequest).where(ProviderRequest.run_id == run["run_id"])).one().output_token_reservation = 0
         migrated = (await api.get(f"/runs/{run['run_id']}/budget"))["output_token_budget"]
-        assert migrated["reserved_output_tokens"] == migrated["occupied_output_tokens"] == 65_536
+        assert migrated["reserved_output_tokens"] == migrated["occupied_output_tokens"] == 393_216
     exercise(app, scenario)
 
 

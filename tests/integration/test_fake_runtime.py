@@ -237,6 +237,7 @@ def test_global_concurrency_limit_keeps_pending_stops_in_occupied_slots(runtime_
     first = api.claim(first_run)
     second_project = api.post("/projects", {"title": "Another project", "body": "Another goal"})
     second = api.claim(api.run(second_project))
+    additional = [api.claim(api.run()) for _ in range(2)]
     third_run = api.run()
     full = api.request(f"/runs/{third_run['run_id']}/claim", worker=True)
     assert full.status_code == 409
@@ -247,6 +248,8 @@ def test_global_concurrency_limit_keeps_pending_stops_in_occupied_slots(runtime_
     third = api.claim(third_run)
     assert third["state"] == "running"
     api.complete(second)
+    for attempt in additional:
+        api.complete(attempt)
 
 
 def test_expired_fake_attempt_recovers_without_old_worker_overwriting_new_attempt(runtime_api):

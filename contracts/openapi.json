@@ -1573,6 +1573,457 @@
         }
       }
     },
+    "/projects/{project_id}/code-sandbox": {
+      "get": {
+        "tags": [
+          "research-assets"
+        ],
+        "summary": "Sandbox Status",
+        "operationId": "sandbox_status_projects__project_id__code_sandbox_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "research-assets"
+        ],
+        "summary": "Sandbox Configure",
+        "operationId": "sandbox_configure_projects__project_id__code_sandbox_put",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SandboxConfigure"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/branches/{branch_id}/merge-preview": {
+      "get": {
+        "tags": [
+          "research-assets"
+        ],
+        "summary": "Merge Preview",
+        "operationId": "merge_preview_branches__branch_id__merge_preview_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "branch_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Branch Id"
+            }
+          },
+          {
+            "name": "source_branch_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Branch Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/branches/{branch_id}/merge": {
+      "post": {
+        "tags": [
+          "research-assets"
+        ],
+        "summary": "Merge Apply",
+        "operationId": "merge_apply_branches__branch_id__merge_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "branch_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Branch Id"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergeApply"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/articles": {
+      "post": {
+        "tags": [
+          "research-assets"
+        ],
+        "summary": "Article Create",
+        "operationId": "article_create_articles_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ArticleCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/articles/{revision_id}/check": {
+      "get": {
+        "tags": [
+          "research-assets"
+        ],
+        "summary": "Article Check",
+        "operationId": "article_check_articles__revision_id__check_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "revision_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Revision Id"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Branch Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/objects/{object_id}/deletion-preview": {
+      "get": {
+        "tags": [
+          "research-assets"
+        ],
+        "summary": "Deletion Preview",
+        "operationId": "deletion_preview_objects__object_id__deletion_preview_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "object_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Object Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/objects/{object_id}/permanent-delete": {
+      "post": {
+        "tags": [
+          "research-assets"
+        ],
+        "summary": "Permanent Delete",
+        "operationId": "permanent_delete_objects__object_id__permanent_delete_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "object_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Object Id"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MaterialDelete"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/providers/status": {
       "get": {
         "summary": "Status",
@@ -1934,7 +2385,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/Execution"
+                "$ref": "#/components/schemas/RequestReservation"
               }
             }
           }
@@ -2595,6 +3046,174 @@
         }
       }
     },
+    "/runs/{run_id}/research": {
+      "get": {
+        "summary": "Research Status",
+        "operationId": "research_status_runs__run_id__research_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/attempts/{attempt_id}/research-context": {
+      "post": {
+        "summary": "Research Context",
+        "operationId": "research_context_attempts__attempt_id__research_context_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "attempt_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Attempt Id"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResearchExecution"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/attempts/{attempt_id}/research-tool": {
+      "post": {
+        "summary": "Research Tool",
+        "operationId": "research_tool_attempts__attempt_id__research_tool_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "attempt_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Attempt Id"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResearchTool"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/runs/{run_id}/options": {
       "get": {
         "summary": "Options",
@@ -3176,6 +3795,120 @@
           }
         }
       }
+    },
+    "/runs/{run_id}/search": {
+      "get": {
+        "summary": "Status",
+        "operationId": "status_runs__run_id__search_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs/{root_id}/search/routes/{route_id}/interventions": {
+      "post": {
+        "summary": "Intervene",
+        "operationId": "intervene_runs__root_id__search_routes__route_id__interventions_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "root_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Root Id"
+            }
+          },
+          {
+            "name": "route_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Route Id"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RouteIntervention"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3264,6 +3997,73 @@
           "body"
         ],
         "title": "AnnotationCreate"
+      },
+      "ArticleCreate": {
+        "properties": {
+          "branch_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Branch Id"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "sections": {
+            "items": {
+              "$ref": "#/components/schemas/ArticleSection"
+            },
+            "type": "array",
+            "maxItems": 40,
+            "minItems": 1,
+            "title": "Sections"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "branch_id",
+          "title",
+          "sections"
+        ],
+        "title": "ArticleCreate"
+      },
+      "ArticleSection": {
+        "properties": {
+          "heading": {
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Heading"
+          },
+          "revision_ids": {
+            "items": {
+              "type": "string",
+              "maxLength": 100,
+              "minLength": 1
+            },
+            "type": "array",
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Revision Ids"
+          },
+          "transition": {
+            "type": "string",
+            "maxLength": 20000,
+            "title": "Transition",
+            "default": ""
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "heading",
+          "revision_ids"
+        ],
+        "title": "ArticleSection"
       },
       "BlockCreate": {
         "properties": {
@@ -3723,6 +4523,116 @@
         ],
         "title": "LayoutUpdate"
       },
+      "MaterialDelete": {
+        "properties": {
+          "preview_token": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Preview Token"
+          },
+          "confirmation": {
+            "type": "string",
+            "const": "永久删除",
+            "title": "Confirmation"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "preview_token",
+          "confirmation"
+        ],
+        "title": "MaterialDelete"
+      },
+      "MergeApply": {
+        "properties": {
+          "source_branch_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Source Branch Id"
+          },
+          "preview_token": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Preview Token"
+          },
+          "resolutions": {
+            "items": {
+              "$ref": "#/components/schemas/MergeResolution"
+            },
+            "type": "array",
+            "maxItems": 10000,
+            "title": "Resolutions"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source_branch_id",
+          "preview_token",
+          "resolutions"
+        ],
+        "title": "MergeApply"
+      },
+      "MergeResolution": {
+        "properties": {
+          "object_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Object Id"
+          },
+          "choice": {
+            "type": "string",
+            "enum": [
+              "source",
+              "target",
+              "rewrite"
+            ],
+            "title": "Choice"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Reason"
+          },
+          "body": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200000,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Body"
+          },
+          "payload": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payload"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "object_id",
+          "choice",
+          "reason"
+        ],
+        "title": "MergeResolution"
+      },
       "ObjectCreate": {
         "properties": {
           "branch_id": {
@@ -3808,7 +4718,7 @@
               "type": "string"
             },
             "type": "array",
-            "maxItems": 12,
+            "maxItems": 24,
             "title": "Allowed Operations"
           }
         },
@@ -4048,6 +4958,81 @@
         ],
         "title": "RelationCreate"
       },
+      "RequestReservation": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Token"
+          },
+          "requested_output_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 393216.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Output Tokens"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "RequestReservation"
+      },
+      "ResearchExecution": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Token"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "ResearchExecution"
+      },
+      "ResearchTool": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Token"
+          },
+          "request_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Request Id"
+          },
+          "call_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Call Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "token",
+          "request_id",
+          "call_id"
+        ],
+        "title": "ResearchTool"
+      },
       "ResolveConflict": {
         "properties": {
           "branch_id": {
@@ -4198,6 +5183,32 @@
         ],
         "title": "RevisionCreate"
       },
+      "RouteIntervention": {
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "pause",
+              "resume",
+              "priority"
+            ],
+            "title": "Action"
+          },
+          "priority": {
+            "type": "integer",
+            "maximum": 10.0,
+            "minimum": -10.0,
+            "title": "Priority",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "title": "RouteIntervention"
+      },
       "RunCreate": {
         "properties": {
           "branch_id": {
@@ -4241,7 +5252,7 @@
             "maximum": 1000.0,
             "minimum": 1.0,
             "title": "Request Budget",
-            "default": 5
+            "default": 1000
           },
           "autonomous": {
             "type": "boolean",
@@ -4278,17 +5289,30 @@
           },
           "max_output_tokens": {
             "type": "integer",
-            "maximum": 65536.0,
-            "minimum": 256.0,
+            "maximum": 393216.0,
+            "minimum": 1.0,
             "title": "Max Output Tokens",
-            "default": 4096
+            "default": 131072
+          },
+          "cumulative_output_token_budget": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 10000000.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cumulative Output Token Budget"
           },
           "request_timeout_seconds": {
             "type": "integer",
-            "maximum": 600.0,
+            "maximum": 3600.0,
             "minimum": 1.0,
             "title": "Request Timeout Seconds",
-            "default": 180
+            "default": 3600
           },
           "thinking_mode": {
             "type": "string",
@@ -4329,6 +5353,16 @@
             "title": "Length Recovery",
             "default": "none"
           },
+          "answer_submission_recovery": {
+            "type": "boolean",
+            "title": "Answer Submission Recovery",
+            "default": false
+          },
+          "answer_requires_exhaustiveness": {
+            "type": "boolean",
+            "title": "Answer Requires Exhaustiveness",
+            "default": false
+          },
           "unknown_recovery": {
             "type": "string",
             "enum": [
@@ -4337,6 +5371,43 @@
             ],
             "title": "Unknown Recovery",
             "default": "stop"
+          },
+          "solver_controller": {
+            "type": "string",
+            "enum": [
+              "legacy",
+              "bounded_search_v1",
+              "continuous_research"
+            ],
+            "title": "Solver Controller",
+            "default": "continuous_research"
+          },
+          "discussion": {
+            "type": "boolean",
+            "title": "Discussion",
+            "default": true
+          },
+          "research_deadline_seconds": {
+            "type": "integer",
+            "maximum": 604800.0,
+            "minimum": 1.0,
+            "title": "Research Deadline Seconds",
+            "default": 86400
+          },
+          "max_researchers": {
+            "type": "integer",
+            "maximum": 16.0,
+            "minimum": 1.0,
+            "title": "Max Researchers",
+            "default": 4
+          },
+          "literature": {
+            "type": "boolean",
+            "title": "Literature",
+            "default": true
+          },
+          "search_config": {
+            "$ref": "#/components/schemas/SearchConfig"
           }
         },
         "additionalProperties": false,
@@ -4350,113 +5421,447 @@
       "RunUpdate": {
         "properties": {
           "request_budget": {
-            "type": "integer",
-            "maximum": 1000.0,
-            "minimum": 1.0,
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 1000.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Request Budget"
           },
           "autonomous": {
-            "type": "boolean",
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Autonomous"
           },
           "max_steps": {
-            "type": "integer",
-            "maximum": 40.0,
-            "minimum": 1.0,
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 40.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Max Steps"
           },
           "max_review_rounds": {
-            "type": "integer",
-            "maximum": 2.0,
-            "minimum": 0.0,
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Max Review Rounds"
           },
           "max_children": {
-            "type": "integer",
-            "maximum": 12.0,
-            "minimum": 0.0,
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 12.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Max Children"
           },
           "max_depth": {
-            "type": "integer",
-            "maximum": 4.0,
-            "minimum": 0.0,
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 4.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Max Depth"
           },
           "max_output_tokens": {
-            "type": "integer",
-            "maximum": 65536.0,
-            "minimum": 256.0,
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 393216.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Max Output Tokens"
           },
+          "cumulative_output_token_budget": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 10000000.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cumulative Output Token Budget"
+          },
           "request_timeout_seconds": {
-            "type": "integer",
-            "maximum": 600.0,
-            "minimum": 1.0,
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 3600.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Request Timeout Seconds"
           },
           "thinking_mode": {
-            "type": "string",
-            "enum": [
-              "provider_default",
-              "enabled",
-              "disabled"
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "provider_default",
+                  "enabled",
+                  "disabled"
+                ]
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Thinking Mode",
-            "default": "provider_default"
+            "title": "Thinking Mode"
           },
           "reasoning_effort": {
-            "type": "string",
-            "enum": [
-              "provider_default",
-              "low",
-              "high",
-              "max"
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "provider_default",
+                  "low",
+                  "high",
+                  "max"
+                ]
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Reasoning Effort",
-            "default": "provider_default"
+            "title": "Reasoning Effort"
           },
           "completion_policy": {
-            "type": "string",
-            "enum": [
-              "draft",
-              "reviewed_answer"
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "reviewed_answer"
+                ]
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Completion Policy",
-            "default": "draft"
+            "title": "Completion Policy"
           },
           "length_recovery": {
-            "type": "string",
-            "enum": [
-              "none",
-              "high"
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "high"
+                ]
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Length Recovery",
-            "default": "none"
+            "title": "Length Recovery"
           },
           "unknown_recovery": {
-            "type": "string",
-            "enum": [
-              "stop",
-              "once"
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "stop",
+                  "once"
+                ]
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Unknown Recovery",
-            "default": "stop"
+            "title": "Unknown Recovery"
+          },
+          "solver_controller": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "legacy",
+                  "bounded_search_v1",
+                  "continuous_research"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Solver Controller"
+          },
+          "discussion": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Discussion"
+          },
+          "research_deadline_seconds": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 604800.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Research Deadline Seconds"
+          },
+          "max_researchers": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 16.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Researchers"
+          },
+          "literature": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Literature"
+          },
+          "answer_submission_recovery": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer Submission Recovery"
+          },
+          "answer_requires_exhaustiveness": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer Requires Exhaustiveness"
+          },
+          "search_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SearchConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "RunUpdate"
+      },
+      "SandboxConfigure": {
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "request_budget",
-          "autonomous",
-          "max_steps",
-          "max_review_rounds",
-          "max_children",
-          "max_depth",
-          "max_output_tokens",
-          "request_timeout_seconds"
+          "enabled"
         ],
-        "title": "RunUpdate"
+        "title": "SandboxConfigure"
+      },
+      "SearchConfig": {
+        "properties": {
+          "max_routes": {
+            "type": "integer",
+            "maximum": 3.0,
+            "minimum": 1.0,
+            "title": "Max Routes",
+            "default": 3
+          },
+          "active_routes": {
+            "type": "integer",
+            "maximum": 2.0,
+            "minimum": 1.0,
+            "title": "Active Routes",
+            "default": 2
+          },
+          "max_route_steps": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": 1.0,
+            "title": "Max Route Steps",
+            "default": 3
+          },
+          "max_repairs": {
+            "type": "integer",
+            "maximum": 2.0,
+            "minimum": 0.0,
+            "title": "Max Repairs",
+            "default": 1
+          },
+          "final_output_tokens": {
+            "type": "integer",
+            "minimum": 256.0,
+            "title": "Final Output Tokens",
+            "default": 4096
+          },
+          "final_requests": {
+            "type": "integer",
+            "maximum": 3.0,
+            "minimum": 1.0,
+            "title": "Final Requests",
+            "default": 1
+          },
+          "check_requests": {
+            "type": "integer",
+            "maximum": 12.0,
+            "minimum": 0.0,
+            "title": "Check Requests",
+            "default": 3
+          },
+          "check_output_tokens": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Check Output Tokens",
+            "default": 12288
+          },
+          "budget_policy": {
+            "type": "string",
+            "enum": [
+              "fixed",
+              "adaptive"
+            ],
+            "title": "Budget Policy",
+            "default": "adaptive"
+          },
+          "min_work_output_tokens": {
+            "type": "integer",
+            "minimum": 256.0,
+            "title": "Min Work Output Tokens",
+            "default": 4096
+          },
+          "min_check_output_tokens": {
+            "type": "integer",
+            "minimum": 256.0,
+            "title": "Min Check Output Tokens",
+            "default": 8192
+          },
+          "analysis_output_tokens": {
+            "type": "integer",
+            "minimum": 256.0,
+            "title": "Analysis Output Tokens",
+            "default": 8192
+          },
+          "deadline_seconds": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Deadline Seconds",
+            "default": 1800
+          },
+          "final_seconds": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Final Seconds",
+            "default": 90
+          },
+          "enable_repairs": {
+            "type": "boolean",
+            "title": "Enable Repairs",
+            "default": true
+          },
+          "enable_tools": {
+            "type": "boolean",
+            "title": "Enable Tools",
+            "default": true
+          },
+          "enable_memory": {
+            "type": "boolean",
+            "title": "Enable Memory",
+            "default": true
+          },
+          "enable_multi_route": {
+            "type": "boolean",
+            "title": "Enable Multi Route",
+            "default": true
+          },
+          "route_schedule": {
+            "type": "string",
+            "enum": [
+              "first_pass",
+              "evidence_first"
+            ],
+            "title": "Route Schedule",
+            "default": "first_pass"
+          },
+          "require_passed_check_for_final": {
+            "type": "boolean",
+            "title": "Require Passed Check For Final",
+            "default": true
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SearchConfig",
+        "description": "Frozen per-run limits for ``bounded_search_v1``.\n\nAdmission against the root request/token budget belongs to the controller;\nthis model only validates relations internal to the search configuration."
       },
       "Settings": {
         "properties": {

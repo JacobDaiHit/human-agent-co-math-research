@@ -1,9 +1,10 @@
-"""A fail-closed, local Docker sandbox for short Python calculations.
+"""Local, isolated Python calculations and durable background computations.
 
 The Docker image is selected only from trusted process configuration.  Solver input
 never controls an image, a path, a mount, or the Docker command line.
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -14,7 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 
-TOOL_VERSION = "docker-python-sandbox-v1"
+TOOL_VERSION = "docker-python-sandbox-v2"
 MAX_CODE_BYTES = 64 * 1024
 MAX_HOST_DIAGNOSTIC_BYTES = 32 * 1024
 _DIGEST = re.compile(r"(?:^|@)sha256:[0-9a-f]{64}$")
@@ -140,10 +141,14 @@ class CodeSandbox:
             if path.is_symlink() or record is None or record.get("project_id") != project_id:
                 pending += 1
                 continue
+            if record.get("container") and record.get("status") != "complete":
+                stopped = self.cancel(project_id, record["job_key"])
+                pending += int(stopped.get("status") != "complete")
+                record = _read_json(path) or record
             record.pop("code", None)
             result = record.get("result")
             if isinstance(result, dict):
-                for key in ("stdout", "stderr"):
+                for key in ("stdout", "stderr", "code"):
                     result.pop(key, None)
             record["redacted_at"] = time.time()
             if _replace_json(path, record):
@@ -158,6 +163,148 @@ class CodeSandbox:
             except OSError:
                 pending += 1
         return {"redacted": redacted, "pending": pending}
+
+    def start(self, project_id, execution_id, code, timeout_seconds=3600, *, research_root_id=None):
+        """Create an owned container once. The container outlives API/worker restarts."""
+        if not isinstance(code, str) or len(code.encode("utf-8")) > MAX_CODE_BYTES:
+            return _failure("code_too_large")
+        timeout = max(1, min(604800, int(timeout_seconds)))
+        code_hash = _hash(code.encode("utf-8"))
+        provenance = {"tool_version": TOOL_VERSION, "image_id": self.image_id,
+                      "timeout_seconds": timeout, "code_hash": code_hash, "background": True}
+        job_id = _hash(json.dumps([project_id, execution_id, provenance], sort_keys=True).encode())
+        path = self._job_path(project_id, job_id)
+        if path is None:
+            return _failure("journal_unavailable")
+        existing = _read_json(path)
+        if existing:
+            return self.poll(project_id, job_id)
+        ready = self.status()
+        if not ready["ready"]:
+            return _failure(ready["reason"])
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _plain(path.parent, directory=True)
+        except OSError:
+            return _failure("journal_unavailable")
+        container = "mathagent-" + job_id
+        record = {"project_id": project_id, "execution_id": execution_id, "job_key": job_id,
+                  "research_root_id": research_root_id,
+                  "code": code, "code_hash": code_hash, "provenance": provenance,
+                  "container": container, "status": "creating", "created_at": time.time()}
+        if not _atomic_json(path, record):
+            return self.poll(project_id, job_id)
+        command = ["docker", "create", "--name", container, "--pull", "never", "--network", "none",
+            "--read-only", "--tmpfs", "/work:rw,noexec,nosuid,nodev,size=256m",
+            "--memory", "1g", "--memory-swap", "1g", "--cpus", "1", "--pids-limit", "64",
+            "--cap-drop", "ALL", "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "KILL",
+            "--security-opt", "no-new-privileges", "--log-driver", "local", "--log-opt", "max-size=16m",
+            "--log-opt", "max-file=1", "--log-opt", "compress=false", "--user", "0:0", "--workdir", "/work",
+            "-e", f"MATHAGENT_TIMEOUT_SECONDS={timeout}",
+            "-e", "MATHAGENT_OUTPUT_BYTES=1048576",
+            self.image_id, "python", "/opt/mathagent/runner.py"]
+        try:
+            # Docker reads this one generated value while creating the container.
+            # No host mount, credentials, repository or writable rootfs is needed.
+            # An env file avoids Windows' command-line length limit for source.
+            with tempfile.TemporaryDirectory(prefix="mathagent-calculation-") as directory:
+                source = Path(directory) / "calculation.env"
+                source.write_text("MATHAGENT_SOURCE_BASE64=" + base64.b64encode(code.encode("utf-8")).decode("ascii"), encoding="ascii")
+                command[2:2] = ["--env-file", str(source)]
+                self._docker(command)
+            record["status"] = "starting"
+            _replace_json(path, record)
+            self._docker(["docker", "start", container])
+            record["status"] = "running"
+            _replace_json(path, record)
+        except (OSError, subprocess.SubprocessError):
+            # An ambiguous start is queried, never automatically launched twice.
+            return self.poll(project_id, job_id)
+        return {"job_id": job_id, "status": "running", "code": code, "provenance": provenance}
+
+    def _job_path(self, project_id, job_id):
+        if not isinstance(project_id, str) or not project_id or not isinstance(job_id, str) or not re.fullmatch(r"[0-9a-f]{64}", job_id):
+            return None
+        path = self.jobs_path / _hash(project_id.encode()) / (job_id + ".json")
+        try:
+            _plain(self.jobs_path, directory=True)
+            _plain(path.parent, directory=True)
+            _plain(path)
+            return path
+        except OSError:
+            return None
+
+    @staticmethod
+    def _docker(command):
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15,
+                                check=True, encoding="utf-8", errors="replace", env=_docker_environment())
+        return result.stdout
+
+    def poll(self, project_id, job_id):
+        path = self._job_path(project_id, job_id)
+        record = _read_json(path) if path else None
+        if not record or record.get("project_id") != project_id or record.get("container") != "mathagent-" + job_id:
+            return _failure("job_not_found", job_id=job_id)
+        if record.get("redacted_at"):
+            return _failure("material_erased", job_id=job_id)
+        if record["status"] == "complete":
+            return {"job_id": job_id, "status": "complete", **record["result"], "cached": True}
+        try:
+            state = json.loads(self._docker(["docker", "inspect", "--format", "{{json .State}}", record["container"]]))
+            if state.get("Running"):
+                return {"job_id": job_id, "status": "running", "elapsed_seconds": time.time() - record["created_at"]}
+            if state.get("Status") == "created":
+                # A host interruption during creation/start must not trigger an
+                # unrequested rerun. Preserve the source and expose that state.
+                return {"job_id": job_id, "status": "not_started", "reason": "start_interrupted",
+                        "detail": _cap(state.get("Error"))}
+            output = self._docker(["docker", "logs", record["container"]])
+            result = json.loads(output)
+            result.update(ok=result.get("reason") is None, code=record.get("code"),
+                          provenance=record["provenance"])
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return _failure("execution_unknown", job_id=job_id)
+        record.update(status="complete", result=result, completed_at=time.time())
+        if not _replace_json(path, record):
+            return _failure("journal_unavailable", job_id=job_id)
+        try:
+            self._docker(["docker", "rm", record["container"]])
+        except (OSError, subprocess.SubprocessError):
+            pass  # The durable result is already saved; this is cleanup only.
+        return {"job_id": job_id, "status": "complete", **result}
+
+    def cancel(self, project_id, job_id):
+        path = self._job_path(project_id, job_id)
+        record = _read_json(path) if path else None
+        if not record or record.get("project_id") != project_id or record.get("container") != "mathagent-" + job_id:
+            return _failure("job_not_found", job_id=job_id)
+        if record["status"] == "complete":
+            return self.poll(project_id, job_id)
+        try:
+            self._docker(["docker", "stop", "--time", "1", record["container"]])
+        except (OSError, subprocess.SubprocessError):
+            return _failure("cancellation_unknown", job_id=job_id)
+        result = _failure("cancelled", code=record.get("code"), provenance=record["provenance"])
+        record.update(status="complete", result=result, completed_at=time.time())
+        if not _replace_json(path, record):
+            return _failure("journal_unavailable", job_id=job_id)
+        try:
+            self._docker(["docker", "rm", record["container"]])
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return {"job_id": job_id, "status": "complete", **result}
+
+    def cancel_research(self, project_id, research_root_id):
+        """Human Stop applies to this research's background jobs, not other work."""
+        directory = self.jobs_path / _hash(project_id.encode())
+        results = []
+        for path in directory.glob("*.json") if directory.exists() else ():
+            record = _read_json(path)
+            if (record and record.get("project_id") == project_id
+                    and record.get("research_root_id") == research_root_id
+                    and record.get("status") != "complete" and record.get("container")):
+                results.append(self.cancel(project_id, record["job_key"]))
+        return results
 
     def _reserve_slot(self, project_path, job_key):
         slot = project_path / ("execution-" + job_key)
@@ -184,7 +331,7 @@ class CodeSandbox:
         try:
             completed = subprocess.run(
                 command, input=code, capture_output=True, text=True, timeout=timeout + 2,
-                check=False, env=_docker_environment(),
+                check=False, encoding="utf-8", errors="replace", env=_docker_environment(),
             )
         except subprocess.TimeoutExpired:
             return _failure("docker_timeout", image_id=self.image_id)
@@ -233,7 +380,7 @@ def _hash(value):
 
 def _bounded_timeout(value):
     try:
-        return max(1, min(10, int(value)))
+        return max(1, min(60, int(value)))
     except (TypeError, ValueError):
         return 5
 
@@ -245,7 +392,7 @@ def _cap(value):
 def _read_json(path):
     try:
         _plain(path)
-        if path.stat().st_size > 1024 * 1024:
+        if path.stat().st_size > 16 * 1024 * 1024:
             return None
         value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else None

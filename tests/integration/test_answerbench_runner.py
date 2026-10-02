@@ -117,15 +117,9 @@ class ScriptedInference:
             assert request.url == httpx.URL("https://api.deepseek.com/chat/completions")
             assert "tools" in payload and "response_format" not in payload
             peer = "你是研究同伴" in serialized
-            startup = not peer and any("当前任务：\n理解题目的条件与目标" in message.get("content", "")
-                                      for message in payload["messages"])
-            if startup:
-                assert payload["thinking"] == {"type": "disabled"}
-                assert "reasoning_effort" not in payload and payload["max_tokens"] <= 4096
-                assert payload["tool_choice"] == "required"
-            else:
-                assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "max"
-                assert "tool_choice" not in payload
+            assert payload["thinking"] == {"type": "enabled"} and payload["reasoning_effort"] == "max"
+            assert "tool_choice" not in payload
+            assert not {"search_literature", "read_literature"} & {tool["function"]["name"] for tool in payload["tools"]}
             self.dispatches.append((case["id"], "peer" if peer else "lead"))
             await asyncio.sleep(0.08)
             if case["id"] == self.failed_case:
@@ -170,7 +164,8 @@ def test_unknown_retry_completes_explicit_submission_with_unresolved_cost(worksp
         case_ids=[cases[0]["id"]], transport_factory=factory))
     assert report["all_completed"] and report["all_unattended"] and report["source_unchanged"]
     case_report = read_json(output / cases[0]["id"] / "report.json")
-    assert case_report["workflow_completed"] and not case_report["finalized_after_review"]
+    assert case_report["submission_present"] and case_report["researcher_outcome"] == "solved"
+    assert "finalized_after_review" not in case_report
     assert case_report["financial_reconciliation_pending"] is True
     assert case_report["unknown_retries_authorized"] == 1
     assert case_report["budget"]["unknown"] == 1 and case_report["budget"]["spent"] == 3
@@ -265,12 +260,13 @@ def test_four_cases_two_real_api_processes_discussion_export_and_frozen_resume(w
         directory = output / case["id"]
         report = read_json(directory / "report.json")
         assert report["completed"] and report["final_answer"] == "2"
-        assert report["requests"] == 3 and report["independent_reviews"] == 0
+        assert report["requests"] == 3 and report["submission_present"] is True
+        assert "independent_reviews" not in report
         assert len(report["calls"]) == 3 and len(report["steps"]) == 2
         assert report["human_interventions"] == 0 and not report["model_web_tools"]
         parameters = [call["call_config"]["parameters"] for call in report["calls"]]
-        assert sum(p["thinking"] == {"type": "enabled"} for p in parameters) == 1
-        assert sum(p["thinking"] == {"type": "disabled"} for p in parameters) == 2
+        assert all(p["thinking"] == {"type": "enabled"} for p in parameters)
+        assert all("tool_choice" not in p for p in parameters)
         assert all(p["reasoning_effort"] == "max" for p in parameters if p["thinking"]["type"] == "enabled")
         assert len(list(directory.glob("dispatch-*.json"))) == 3
         assert (directory / "api.log").exists()

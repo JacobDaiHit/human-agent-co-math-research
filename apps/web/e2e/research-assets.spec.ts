@@ -58,5 +58,5 @@ test('permanent deletion clears unsaved drafts across branches and old history',
 })
 
 test('code sandbox reports unavailable and disables enable', async ({ page, request }, testInfo) => {
-  await command(request, '/projects', { title: '资产验收 · 沙箱', body: '离线沙箱状态。' }); await openProject(page, '资产验收 · 沙箱'); await page.getByRole('tab', { name: '运行', exact: true }).click(); const panel = page.getByLabel('请求额度与调用账本'); await expect(panel).toContainText('离线代码沙箱'); await expect(panel).toContainText('环境不可用'); await expect(panel.getByRole('button', { name: '启用沙箱', exact: true })).toBeDisabled(); await expect(panel).toContainText('仅允许离线标准库'); await page.screenshot({ path: testInfo.outputPath('code-sandbox-unavailable.png'), fullPage: true })
+  await command(request, '/projects', { title: '资产验收 · 沙箱', body: '离线沙箱状态。' }); await openProject(page, '资产验收 · 沙箱'); await page.getByRole('tab', { name: '运行', exact: true }).click(); const panel = page.getByLabel('请求额度与调用账本'); await expect(panel).toContainText('离线代码沙箱'); await expect(panel).toContainText('环境不可用'); await expect(panel.getByRole('button', { name: '启用沙箱', exact: true })).toBeDisabled(); await expect(panel).toContainText('Python 与 SymPy'); await page.screenshot({ path: testInfo.outputPath('code-sandbox-unavailable.png'), fullPage: true })
 })

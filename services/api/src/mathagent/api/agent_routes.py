@@ -13,7 +13,13 @@ from mathagent.persistence.agent_models import AgentStep, ProviderCall
 from mathagent.persistence.models import Project
 from mathagent.persistence.runtime_models import ProviderRequest
 from mathagent.providers.actions import operation_schemas
-from mathagent.providers.options import MAX_OUTPUT_TOKENS, ReasoningEffort, ThinkingMode
+from mathagent.providers.options import (
+    MAX_OUTPUT_TOKENS,
+    MAX_REQUEST_TIMEOUT_SECONDS,
+    MAX_RESEARCH_SECONDS,
+    ReasoningEffort,
+    ThinkingMode,
+)
 from mathagent.providers.search_contract import SearchConfig
 from pydantic import Field
 from sqlalchemy import select
@@ -26,9 +32,9 @@ class RunUpdate(Command):
     max_review_rounds: int | None = Field(default=None, ge=0, le=2)
     max_children: int | None = Field(default=None, ge=0, le=12)
     max_depth: int | None = Field(default=None, ge=0, le=4)
-    max_output_tokens: int | None = Field(default=None, ge=256, le=MAX_OUTPUT_TOKENS)
-    cumulative_output_token_budget: int | None = Field(default=None, ge=256, le=10_000_000)
-    request_timeout_seconds: int | None = Field(default=None, ge=1, le=600)
+    max_output_tokens: int | None = Field(default=None, ge=1, le=MAX_OUTPUT_TOKENS)
+    cumulative_output_token_budget: int | None = Field(default=None, ge=1, le=10_000_000)
+    request_timeout_seconds: int | None = Field(default=None, ge=1, le=MAX_REQUEST_TIMEOUT_SECONDS)
     thinking_mode: ThinkingMode | None = None
     reasoning_effort: ReasoningEffort | None = None
     completion_policy: Literal["draft", "reviewed_answer"] | None = None
@@ -36,7 +42,9 @@ class RunUpdate(Command):
     unknown_recovery: Literal["stop", "once"] | None = None
     solver_controller: Literal["legacy", "bounded_search_v1", "continuous_research"] | None = None
     discussion: bool | None = None
-    research_deadline_seconds: int | None = Field(default=None, ge=1, le=86400)
+    research_deadline_seconds: int | None = Field(default=None, ge=1, le=MAX_RESEARCH_SECONDS)
+    max_researchers: int | None = Field(default=None, ge=1, le=16)
+    literature: bool | None = None
     answer_submission_recovery: bool | None = None
     answer_requires_exhaustiveness: bool | None = None
     search_config: SearchConfig | None = None
@@ -93,9 +101,9 @@ def mount_agent_routes(app, runtime, human, worker, key, command):
         payload = {"attempt_id": attempt_id, **p.model_dump()}
         status, response = runtime.service.execute("research.tool", k, payload,
                                                    runtime.research.execute_tool)
-        if "computation" not in response:
+        if "computation" not in response and "external" not in response:
             return JSONResponse(response, status_code=status)
-        result = await asyncio.to_thread(runtime.research.compute, response["computation"])
+        result = await asyncio.to_thread(runtime.research.compute, response["computation"]) if "computation" in response else await asyncio.to_thread(runtime.research.external, response["external"])
         return command("research.computation", k + ":result", {**payload, "result": result},
                        runtime.research.finish_computation)
 
@@ -121,8 +129,11 @@ def mount_agent_routes(app, runtime, human, worker, key, command):
         return command("agent.branch_budget", k, {"branch_id": branch_id, **p.model_dump()}, agent.update_branch_settings)
 
     @app.post("/branches/{branch_id}/interventions", dependencies=[Depends(human)])
-    def branch_intervention(branch_id: str, p: BranchIntervention, k: str = Depends(key)):
-        return command("agent.branch_intervention", k, {"branch_id": branch_id, **p.model_dump()}, agent.intervene_branch)
+    async def branch_intervention(branch_id: str, p: BranchIntervention, k: str = Depends(key)):
+        response = command("agent.branch_intervention", k, {"branch_id": branch_id, **p.model_dump()}, agent.intervene_branch)
+        if p.action == "cancel":
+            await asyncio.to_thread(runtime.research.cancel_computations, branch_id=branch_id)
+        return response
 
     @app.get("/runs/{run_id}/steps", dependencies=[Depends(human)])
     def steps(run_id: str):

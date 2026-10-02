@@ -33,7 +33,6 @@ from mathagent.evaluation.outcomes import (
 )
 from mathagent.providers import research
 from mathagent.providers.remote import DEFAULT_URLS, RemoteProvider
-from mathagent.runtime.completion import boxed_answers
 from mathagent.runtime.worker import HTTPWorker
 
 OPERATIONS = [
@@ -56,11 +55,12 @@ internet access, hidden answers or solution hints. Work on the actual local task
 Use calculations, saved worknotes, new local tasks and a research peer when useful.
 Keep the original assumptions and quantifiers. Present mathematical reasoning as
 ordinary text with LaTeX. The peer is a researcher, not an approving authority.
-For the peer's first task provide the original problem and a neutral research goal,
-not your candidate answer. Exchange actual arguments, failures and open questions
-after that independent attempt; do not seek votes or agreement.
+Choose independent exploration when you need another approach: provide the original
+problem and a neutral local goal, not your candidate answer. For targeted work,
+provide the exact inference and relevant material immediately. Exchange actual
+arguments, failures and open questions; do not seek votes or agreement.
 All members and tools share the problem's request and output budgets.
-When ready, explicitly submit your selected solution body and its short answer.
+When ready, explicitly submit your selected solution body. A short answer is optional.
 For tasks asking for all solutions, explain both membership and exhaustiveness.
 If unresolved, save the remaining obstacle and submit an unresolved outcome.
 A submitted solution is not program-verified mathematical truth.
@@ -104,14 +104,14 @@ def load_problems(path):
 
 @dataclass(frozen=True)
 class Limits:
-    request_budget: int = 12
+    request_budget: int = 1000
     max_steps: int = 6
     max_children: int = 3
     max_depth: int = 2
     max_review_rounds: int = 2
-    max_output_tokens: int = 65536
-    request_timeout_seconds: int = 600
-    case_timeout_seconds: int = 1800
+    max_output_tokens: int = 131072
+    request_timeout_seconds: int = 3600
+    case_timeout_seconds: int = 86400
     parallel_cases: int = 2
     thinking_mode: str = "enabled"
     reasoning_effort: str = "max"
@@ -123,18 +123,19 @@ class Limits:
     solver: str = "agent"
     solver_controller: str = "continuous_research"
     discussion: bool = True
-    research_deadline_seconds: int = 1800
+    research_deadline_seconds: int = 86400
+    max_researchers: int = 4
     search_config: dict = field(default_factory=dict)
     cumulative_output_token_budget: int | None = None
     builtin_calculator: bool = False
     case_order_seed: int = 0
 
     def validate(self):
-        if not 1 <= self.request_budget <= 100:
+        if not 1 <= self.request_budget <= 1000:
             raise ValueError("Invalid request budget")
-        if self.parallel_cases not in {1, 2} or not 1 <= self.case_timeout_seconds <= 7200:
+        if self.parallel_cases not in {1, 2} or not 1 <= self.case_timeout_seconds <= 604800:
             raise ValueError("Invalid batch concurrency/deadline")
-        if not 256 <= self.max_output_tokens <= 65536 or not 1 <= self.request_timeout_seconds <= 600:
+        if not 1 <= self.max_output_tokens <= 393216 or not 1 <= self.request_timeout_seconds <= 3600:
             raise ValueError("Invalid provider budget/deadline")
         if self.thinking_mode != "enabled" or self.reasoning_effort not in {"high", "max"}:
             raise ValueError("This pilot requires an explicit high/max thinking setting")
@@ -156,7 +157,7 @@ class Limits:
             raise ValueError("Invalid unknown outcome recovery policy")
         if type(self.code_sandbox) is not bool:
             raise ValueError("Invalid sandbox policy")
-        if type(self.discussion) is not bool or not 1 <= self.research_deadline_seconds <= 86400:
+        if type(self.discussion) is not bool or not 1 <= self.research_deadline_seconds <= 604800 or not 1 <= self.max_researchers <= 16:
             raise ValueError("Invalid discussion/deadline configuration")
         if type(self.builtin_calculator) is not bool:
             raise ValueError("Invalid calculator policy")
@@ -164,7 +165,7 @@ class Limits:
             raise ValueError("Invalid case ordering seed")
         if self.cumulative_output_token_budget is not None and (
                 type(self.cumulative_output_token_budget) is not int or
-                not 256 <= self.cumulative_output_token_budget <= 6_553_600):
+                not 1 <= self.cumulative_output_token_budget <= 10_000_000):
             raise ValueError("Invalid cumulative output token budget")
 
 
@@ -234,6 +235,8 @@ async def local_api(directory, config):
         prefix + "_API_KEY": config.api_key, prefix + "_MODEL": config.model,
         prefix + "_BASE_URL": config.base_url,
     })
+    if config.context_capacity is not None:
+        environment[prefix + "_CONTEXT_CAPACITY"] = str(config.context_capacity)
     # Only the operator-selected image crosses into the isolated API; project
     # opt-in and the frozen-image check still happen before inference dispatch.
     if os.environ.get("MATHAGENT_SANDBOX_IMAGE"):
@@ -326,7 +329,8 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
         options = {k: v for k, v in asdict(limits).items() if k in {
             "request_budget", "max_output_tokens", "request_timeout_seconds",
             "thinking_mode", "reasoning_effort", "unknown_recovery",
-            "discussion", "research_deadline_seconds", "cumulative_output_token_budget"}}
+            "discussion", "research_deadline_seconds", "max_researchers", "cumulative_output_token_budget"}}
+        options["literature"] = False  # Original-only evaluation, never a paper/answer lookup.
         options["solver_controller"] = limits.solver_controller
         research = await write("/runs", {"branch_id": branch_id,
             "goal_object_id": project["object_id"], "provider": config.name,
@@ -340,7 +344,7 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
         transport = CompletionOnlyTransport(DEFAULT_URLS[config.name] + "/chat/completions", directory,
             inner=transport_factory(case) if transport_factory else None)
         async with httpx.AsyncClient(transport=transport, follow_redirects=False, trust_env=False) as external:
-            worker = HTTPWorker(client, providers=[config.name], concurrency=1,
+            worker = HTTPWorker(client, providers=[config.name], concurrency=min(limits.max_researchers, 4),
                 provider_factory=lambda _: RemoteProvider(config, external))
             work = asyncio.create_task(asyncio.sleep(0) if timed_out else worker.run(once=True))
             previous = None
@@ -372,14 +376,12 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
         search_state = await read(f"/runs/{run_id}/search") if limits.solver_controller == "bounded_search_v1" else None
         research_state = await read(f"/runs/{run_id}/research") if limits.solver_controller == "continuous_research" else None
         all_runs = {run["id"]: run for run in snapshot["runs"]}
-        all_reviews = {review["id"]: review for review in snapshot["reviews"]}
         branches = (await read(f"/projects/{project_id}/branches"))["branches"]
         for branch in branches:
             if branch["id"] == branch_id:
                 continue
             other = await read(f"/projects/{project_id}/snapshot?branch_id={branch['id']}")
             all_runs.update((run["id"], run) for run in other["runs"])
-            all_reviews.update((review["id"], review) for review in other["reviews"])
         calls = []
         for run in all_runs.values():
             calls.extend((await read(f"/runs/{run['id']}/calls"))["calls"])
@@ -387,23 +389,12 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
         final_body = steps[-1]["body"] if steps else None
         budget = await read(f"/projects/{project_id}/budget")
         root_budget = await read(f"/runs/{run_id}/budget")
-        reviews = [review for review in all_reviews.values() if review["kind"] == "llm_review"]
-        answers = boxed_answers(final_body)
-        answer = answers[0] if len(answers) == 1 and root["state"] == "completed" and not timed_out else None
-        final_citations = set(next((call.get("result", {}).get("cited_revision_ids", [])
-            for call in calls if steps and call["request_id"] == steps[-1]["request_id"] and call.get("result")), []))
-        reviewed_targets = {review["target_revision_id"] for review in reviews if review["verdict"] == "passed"}
-        review_completed = bool(reviewed_targets & final_citations)
-        completion_checks = steps[-1]["receipt"].get("completion_checks", {}) if steps else {}
-        finalized_after_review = completion_checks.get("policy") == "reviewed_answer" and completion_checks.get("passed") is True
-        workflow_completed = root["state"] == "completed" and answer is not None and review_completed and finalized_after_review and not timed_out
         if research_state is not None:
             final_body = (research_state.get("solution") or {}).get("body")
-            workflow_completed = root["state"] == "completed" and research_state["session"]["outcome"] == "solved" and not timed_out
-        outcomes = agent_outcomes(steps, calls, reviews, workflow_completed, research_state)
+        outcomes = agent_outcomes(steps, calls, research_state)
         answer = outcomes["answer_submission"]["answer"]
-        mode_completed = workflow_completed if limits.evaluation_mode == "research" else (
-            answer is not None and root["state"] == "completed" and not timed_out)
+        submitted = outcomes["answer_submission"]["status"] == "submitted"
+        mode_completed = root["state"] == "completed" and submitted and not timed_out
         events, cursor = [], 0
         while True:
             page = await read(f"/projects/{project_id}/events?after_seq={cursor}")
@@ -413,13 +404,11 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
                 break
         audit = intervention_audit(events, journal.get("scheduler_cancel_receipt"))
         report = {**base, **audit, "state": root["state"],
-            "terminal_reason": "case_timeout" if timed_out else "unresolved" if research_state and research_state["session"]["outcome"] == "unresolved" else "missing_final_answer" if root["state"] == "completed" and answer is None else "review_missing" if not research_state and limits.evaluation_mode == "research" and root["state"] == "completed" and not review_completed else root["state"],
+            "terminal_reason": "case_timeout" if timed_out else "unresolved" if research_state and research_state["session"]["outcome"] == "unresolved" else "missing_submission" if root["state"] == "completed" and not submitted else root["state"],
             "runtime_terminal": root["state"] in TERMINAL, "runtime_completed": root["state"] == "completed",
-            "final_answer_present": answer is not None, "review_completed": review_completed,
-            "finalized_after_review": finalized_after_review, "completion_checks": completion_checks,
-            "reviewed_candidate_revision_ids": sorted(reviewed_targets & final_citations),
-            "workflow_completed": workflow_completed, "completed": mode_completed,
-            "report_schema_version": "2.0", "evaluation_mode": limits.evaluation_mode,
+            "final_answer_present": answer is not None, "submission_present": submitted,
+            "completed": mode_completed,
+            "report_schema_version": "3.0", "evaluation_mode": limits.evaluation_mode,
             "solver": limits.solver, **outcomes, "usage_summary": usage_summary(calls),
             "solver_controller": limits.solver_controller,
             "elapsed_seconds": (datetime.now(UTC) - datetime.fromisoformat(journal["started_at"])).total_seconds(),
@@ -428,11 +417,10 @@ async def run_case(case, directory, config, limits, batch_id, *, api_factory=loc
             "output_token_budget": root_budget.get("output_token_budget"),
             "financial_reconciliation_pending": budget["unknown"] > 0,
             "unknown_retries_authorized": sum(event["type"] == "request.unknown_retry_authorized" for event in events),
-            "steps": steps, "calls": calls, "reviews": reviews, "runs": list(all_runs.values()),
-            "independent_reviews": len(reviews),
+            "steps": steps, "calls": calls, "runs": list(all_runs.values()),
             "network_dispatches": len(list(directory.glob("dispatch-*.json"))),
             "network_dispatches_this_process": transport.number,
-            "evaluation_kind": "unattended_agent_short_answer" if audit["unattended_eligible"] else "intervened_agent_short_answer", "scored": False}
+            "evaluation_kind": "unattended_research" if audit["unattended_eligible"] else "intervened_research"}
         if search_state is not None:
             report["search_state"] = search_state
         if research_state is not None:
@@ -513,6 +501,7 @@ async def run_batch(problems_file, directory, config, limits, root, *, resume=Fa
         fingerprint = source_fingerprint(Path(root))
         stable = {"problems_sha256": digest(Path(problems_file).read_bytes()),
             "provider": config.name, "requested_model": config.model, "limits": asdict(limits),
+            "provider_context_capacity": config.context_length(),
             "source": fingerprint, "instruction_sha256": digest(instruction_for(limits).encode()),
             "submission_rule": RESEARCH_SUBMISSION_RULE if limits.solver == "agent" and limits.solver_controller == "continuous_research" else SUBMISSION_RULE,
             "selection_rule": ("independent-single-box-whitespace-vote-earliest-v1"
@@ -563,11 +552,12 @@ async def run_batch(problems_file, directory, config, limits, root, *, resume=Fa
         reports = await asyncio.gather(*(bounded(case) for case in problems["problems"]))
         summary = {"batch_id": plan["batch_id"], "finished_at": stamp(),
             "scope": stable["scope"],
-            "cases": [{k: report.get(k) for k in ("case_id", "state", "completed", "requests", "independent_reviews", "terminal_reason", "human_interventions", "unattended_eligible", "financial_reconciliation_pending", "unknown_retries_authorized")} for report in reports],
+            "report_schema_version": "3.0",
+            "cases": [{k: report.get(k) for k in ("case_id", "state", "completed", "researcher_outcome", "requests", "terminal_reason", "human_interventions", "unattended_eligible", "financial_reconciliation_pending", "unknown_retries_authorized")} for report in reports],
             "case_reports": [f"{case['id']}/report.json" for case in problems["problems"]],
             "all_completed": all(report["completed"] for report in reports),
             "all_unattended": all(report.get("unattended_eligible") is True for report in reports),
             "source_unchanged": source_fingerprint(Path(root)) == fingerprint,
-            "answer_key_loaded": False, "scored": False}
+            "answer_key_loaded": False}
         write_json(directory / "report.json", summary)
         return summary

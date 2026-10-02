@@ -13,7 +13,7 @@ from mathagent.api.app import create_app
 from mathagent.exports.service import ExportService
 from mathagent.persistence.models import Attempt, Project, Revision, RevisionParent, Run
 from mathagent.persistence.solver_models import ResearchMember
-from mathagent.providers.remote import DeepSeekProvider, ProviderConfig
+from mathagent.providers.remote import DeepSeekProvider, ProviderConfig, ProviderFailure
 from mathagent.runtime.service import Runtime
 from mathagent.runtime.worker import HTTPWorker
 from mathagent.tools.code_sandbox import CodeSandbox
@@ -183,40 +183,49 @@ def test_export_freezes_notes_tasks_messages_and_the_explicit_solution(app):
     exercise(app, scenario)
 
 
-def test_no_automatic_copy_only_finalization_request(app):
+def test_plain_prose_continues_research_without_a_copy_only_finalizer(app):
     calls = 0
 
     class Model:
         async def generate(self, task):
             nonlocal calls
             calls += 1
+            if calls == 2:
+                visible = json.dumps(task["conversation"], ensure_ascii=False)
+                assert "尚未明确提交" in visible
+                return output("新的推导解决了剩余问题。", ("submit_solution", {"outcome": "solved", "answer": "fixture"}))
             return output("一个局部任务的研究结果，尚未明确提交原题解答。")
 
     async def scenario(client):
         _, run = await setup(client)
         await HTTPWorker(client, provider_factory=lambda _: Model(), fake_delay_seconds=0).run(once=True)
         state = await read(client, f"/runs/{run['run_id']}/research")
-        assert calls == 1 and len(state["work"]) == 1
-        assert state["members"][0]["state"] == "idle"
-        assert state["solution"] is None and state["session"]["answer"] is None
+        assert calls == 2 and len(state["work"]) == 1
+        assert state["members"][0]["state"] == "completed"
+        assert state["solution"]["body"] == "新的推导解决了剩余问题。"
+        assert state["session"]["answer"] == "fixture"
     exercise(app, scenario)
 
 
 def test_local_task_changes_direction_and_notes_have_immutable_history(app):
     calls = 0
+    opening = None
+    dialogue = None
 
     class Model:
         async def generate(self, task):
-            nonlocal calls
+            nonlocal calls, opening, dialogue
             calls += 1
             if calls == 1:
+                opening, dialogue = task["conversation"][0], task["research_dialogue_id"]
                 return output("记录目前已得到的整除关系。",
                     ("save_note", {"scope": "personal", "body": "已得到整除关系，下一步研究变量范围。"}),
                     ("assign_work", {"member": "self", "goal": "利用整除关系研究变量范围。"}))
             if calls == 2:
-                opening = task["conversation"][0]["content"]
-                assert "当前任务：\n利用整除关系研究变量范围。" in opening
-                assert "已得到整除关系" in opening
+                assert task["conversation"][0] == opening and task["research_dialogue_id"] == dialogue
+                visible = json.dumps(task["conversation"], ensure_ascii=False)
+                assert "当前任务更新：\\n利用整除关系研究变量范围。" in visible
+                assert "已得到整除关系" in visible
                 return output("局部研究得到一个范围。",
                     ("save_note", {"scope": "personal", "body": "保留整除关系；已得到变量范围，准备组合推导。"}))
             return output("工程夹具完整正文。", ("submit_solution", {"outcome": "solved", "answer": "fixture"}))
@@ -237,7 +246,7 @@ def test_local_task_changes_direction_and_notes_have_immutable_history(app):
     exercise(app, scenario)
 
 
-def test_small_initial_goal_then_user_configured_mathematical_research(app):
+def test_full_mathematical_capacity_and_user_settings_apply_from_first_turn(app):
     calls = 0
 
     class Model:
@@ -247,13 +256,15 @@ def test_small_initial_goal_then_user_configured_mathematical_research(app):
             opening = task["conversation"][0]["content"]
             assert "用户的研究要求：\nKeep the given assumptions." in opening
             if calls == 1:
-                assert task["max_output_tokens"] == 4096
-                assert "当前任务：\n理解题目的条件与目标" in opening
+                assert task["max_output_tokens"] == 32768
+                assert task["thinking_mode"] == "enabled" and task["reasoning_effort"] == "high"
+                assert "当前任务：\n研究原题" in opening
                 return output("先研究一个明确的小问题。",
                     ("assign_work", {"member": "self", "goal": "Derive the local relation."}))
             assert task["max_output_tokens"] == 32768
             assert task["thinking_mode"] == "enabled" and task["reasoning_effort"] == "high"
-            assert "当前任务：\nDerive the local relation." in opening
+            assert any("当前任务更新：\nDerive the local relation." in message["content"]
+                       for message in task["conversation"])
             return output("Synthetic solution.", ("submit_solution", {"outcome": "solved", "answer": "fixture"}))
 
     async def scenario(client):
@@ -263,13 +274,13 @@ def test_small_initial_goal_then_user_configured_mathematical_research(app):
         with app.state.database.sessions.begin() as session:
             record = session.get(Run, run["run_id"])
             record.provider = "deepseek"
-            light = Runtime(app.state.service).research.enrich(session, task)
+            full = Runtime(app.state.service).research.enrich(session, task)
             described = DeepSeekProvider(ProviderConfig("deepseek", "synthetic-secret", "fixture",
-                                                        "https://fixture.invalid", True)).describe(light)
-            assert described["parameters"]["thinking"] == {"type": "disabled"}
-            assert "reasoning_effort" not in described["parameters"]
-            assert described["parameters"]["max_tokens"] == 4096
-            assert described["parameters"]["tool_choice"] == "required"
+                                                        "https://fixture.invalid", True)).describe(full)
+            assert described["parameters"]["thinking"] == {"type": "enabled"}
+            assert described["parameters"]["reasoning_effort"] == "high"
+            assert described["parameters"]["max_tokens"] == 32768
+            assert "tool_choice" not in described["parameters"]
             record.provider = "fake"
         await HTTPWorker(client, provider_factory=lambda _: Model(), fake_delay_seconds=0).execute_research(task)
         assert calls == 2
@@ -277,6 +288,109 @@ def test_small_initial_goal_then_user_configured_mathematical_research(app):
         assert state["session"]["state"] == "completed"
         settings = await read(client, f"/runs/{run['run_id']}/options")
         assert settings["thinking_mode"] == "enabled" and settings["reasoning_effort"] == "high"
+    exercise(app, scenario)
+
+
+def test_model_compacts_its_own_context_and_can_read_the_full_saved_derivation(app):
+    calls = 0
+    saved_body = "LONG_DERIVATION_SENTINEL " + "x = x + 0. " * 5000
+
+    class Model:
+        async def generate(self, task):
+            nonlocal calls
+            calls += 1
+            visible = json.dumps(task["conversation"], ensure_ascii=False)
+            if calls == 1:
+                return output(saved_body)
+            if calls == 2:
+                assert "LONG_DERIVATION_SENTINEL" in visible
+                return output("重整工作稿后继续。", ("compact_context", {
+                    "summary": "COMPACT_NOTE: 已得到恒等关系；仍需解决剩余条件。"}))
+            if calls == 3:
+                assert "COMPACT_NOTE" in visible and "LONG_DERIVATION_SENTINEL" not in visible
+                assert len(task["conversation"]) == 1
+                return output("找回长推导。", ("list_materials", {"query": "LONG_DERIVATION_SENTINEL"}))
+            replies = [json.loads(item["content"]) for item in task["conversation"] if item["role"] == "tool"]
+            if calls == 4:
+                ref = replies[-1]["materials"][0]["ref"]
+                assert ref.startswith("revision:")
+                return output("读取完整来源。", ("read_material", {"ref": ref}))
+            assert replies[-1]["body"] == saved_body[:50000]
+            assert replies[-1]["next_offset"] == 50000
+            return output("新的推导已组合成解答。", ("submit_solution", {"outcome": "solved"}))
+
+    async def scenario(client):
+        _, run = await setup(client)
+        await HTTPWorker(client, provider_factory=lambda _: Model(), fake_delay_seconds=0).run(once=True)
+        state = await read(client, f"/runs/{run['run_id']}/research")
+        assert calls == 5 and state["session"]["state"] == "completed"
+        with app.state.database.sessions() as session:
+            assert session.scalar(select(Revision).where(Revision.body == saved_body))
+        assert len(state["work"]) == 2
+    exercise(app, scenario)
+
+
+def test_later_research_reuses_notes_and_original_material_without_cross_problem_leakage(app):
+    calls = 0
+
+    class Model:
+        async def generate(self, task):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return output("先前进展。",
+                    ("save_note", {"scope": "personal", "body": "PERSISTENT_PERSONAL_NOTE"}),
+                    ("save_note", {"scope": "shared", "body": "PERSISTENT_SHARED_NOTE"}),
+                    ("save_note", {"scope": "material", "body": "FULL_OLD_DERIVATION", "title": "旧推导"}),
+                    ("submit_solution", {"outcome": "unresolved"}))
+            visible = json.dumps(task["conversation"], ensure_ascii=False)
+            if calls == 2:
+                assert "PERSISTENT_PERSONAL_NOTE" in visible and "PERSISTENT_SHARED_NOTE" in visible
+                assert "UNRELATED_PROBLEM_SECRET" not in visible
+                return output("查找先前原始材料。", ("list_materials", {"query": "FULL_OLD_DERIVATION"}))
+            replies = [json.loads(item["content"]) for item in task["conversation"] if item["role"] == "tool"]
+            if calls == 3:
+                assert replies[-1]["materials"][0]["previous_research"] is True
+                return output("读取旧推导。", ("read_material", {"ref": replies[-1]["materials"][0]["ref"]}))
+            assert replies[-1]["body"] == "FULL_OLD_DERIVATION"
+            return output("接续得到新推导。", ("submit_solution", {"outcome": "solved"}))
+
+    async def scenario(client):
+        project, _ = await setup(client)
+        worker = HTTPWorker(client, provider_factory=lambda _: Model(), fake_delay_seconds=0)
+        await worker.run(once=True)
+        await write(client, "/projects", {"title": "另一道题", "body": "UNRELATED_PROBLEM_SECRET"})
+        run = await write(client, "/runs", {"branch_id": project["branch_id"],
+            "goal_object_id": project["object_id"], "autonomous": True, "request_budget": 12})
+        await worker.run(once=True)
+        assert calls == 4
+        assert (await read(client, f"/runs/{run['run_id']}/research"))["session"]["state"] == "completed"
+    exercise(app, scenario)
+
+
+def test_reasoning_only_length_stop_becomes_visible_research_not_ignored_hidden_state(app):
+    calls = 0
+    fragment = "PAID_MATHEMATICAL_PROGRESS " + "推导细节。" * 60000
+
+    class Model:
+        async def generate(self, task):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ProviderFailure("incomplete_output", outcome="spent", observation={
+                    "finish_reason": "length", "raw_text_truncated": False,
+                    "raw_text": json.dumps({"content": "", "reasoning_content": fragment}, ensure_ascii=False),
+                    "usage": {"completion_tokens": 32}})
+            assert any(item["role"] == "assistant" and fragment == item.get("reasoning_content")
+                       for item in task["conversation"])
+            return output("利用已付费的推导继续。", ("submit_solution", {"outcome": "unresolved"}))
+
+    async def scenario(client):
+        _, run = await setup(client)
+        await HTTPWorker(client, provider_factory=lambda _: Model(), fake_delay_seconds=0).run(once=True)
+        state = await read(client, f"/runs/{run['run_id']}/research")
+        assert calls == 2 and state["session"]["outcome"] == "unresolved"
+        assert state["output_budget"]["reported_output_tokens"] == 40
     exercise(app, scenario)
 
 
@@ -299,8 +413,12 @@ def test_independent_peer_then_two_way_topic_discussion_without_consensus_gate(a
                     return output("PEER_INDEPENDENT_ARGUMENT：不同方法得到的局部推导。",
                         ("save_note", {"scope": "personal", "body": "PEER_OWN_NOTE：先前的独立尝试。"}),
                         ("finish_work", {}))
-                assert "请解释你得到范围的关键一步" in visible
                 assert "PEER_OWN_NOTE" in visible
+                if "请解释你得到范围的关键一步" not in visible:
+                    # Four execution slots allow this reply before the lead's
+                    # follow-up arrives. Discussion must not depend on timing.
+                    return output("独立推导已完成，等待具体的问题。", ("send_message", {
+                        "recipient": "lead", "topic": "变量范围", "body": "可以讨论具体推导。", "wait": True}))
                 return output("PEER_NEW_DERIVATION：补出了关键一步，另一个问题仍有分歧。",
                     ("send_message", {"recipient": "lead", "topic": "变量范围",
                                       "body": "PEER_REPLY：具体的新推导，而非同意票。"}),
@@ -309,15 +427,14 @@ def test_independent_peer_then_two_way_topic_discussion_without_consensus_gate(a
                 return output("LEAD_SECRET_CONCLUSION：主研究者自己的初步判断。",
                     ("save_note", {"scope": "shared", "body": "LEAD_SECRET_CONCLUSION"}),
                     ("assign_work", {"member": "peer", "goal": "独立从原题研究变量范围。",
-                                     "materials": ["shared_note"]}))
+                                     "independent": True, "materials": ["shared_note"]}))
             if number == 2:
                 return output("请求同伴研究后交流。", ("send_message", {
                     "recipient": "peer", "topic": "变量范围", "body": "LEAD_SECRET_CONCLUSION", "wait": True}))
-            if number == 3:
+            if "PEER_REPLY" not in visible:
                 assert "PEER_INDEPENDENT_ARGUMENT" in visible
                 return output("回应同伴的不同推导。", ("send_message", {
                     "recipient": "peer", "topic": "变量范围", "body": "请解释你得到范围的关键一步。", "wait": True}))
-            assert "PEER_REPLY" in visible
             return output("利用已有推导形成解答，另一个意见不同不构成交付审批条件。",
                           ("submit_solution", {"outcome": "solved", "answer": "fixture"}))
 
@@ -328,7 +445,7 @@ def test_independent_peer_then_two_way_topic_discussion_without_consensus_gate(a
         assert state["session"]["state"] == "completed", state
         assert len(state["members"]) == 2
         assert all(len(ids) == 1 for ids in member_ids.values())
-        assert calls == {"lead": 4, "peer": 2}
+        assert calls["lead"] >= 4 and calls["peer"] >= 2
         assert len(state["messages"]) >= 4
         assert {message["topic"] for message in state["messages"]} >= {"变量范围"}
     exercise(app, scenario)

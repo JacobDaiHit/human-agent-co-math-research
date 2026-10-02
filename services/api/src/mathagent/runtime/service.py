@@ -30,7 +30,7 @@ from sqlalchemy import func, select
 
 
 class Runtime:
-    def __init__(self, service, *, lease_seconds: int = 60, max_active_attempts: int = 2):
+    def __init__(self, service, *, lease_seconds: int = 60, max_active_attempts: int = 4):
         if lease_seconds < 1 or max_active_attempts < 1:
             raise ValueError("Lease duration and active-attempt limit must be positive")
         self.service = service
@@ -49,7 +49,7 @@ class Runtime:
         row = session.get(RuntimeSettings, project_id)
         return row or RuntimeSettings(
             project_id=project_id,
-            request_budget=100,
+            request_budget=1000,
             allow_real_api=False,
             allowed_providers=["fake"],
         )
@@ -242,7 +242,7 @@ class Runtime:
         session.flush()
         active = session.scalars(select(Attempt).where(Attempt.state == "running")).all()
         if sum(not self._expired(attempt) for attempt in active) >= self.max_active_attempts:
-            return 200, {"task": None}
+            return 200, {"task": None, "work_pending": True}
         for run in session.scalars(
             select(Run)
             .where(Run.state == "queued", Run.provider.in_(payload["providers"]))
@@ -255,7 +255,11 @@ class Runtime:
             except DomainError as error:
                 if error.status != 403:
                     raise
-        return 200, {"task": None}
+        pending = session.scalar(select(Run.id).where(
+            Run.provider.in_(payload["providers"]),
+            Run.state.in_(["running", "pause_requested", "cancel_requested", "steer_requested",
+                           "waiting_discussion", "waiting_budget"])).limit(1))
+        return 200, {"task": None, "work_pending": pending is not None}
 
     def reserve_request(self, session, payload):
         attempt, run = self._attempt(session, payload, active=True)
@@ -295,6 +299,20 @@ class Runtime:
             # exact cap they will pass to the provider.
             requested_output_tokens = self.agent.options(session, run.id)["max_output_tokens"]
         output_budget = self.agent.output_token_budget_status(session, run)
+        research_session = self.research.session_for(session, run.id)
+        if output_budget["enabled"] and research_session:
+            remaining = output_budget["remaining_output_tokens"]
+            if remaining >= 1:
+                requested_output_tokens = min(requested_output_tokens, remaining)
+            else:
+                family = self.agent.subtree_ids(session, research_session.root_run_id)
+                if any(r.state in {"reserved", "dispatched"} and r.run_id in family for r in requests):
+                    # Reservations are not bills. Let in-flight research settle
+                    # before deciding whether the whole budget is used up.
+                    attempt.state, run.state = "completed", "waiting_budget"
+                    run.current_attempt_id = None
+                    self._emit(session, run, "research.waiting_budget", {"attempt_id": attempt.id})
+                    return 200, {"continue": False, "state": run.state}
         if output_budget["enabled"] and requested_output_tokens > output_budget["remaining_output_tokens"]:
             attempt.state = "failed"
             run.state = "budget_exhausted"
@@ -360,7 +378,7 @@ class Runtime:
                 or (not native and config.options.get("unknown_recovery", "stop") != "once")):
             return False
         root_run = session.get(Run, root.run_id)
-        if root_run.state not in {"running", "waiting_children", "waiting_discussion", "idle", "queued"}:
+        if root_run.state not in {"running", "waiting_children", "waiting_discussion", "waiting_budget", "idle", "queued"}:
             return False
         observation = session.get(ProviderCall, row.id)
         if not observation or observation.complete or observation.result is not None:

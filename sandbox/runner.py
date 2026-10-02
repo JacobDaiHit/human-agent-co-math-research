@@ -1,5 +1,6 @@
 """Trusted, root-owned container supervisor. It is not untrusted solver code."""
 
+import base64
 import json
 import os
 import resource
@@ -10,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-MAX_OUTPUT = 32 * 1024
+MAX_OUTPUT = max(32 * 1024, min(1024 * 1024, int(os.environ.get("MATHAGENT_OUTPUT_BYTES", 32768))))
 MAX_CODE = 64 * 1024
 
 
@@ -19,12 +20,13 @@ def emit(**value):
 
 
 def main():
-    code = sys.stdin.buffer.read(MAX_CODE + 1)
+    source = os.environ.get("MATHAGENT_SOURCE_BASE64")
+    code = base64.b64decode(source) if source else sys.stdin.buffer.read(MAX_CODE + 1)
     if len(code) > MAX_CODE:
         emit(reason="code_too_large")
         return
     try:
-        timeout = max(1, min(10, int(os.environ.get("MATHAGENT_TIMEOUT_SECONDS", "5"))))
+        timeout = max(1, min(604800, int(os.environ.get("MATHAGENT_TIMEOUT_SECONDS", "5"))))
     except ValueError:
         timeout = 5
     program = Path("/work/program.py")
@@ -32,11 +34,13 @@ def main():
     # The untrusted uid needs read access to execute it, but cannot modify the
     # root-owned source after the supervisor has written it.
     os.chmod(program, 0o644)
-    command = [sys.executable, "-I", "-S", str(program)]
+    # Isolated mode excludes user paths and environment, but installed trusted
+    # libraries (notably SymPy) must remain importable.
+    command = [sys.executable, "-I", str(program)]
     child = subprocess.Popen(
         command, cwd="/work", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=True, env={"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONIOENCODING": "utf-8"},
-        preexec_fn=_drop_privileges,
+        preexec_fn=lambda: _drop_privileges(timeout),
     )
     stdout, stderr, overflow, timed_out = _collect(child, timeout)
     if timed_out:
@@ -48,10 +52,9 @@ def main():
              exit_code=child.returncode, stdout=stdout, stderr=stderr)
 
 
-def _drop_privileges():
-    timeout = max(1, min(10, int(os.environ.get("MATHAGENT_TIMEOUT_SECONDS", "5"))))
+def _drop_privileges(timeout):
     resource.setrlimit(resource.RLIMIT_CPU, (timeout, timeout + 1))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (1024 * 1024, 1024 * 1024))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
     os.setgroups([])
     os.setgid(65534)

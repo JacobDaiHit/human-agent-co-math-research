@@ -20,7 +20,7 @@ class BranchRuntime(Base):
     __tablename__ = "branch_runtime"
     branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id"), primary_key=True)
     state: Mapped[str] = mapped_column(String, default="active")
-    request_budget: Mapped[int] = mapped_column(Integer, default=100)
+    request_budget: Mapped[int] = mapped_column(Integer, default=1000)
     instruction: Mapped[str] = mapped_column(Text, default="")
 
 

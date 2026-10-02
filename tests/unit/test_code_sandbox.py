@@ -97,3 +97,79 @@ def test_project_has_no_lifetime_execution_counter_and_redaction_preserves_recei
     assert "code" not in record
     assert "code_hash" in record
     assert "stdout" not in record["result"]
+
+
+def test_background_job_survives_client_restart_and_is_never_started_twice(tmp_path, monkeypatch):
+    import base64
+    from pathlib import Path
+
+    commands = []
+    running = True
+
+    def docker(args, **kwargs):
+        commands.append(args)
+        assert kwargs["env"].keys() <= {"PATH", "SystemRoot"}
+        if args[1:3] == ["image", "inspect"]:
+            return _completed(args)
+        if args[1] == "create":
+            value = Path(args[args.index("--env-file") + 1]).read_text(encoding="ascii")
+            assert value.startswith("MATHAGENT_SOURCE_BASE64=")
+            assert base64.b64decode(value.split("=", 1)[1]).decode() == "print('LONG_RESULT')"
+        if args[1] == "inspect":
+            return subprocess.CompletedProcess(args, 0, json.dumps({"Running": running, "Status": "running" if running else "exited"}), "")
+        if args[1] == "logs":
+            return subprocess.CompletedProcess(args, 0, json.dumps({"reason": None, "stdout": "LONG_RESULT", "stderr": ""}), "")
+        return subprocess.CompletedProcess(args, 0, "container-id", "")
+
+    monkeypatch.setattr("mathagent.tools.code_sandbox.subprocess.run", docker)
+    sandbox = CodeSandbox(tmp_path / "mathagent.db", IMMUTABLE)
+    job = sandbox.start("project-a", "request:tool", "print('LONG_RESULT')", 3600)
+    assert job["status"] == "running" and job["code"] == "print('LONG_RESULT')"
+    create = next(command for command in commands if command[1] == "create")
+    assert "3600" in create[create.index("-e") + 1]
+    assert "--network" in create and "none" in create and "--read-only" in create
+    assert "--mount" not in create and "--privileged" not in create
+    assert "--memory" in create and "1g" in create
+    restarted = CodeSandbox(tmp_path / "mathagent.db", IMMUTABLE)
+    assert restarted.start("project-a", "request:tool", "print('LONG_RESULT')", 3600)["status"] == "running"
+    assert len([command for command in commands if command[1] == "start"]) == 1
+    running = False
+    result = restarted.poll("project-a", job["job_id"])
+    assert result["ok"] and result["stdout"] == "LONG_RESULT" and result["code"] == "print('LONG_RESULT')"
+    before = len(commands)
+    assert restarted.poll("project-a", job["job_id"])["cached"]
+    assert len(commands) == before
+    assert restarted.poll("other-project", job["job_id"])["reason"] == "job_not_found"
+
+
+def test_background_cancellation_is_scoped_and_durable(tmp_path, monkeypatch):
+    commands = []
+
+    def docker(args, **kwargs):
+        commands.append(args)
+        return _completed(args) if args[1:3] == ["image", "inspect"] else subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr("mathagent.tools.code_sandbox.subprocess.run", docker)
+    sandbox = CodeSandbox(tmp_path / "mathagent.db", IMMUTABLE)
+    job = sandbox.start("project-a", "calculation", "while True: pass", 3600)
+    result = sandbox.cancel("project-a", job["job_id"])
+    assert result["status"] == "complete" and result["reason"] == "cancelled"
+    assert sandbox.poll("project-a", job["job_id"])["reason"] == "cancelled"
+    assert [command[-1] for command in commands if command[1] in {"stop", "rm"}] == ["mathagent-" + job["job_id"]] * 2
+
+
+def test_permanent_project_erasure_stops_and_redacts_background_work(tmp_path, monkeypatch):
+    commands = []
+
+    def docker(args, **kwargs):
+        commands.append(args)
+        return _completed(args) if args[1:3] == ["image", "inspect"] else subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr("mathagent.tools.code_sandbox.subprocess.run", docker)
+    sandbox = CodeSandbox(tmp_path / "mathagent.db", IMMUTABLE)
+    job = sandbox.start("project-a", "erase-work", "print('private research')", 3600)
+    assert sandbox.erase_project("project-a") == {"redacted": 1, "pending": 0}
+    assert sandbox.poll("project-a", job["job_id"])["reason"] == "material_erased"
+    record = json.loads(next((tmp_path / "sandbox-jobs").rglob("*.json")).read_text())
+    assert record["status"] == "complete" and "code" not in record and "code" not in record["result"]
+    assert [command[-1] for command in commands if command[1] in {"stop", "rm"}] == ["mathagent-" + job["job_id"]] * 2

@@ -17,12 +17,14 @@ from mathagent.persistence.models import (
 )
 from mathagent.persistence.runtime_models import ProviderRequest, RunOptions
 from mathagent.providers.actions import operation_schemas
+from mathagent.providers.observability import MAX_RAW_TEXT
+from mathagent.providers.options import MAX_OUTPUT_TOKENS
 from mathagent.providers.protocol import validate_result
 from sqlalchemy import func, select
 
 DEFAULT_OPTIONS = {
     "max_steps": 8, "max_review_rounds": 2, "max_children": 4, "max_depth": 2,
-    "max_output_tokens": 4096, "request_timeout_seconds": 180,
+    "max_output_tokens": 131072, "request_timeout_seconds": 3600,
     "cumulative_output_token_budget": None,
     "thinking_mode": "provider_default", "reasoning_effort": "provider_default",
     "completion_policy": "draft",
@@ -31,7 +33,8 @@ DEFAULT_OPTIONS = {
     "answer_requires_exhaustiveness": False,
     "unknown_recovery": "stop",
     "solver_controller": "continuous_research", "search_config": {},
-    "discussion": True, "research_deadline_seconds": 1800,
+    "discussion": True, "research_deadline_seconds": 86400,
+    "max_researchers": 4, "literature": True,
 }
 TERMINAL = {"completed", "cancelled", "failed", "interrupted", "budget_exhausted", "step_limit"}
 
@@ -88,6 +91,8 @@ class AgentRuntime:
         if research:
             research.config = {**research.config,
                 "discussion": payload.get("discussion", research.config["discussion"]),
+                "max_researchers": payload.get("max_researchers", research.config.get("max_researchers", 4)),
+                "literature": payload.get("literature", research.config.get("literature", True)),
                 "deadline_seconds": payload.get("research_deadline_seconds", research.config["deadline_seconds"])}
             if not research.config["discussion"]:
                 self.runtime.research.discussion_closed(session, research)
@@ -99,7 +104,7 @@ class AgentRuntime:
     def branch_settings(self, session, branch_id):
         self.state.require_branch(session, branch_id)
         row = session.get(BranchRuntime, branch_id)
-        return {"branch_id": branch_id, "request_budget": row.request_budget if row else 100,
+        return {"branch_id": branch_id, "request_budget": row.request_budget if row else 1000,
                 "state": row.state if row else "active"}
 
     def update_branch_settings(self, session, payload):
@@ -127,7 +132,7 @@ class AgentRuntime:
         branch = self.state.require_branch(session, payload["branch_id"])
         row = session.get(BranchRuntime, branch.id)
         if not row:
-            row = BranchRuntime(branch_id=branch.id, request_budget=100, instruction="")
+            row = BranchRuntime(branch_id=branch.id, request_budget=1000, instruction="")
             session.add(row)
         action = payload["action"]
         row.state = {"pause": "paused", "cancel": "cancelled", "resume": "active"}.get(action, row.state or "active")
@@ -207,7 +212,7 @@ class AgentRuntime:
                     parameters = (call.call_config or {}).get("parameters", {}) if call else {}
                     configured = parameters.get("max_tokens", parameters.get("max_output_tokens")) \
                         if isinstance(parameters, dict) else None
-                    reservation = configured if self._nonnegative_int(configured) is not None and 256 <= configured <= 65_536 else 65_536
+                    reservation = configured if self._nonnegative_int(configured) is not None and 1 <= configured <= MAX_OUTPUT_TOKENS else MAX_OUTPUT_TOKENS
                 reserved += reservation
                 incomplete_usage += 1
             if request.state == "unknown":
@@ -445,12 +450,13 @@ class AgentRuntime:
             raise DomainError(409, "request_outcome_unknown", "未知请求的观察记录已冻结，不能作为后续产物提交")
         observation = payload["observation"]
         raw = observation.get("raw_text", "")
-        if not isinstance(raw, str) or len(raw) > 200000:
+        if not isinstance(raw, str) or len(raw) > MAX_RAW_TEXT:
             raise DomainError(422, "invalid_observation", "可见输出超出保存范围")
         config = observation.get("call_config", {})
         # Credentials are never accepted as configuration metadata.
         allowed = {"provider", "model", "parameters", "request_timeout_seconds", "prompt_template_version",
-                   "prompt_template_sha256", "prompt_sha256", "simulated", "transport_timeout_seconds", "review_input_receipt"}
+                   "prompt_template_sha256", "prompt_sha256", "simulated", "transport_timeout_seconds", "review_input_receipt",
+                   "research_context"}
         if set(config) - allowed or len(json.dumps(config, ensure_ascii=False)) > 30000:
             raise DomainError(422, "invalid_call_config", "调用元数据包含不允许的字段")
         row = session.get(ProviderCall, request.id)

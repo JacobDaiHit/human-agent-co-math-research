@@ -8,7 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 class RuntimeSettings(Base):
     __tablename__ = "runtime_settings"
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), primary_key=True)
-    request_budget: Mapped[int] = mapped_column(Integer, default=100)
+    request_budget: Mapped[int] = mapped_column(Integer, default=1000)
     allow_real_api: Mapped[bool] = mapped_column(Boolean, default=False)
     allowed_providers: Mapped[list] = mapped_column(JSON, default=lambda: ["fake"])
 

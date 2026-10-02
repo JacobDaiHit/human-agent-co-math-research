@@ -262,10 +262,13 @@ def create_app(database_path=None, token=None, worker_token=None, allowed_origin
         )
 
     @app.post("/runs/{run_id}/interventions", dependencies=[Depends(human)])
-    def intervene(run_id: str, p: InterventionCreate, k: str = Depends(key)):
-        return command(
+    async def intervene(run_id: str, p: InterventionCreate, k: str = Depends(key)):
+        response = command(
             "run.intervene", k, {**p.model_dump(mode="json"), "run_id": run_id}, runtime.intervene
         )
+        if p.action == "cancel":
+            await asyncio.to_thread(runtime.research.cancel_computations, run_id=run_id)
+        return response
 
     @app.post("/runs/{run_id}/resume", dependencies=[Depends(human)])
     def resume(run_id: str, k: str = Depends(key)):

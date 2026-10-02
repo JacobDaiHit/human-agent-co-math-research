@@ -62,5 +62,5 @@ def test_discussion_can_be_disabled_without_changing_request_budget(monkeypatch)
     monkeypatch.setattr("sys.argv", ["imo_answerbench.py", "--execute", "--output", "out", "--no-discussion"])
     module.main()
     assert captured["discussion"] is False
-    assert captured["request_budget"] == 12
+    assert captured["request_budget"] == 1000
     assert "max_steps" not in captured

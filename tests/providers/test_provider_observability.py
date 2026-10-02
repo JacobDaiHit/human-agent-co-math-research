@@ -341,11 +341,11 @@ def test_total_deadline_interrupts_a_stream_that_keeps_sending_heartbeats():
 @pytest.mark.parametrize(
     "changes,code",
     [
-        ({"max_output_tokens": 255}, "invalid_max_output_tokens"),
-        ({"max_output_tokens": 65537}, "invalid_max_output_tokens"),
+        ({"max_output_tokens": 0}, "invalid_max_output_tokens"),
+        ({"max_output_tokens": 393217}, "invalid_max_output_tokens"),
         ({"max_output_tokens": True}, "invalid_max_output_tokens"),
         ({"request_timeout_seconds": 0}, "invalid_request_timeout"),
-        ({"request_timeout_seconds": 601}, "invalid_request_timeout"),
+        ({"request_timeout_seconds": 3601}, "invalid_request_timeout"),
         ({"request_timeout_seconds": float("nan")}, "invalid_request_timeout"),
         ({"provider_options": {"model": "untrusted-override"}}, "invalid_provider_options"),
         ({"thinking_mode": "auto"}, "invalid_thinking_mode"),
@@ -364,6 +364,20 @@ def test_invalid_options_never_dispatch(changes, code):
     assert str(caught.value) == code
     assert caught.value.outcome == "unaccepted"
     assert caught.value.observation["complete"] is False
+
+
+@pytest.mark.parametrize("cap", [1, 131072, 393216])
+def test_full_provider_output_range_is_sent_without_a_hidden_clamp(cap):
+    captured = {}
+
+    def transport(request):
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json=envelope(json.dumps(result())))
+
+    call(transport, task(max_output_tokens=cap, request_timeout_seconds=3600,
+                         thinking_mode="enabled", reasoning_effort="max"))
+    assert captured["max_tokens"] == cap
+    assert captured["thinking"] == {"type": "enabled"} and captured["reasoning_effort"] == "max"
 
 
 def test_http_diagnostics_redact_known_key_and_url_credentials():
@@ -403,7 +417,7 @@ def test_raw_observation_and_wire_buffer_are_bounded():
             task(max_output_tokens=256),
         )
     assert str(caught.value) == "response_too_large"
-    assert len(caught.value.observation["raw_text"]) == MAX_RAW_TEXT
+    assert len(caught.value.observation["raw_text"]) == min(MAX_RAW_TEXT, MAX_WIRE_BYTES)
     assert caught.value.observation["raw_text_truncated"] is True
     assert caught.value.observation["complete"] is False
 

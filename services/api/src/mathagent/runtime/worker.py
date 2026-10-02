@@ -33,13 +33,13 @@ class HTTPWorker:
         client,
         *,
         providers=("fake",),
-        concurrency=2,
+        concurrency=4,
         fake_delay_seconds=4.0,
         poll_seconds=0.5,
         provider_factory=None,
     ):
-        if concurrency not in {1, 2}:
-            raise ValueError("Worker concurrency must be 1 or 2")
+        if not 1 <= concurrency <= 16:
+            raise ValueError("Worker concurrency must be between 1 and 16")
         if not providers or not set(providers).issubset({"fake", "deepseek", "glm"}):
             raise ValueError("Unsupported provider")
         if fake_delay_seconds < 0 or poll_seconds <= 0:
@@ -130,7 +130,7 @@ class HTTPWorker:
                 # the adapter will receive.  A below-minimum remainder is
                 # deliberately rejected by reserve before any provider call.
                 reservation = await self._post(attempt_path + "/requests", {
-                    **execution, "requested_output_tokens": max(256, task["max_output_tokens"]),
+                    **execution, "requested_output_tokens": max(1, task["max_output_tokens"]),
                 })
                 if not reservation["continue"]:
                     return
@@ -347,10 +347,13 @@ class HTTPWorker:
                 if not boundary["continue"]:
                     return
                 reservation = await self._post(attempt_path + "/requests", {
-                    **execution, "requested_output_tokens": max(256, task["max_output_tokens"]),
+                    **execution, "requested_output_tokens": max(1, task["max_output_tokens"]),
                 })
                 if not reservation["continue"]:
                     return
+                task = {**task, "max_output_tokens": reservation["output_token_reservation"]}
+                if "provider_options" in task:
+                    task["provider_options"] = {**task["provider_options"], "max_output_tokens": task["max_output_tokens"]}
                 request_path = f"/requests/{reservation['request_id']}"
                 config = provider.describe(task) if provider and hasattr(provider, "describe") else {
                     "provider": task["provider"], "model": "synthetic-fixture",
@@ -429,16 +432,27 @@ class HTTPWorker:
 
     async def run(self, *, once=False, stop=None):
         stop = stop or asyncio.Event()
+        idle_slots = set()
+        drained = False
 
-        async def slot():
-            while not stop.is_set():
+        async def slot(index):
+            nonlocal drained
+            while not stop.is_set() and not drained:
                 try:
                     response = await self._post("/worker/claim-next", {"providers": self.providers})
                     if response["task"]:
+                        idle_slots.discard(index)
                         await self.execute(response["task"])
                         continue
-                    if once:
-                        return
+                    if response.get("work_pending", False):
+                        idle_slots.discard(index)
+                    elif once:
+                        idle_slots.add(index)
+                        # Idle slots must remain available while another member
+                        # can create work. Exit only when the whole pool is idle.
+                        if len(idle_slots) == self.concurrency:
+                            drained = True
+                            return
                 except WorkerAPIError:
                     log.warning("API unavailable; waiting for the next poll.")
                     if once:
@@ -448,7 +462,7 @@ class HTTPWorker:
                 except TimeoutError:
                     pass
 
-        await asyncio.gather(*(slot() for _ in range(self.concurrency)))
+        await asyncio.gather(*(slot(index) for index in range(self.concurrency)))
 
 
 def main():
@@ -458,7 +472,7 @@ def main():
     parser.add_argument(
         "--providers", nargs="+", choices=["fake", "deepseek", "glm"], default=["fake"]
     )
-    parser.add_argument("--concurrency", type=int, choices=[1, 2], default=2)
+    parser.add_argument("--concurrency", type=int, choices=range(1, 17), default=4)
     parser.add_argument("--fake-delay", type=float, default=4.0)
     parser.add_argument("--once", action="store_true", help="处理当前可领取队列后退出")
     args = parser.parse_args()

@@ -139,3 +139,15 @@ def test_streamed_reasoning_is_retained_when_the_provider_hits_its_output_limit(
             assert observed["usage"]["completion_tokens"] == 32
             assert json.loads(observed["raw_text"])["reasoning_content"] == "unfinished mathematical exploration"
     asyncio.run(run())
+
+
+def test_context_capacity_only_uses_explicit_or_known_official_values():
+    def config(model="unknown-model", url="https://fixture.invalid", capacity=None):
+        return ProviderConfig("deepseek", "synthetic-secret", model, url, True, capacity)
+    assert config().context_length() is None
+    assert config("deepseek-v4-flash").context_length() is None
+    assert config(url="https://api.deepseek.com").context_length() is None
+    assert config("deepseek-v4-flash", "https://api.deepseek.com").context_length() == 1000000
+    assert config(capacity=123456).context_length() == 123456
+    with pytest.raises(ValueError, match="positive"):
+        config(capacity=0)

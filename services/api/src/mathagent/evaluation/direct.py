@@ -13,9 +13,10 @@ INDEPENDENT_SELECTION_RULE = "independent-single-box-whitespace-vote-earliest-v1
 
 DIRECT_INSTRUCTION = r"""Solve the given Olympiad problem. No internet, tools, external
 references, answer key or human hints are available. Explain your reasoning and use
-LaTeX for all mathematics. Submit exactly one final answer in \boxed{...} in your reply.
-If the proof is incomplete, state its gaps honestly. If you have no answer, abstain
-without a boxed guess. An answer submission does not certify the proof.
+LaTeX for all mathematics. Submit your full mathematical argument. If there is a
+separate short answer, you may put it in \boxed{...}; a proof-only submission is
+valid. If the proof is incomplete, state what remains unresolved honestly rather
+than inventing an answer. A submission does not certify the proof.
 """ + "\n" + SOLUTION_SET_GUIDANCE
 REFINE_INSTRUCTION = "Independently check your previous reasoning for errors, correct any you find, and submit your best final answer. State unresolved proof gaps. Do not assume the previous answer was correct."
 
@@ -51,11 +52,8 @@ async def run_direct_case(case, directory, config, limits, *, transport_factory=
                 terminal = "case_timeout"
                 break
             maximum = min(limits.max_output_tokens, output_budget - occupied_output) if output_budget is not None else limits.max_output_tokens
-            if maximum < 256:
+            if maximum < 1:
                 terminal = "output_token_budget_exhausted"
-                break
-            if sum(len(m["content"]) for m in messages) > 200_000:
-                terminal = "context_limit"
                 break
             call = {"number": index + 1, "state": "dispatched", "usage": {},
                     "reserved_output_tokens": maximum, "created_at": stamp()}
@@ -117,14 +115,12 @@ async def run_direct_case(case, directory, config, limits, *, transport_factory=
     final = submission(final_body, declared=final_body is not None, source="last_baseline_response",
                        source_id=calls[-1]["number"] if calls else None)
     unknown = sum(c["state"] == "unknown" for c in calls)
-    report = {"report_schema_version": "2.0", "case_id": case["id"], "problem_id": case["id"],
+    report = {"report_schema_version": "3.0", "case_id": case["id"], "problem_id": case["id"],
         "evaluation_mode": "answer", "solver": limits.solver, "state": terminal, "terminal_reason": terminal,
         "answer_submission": final, "final_answer": final["answer"], "final_body": final_body,
         "final_answer_present": final["answer"] is not None,
-        "completed": terminal == "completed" and final["answer"] is not None,
-        "workflow_completed": False, "review_completed": False, "independent_reviews": 0,
-        "proof_assessment": {"status": "not_reviewed", "formal_verification": False,
-                             "mathematical_correctness_verified": False},
+        "completed": terminal == "completed" and final["status"] == "submitted",
+        "submission_present": final["status"] == "submitted", "researcher_outcome": None,
         "calls": calls, "usage_summary": usage_summary(calls), "requests": len(calls),
         "occupied_output_tokens": occupied_output,
         "budget": {"request_budget": limits.request_budget, "occupied": len(calls),
@@ -158,11 +154,8 @@ async def run_independent_samples_case(case, directory, config, limits, *, trans
             maximum = min(limits.max_output_tokens,
                           (limits.cumulative_output_token_budget - occupied_output)
                           if limits.cumulative_output_token_budget is not None else limits.max_output_tokens)
-            if maximum < 256:
+            if maximum < 1:
                 runtime_terminal = "output_token_budget_exhausted"
-                break
-            if len(DIRECT_INSTRUCTION) + len(case["problem"]) > 200_000:
-                runtime_terminal = "context_limit"
                 break
             call = {"number": index + 1, "state": "dispatched", "usage": {},
                     "reserved_output_tokens": maximum, "created_at": stamp()}
@@ -241,15 +234,13 @@ async def run_independent_samples_case(case, directory, config, limits, *, trans
     terminal = runtime_terminal
     if unknown and terminal == "completed":
         terminal = "reconciliation_required"
-    report = {"report_schema_version": "2.0", "case_id": case["id"], "problem_id": case["id"],
+    report = {"report_schema_version": "3.0", "case_id": case["id"], "problem_id": case["id"],
         "evaluation_mode": "answer", "solver": limits.solver, "state": terminal,
         "terminal_reason": terminal, "selection_rule": INDEPENDENT_SELECTION_RULE,
         "answer_submission": final, "final_answer": final["answer"], "final_body": final_body,
         "final_answer_present": final["answer"] is not None, "answer_independently_submitted": selected is not None,
         "completed": terminal == "completed" and selected is not None,
-        "workflow_completed": False, "review_completed": False, "independent_reviews": 0,
-        "proof_assessment": {"status": "not_reviewed", "formal_verification": False,
-                             "mathematical_correctness_verified": False},
+        "submission_present": final["status"] == "submitted", "researcher_outcome": None,
         "candidates": candidates, "vote_counts": counts, "calls": calls,
         "usage_summary": usage_summary(calls), "requests": len(calls),
         "occupied_output_tokens": occupied_output,

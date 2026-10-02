@@ -1,4 +1,4 @@
-"""Run a fixed problem-only batch; scoring is a separate, offline command."""
+"""Run a fixed problem-only research batch and record submissions and usage. No grading."""
 
 import argparse
 import asyncio
@@ -30,14 +30,15 @@ def main():
                         help="direct: one call; self_refine: fixed refinement; independent_samples: independent vote")
     parser.add_argument("--solver-controller", choices=["continuous_research"], default="continuous_research")
     parser.add_argument("--no-discussion", action="store_true", help="Disable the research peer for a same-budget comparison")
+    parser.add_argument("--max-researchers", type=int, default=4, help="Maximum team size, including the lead; shared case budget")
     parser.add_argument("--cumulative-output-token-budget", type=int,
                         help="Shared output/thinking token cap; unknown usage keeps its reservation. Input tokens reported separately.")
     parser.add_argument("--case-order-seed", type=int, default=0,
                         help="Local task ordering only, not a provider sampling seed")
-    parser.add_argument("--request-budget", type=int, default=12)
-    parser.add_argument("--max-output-tokens", type=int, default=65536)
-    parser.add_argument("--request-timeout", type=int, default=600)
-    parser.add_argument("--case-timeout", type=int, default=1800)
+    parser.add_argument("--request-budget", type=int, default=1000)
+    parser.add_argument("--max-output-tokens", type=int, default=131072)
+    parser.add_argument("--request-timeout", type=int, default=3600)
+    parser.add_argument("--case-timeout", type=int, default=86400)
     parser.add_argument("--parallel-cases", type=int, choices=[1, 2], default=2)
     args = parser.parse_args()
     if not args.execute:
@@ -52,6 +53,7 @@ def main():
         evaluation_mode=args.evaluation_mode, solver=args.solver,
         solver_controller=args.solver_controller,
         discussion=not args.no_discussion, research_deadline_seconds=args.case_timeout,
+        max_researchers=args.max_researchers,
         cumulative_output_token_budget=args.cumulative_output_token_budget,
         case_order_seed=args.case_order_seed)
     logging.basicConfig(level=logging.WARNING, format="%(message)s")

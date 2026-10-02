@@ -87,6 +87,32 @@ print('SYMPY_OK')
     assert result["ok"] and result["stdout"].strip() == "SYMPY_OK", result
 
 
+def test_background_symbolic_work_exceeds_old_ten_second_limit_and_survives_restart(sandbox):
+    source = "import time\ntime.sleep(11)\nfrom sympy import symbols, factor\nx=symbols('x')\nprint(factor(x*x-1))\nprint('x'*100000)"
+    job = sandbox.start("isolation", "long-symbolic-work", source, 30, research_root_id="research-a")
+    assert job["status"] == "running", job
+    restarted = CodeSandbox(sandbox.database_path, sandbox.image_id)
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        result = restarted.poll("isolation", job["job_id"])
+        if result.get("status") != "running":
+            break
+        time.sleep(0.2)
+    assert result.get("status") == "complete" and result["ok"], result
+    assert "(x - 1)*(x + 1)" in result["stdout"] and len(result["stdout"]) > 100000
+    assert restarted.poll("isolation", job["job_id"])["cached"]
+
+
+def test_human_stop_cancels_only_this_researchs_background_computations(sandbox):
+    first = sandbox.start("isolation", "cancel-long-work", "while True: pass", 3600, research_root_id="research-a")
+    other = sandbox.start("isolation", "keep-other-work", "import time\ntime.sleep(15)", 30, research_root_id="research-b")
+    assert first.get("status") == other.get("status") == "running"
+    stopped = sandbox.cancel_research("isolation", "research-a")
+    assert len(stopped) == 1 and stopped[0]["reason"] == "cancelled"
+    assert sandbox.poll("isolation", other["job_id"])["status"] == "running"
+    sandbox.cancel("isolation", other["job_id"])
+
+
 def test_benchmark_api_receives_pinned_image_without_model_dispatch(tmp_path):
     asyncio.run(_check_benchmark_api(tmp_path))
 

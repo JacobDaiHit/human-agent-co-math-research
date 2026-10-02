@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 import httpx
 from mathagent.providers import protocol, research
 from mathagent.providers.observability import MAX_WIRE_BYTES, RequestObservation, empty_observation
-from mathagent.providers.options import MAX_OUTPUT_TOKENS
+from mathagent.providers.options import MAX_OUTPUT_TOKENS, MAX_REQUEST_TIMEOUT_SECONDS
 
 DEFAULT_URLS = {
     "deepseek": "https://api.deepseek.com",
@@ -44,22 +44,40 @@ class ProviderConfig:
     model: str
     base_url: str
     enabled: bool
+    context_capacity: int | None = None
+
+    def __post_init__(self):
+        if self.context_capacity is not None and (type(self.context_capacity) is not int or self.context_capacity < 1):
+            raise ValueError("Context capacity must be a positive provider token count")
 
     @classmethod
     def from_env(cls, name):
         if name not in DEFAULT_URLS:
             raise ValueError("Unknown provider")
         prefix = "MATHAGENT_" + name.upper()
+        capacity = os.getenv(prefix + "_CONTEXT_CAPACITY", "")
         return cls(
             name,
             os.getenv(prefix + "_API_KEY", ""),
             os.getenv(prefix + "_MODEL", ""),
             os.getenv(prefix + "_BASE_URL", DEFAULT_URLS[name]).rstrip("/"),
             os.getenv("MATHAGENT_ENABLE_REAL_API") == "1",
+            int(capacity) if capacity else None,
         )
 
     def ready(self):
         return self.enabled and bool(self.api_key.strip() and self.model.strip())
+
+    def context_length(self):
+        if self.context_capacity is not None:
+            return self.context_capacity
+        if (self.name == "deepseek" and urlparse(self.base_url).hostname == "api.deepseek.com"
+                and self.model in {"deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash",
+                                   "deepseek-v4-flash-vision-exp"}):
+            # Official model documentation, checked 2026-10-02. Unknown models
+            # or third-party endpoints have no guessed context capacity.
+            return 1_000_000
+        return None
 
 
 def provider_status():
@@ -146,14 +164,14 @@ class RemoteProvider:
         if (
             isinstance(max_tokens, bool)
             or not isinstance(max_tokens, int)
-            or not 256 <= max_tokens <= MAX_OUTPUT_TOKENS
+            or not 1 <= max_tokens <= MAX_OUTPUT_TOKENS
         ):
             raise ProviderFailure("invalid_max_output_tokens", outcome="unaccepted")
         if (
             isinstance(deadline, bool)
             or not isinstance(deadline, (int, float))
             or not math.isfinite(deadline)
-            or not 1 <= deadline <= 600
+            or not 1 <= deadline <= MAX_REQUEST_TIMEOUT_SECONDS
         ):
             raise ProviderFailure("invalid_request_timeout", outcome="unaccepted")
         if thinking not in ("provider_default", "enabled", "disabled"):
@@ -195,10 +213,31 @@ class RemoteProvider:
                 "write": min(120, deadline),
                 "pool": min(120, deadline),
             },
-            "prompt_template_version": research.PROMPT_VERSION if native else protocol.PROMPT_VERSION,
+            "prompt_template_version": task.get("research_prompt_version", research.PROMPT_VERSION) if native else protocol.PROMPT_VERSION,
             "prompt_template_sha256": hashlib.sha256(template.encode("utf-8")).hexdigest(),
             "prompt_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
         }
+        if native:
+            previous = task.get("previous_research_call") or {}
+            prior_context = previous.get("research_context") or {}
+            count = prior_context.get("input_messages", 0)
+            same = prior_context.get("dialogue_id") == task.get("research_dialogue_id") and count > 0
+            prefix = json.dumps(messages[:count], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            catalog = json.dumps(parameters["tools"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            tools_sha256 = hashlib.sha256(catalog.encode("utf-8")).hexdigest()
+            call_config["research_context"] = {
+                "dialogue_id": task.get("research_dialogue_id"), "member": task.get("research_member"),
+                "input_messages": len(messages), "reset_reason": task.get("research_reset_reason"),
+                "tools_sha256": tools_sha256,
+                "previous_input_preserved": (
+                    previous.get("model") == config.model
+                    and prior_context.get("tools_sha256") == tools_sha256
+                    and len(messages) >= count
+                    and hashlib.sha256(prefix.encode("utf-8")).hexdigest() == previous.get("prompt_sha256")
+                ) if same else None,
+                "capacity": config.context_length(),
+                "input_estimate": task.get("context_input_estimate"),
+            }
         payload = {"model": config.model, "messages": messages, **parameters}
         return task, payload, call_config
 
@@ -231,8 +270,6 @@ class RemoteProvider:
                 or parsed.fragment
             ):
                 raise ProviderFailure("invalid_provider_url", outcome="unaccepted")
-            if not task.get("research_protocol") and sum(len(m["content"]) for m in payload["messages"]) > 200_000:
-                raise ProviderFailure("input_too_large", outcome="unaccepted")
             deadline = call_config["request_timeout_seconds"]
             timeout = httpx.Timeout(min(120, deadline), connect=min(10, deadline))
             client = client or httpx.AsyncClient(

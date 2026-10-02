@@ -3,7 +3,13 @@
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from mathagent.providers.options import MAX_OUTPUT_TOKENS, ReasoningEffort, ThinkingMode
+from mathagent.providers.options import (
+    MAX_OUTPUT_TOKENS,
+    MAX_REQUEST_TIMEOUT_SECONDS,
+    MAX_RESEARCH_SECONDS,
+    ReasoningEffort,
+    ThinkingMode,
+)
 from mathagent.providers.search_contract import SearchConfig
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -104,18 +110,18 @@ class RunCreate(Command):
     instruction: str = ""
     provider: Literal["fake", "deepseek", "glm"] = "fake"
     mode: Literal["research", "review"] = "research"
-    request_budget: int = Field(default=5, ge=1, le=1000)
+    request_budget: int = Field(default=1000, ge=1, le=1000)
     autonomous: bool = False
     max_steps: int = Field(default=8, ge=1, le=40)
     max_review_rounds: int = Field(default=2, ge=0, le=2)
     max_children: int = Field(default=4, ge=0, le=12)
     max_depth: int = Field(default=2, ge=0, le=4)
-    max_output_tokens: int = Field(default=4096, ge=256, le=MAX_OUTPUT_TOKENS)
+    max_output_tokens: int = Field(default=131072, ge=1, le=MAX_OUTPUT_TOKENS)
     # This constrains completion/output tokens across the complete root run tree.
     # Prompt tokens are reported when supplied by the provider, but are not used as
     # a tokenizer-dependent admission bound.
-    cumulative_output_token_budget: int | None = Field(default=None, ge=256, le=10_000_000)
-    request_timeout_seconds: int = Field(default=180, ge=1, le=600)
+    cumulative_output_token_budget: int | None = Field(default=None, ge=1, le=10_000_000)
+    request_timeout_seconds: int = Field(default=3600, ge=1, le=MAX_REQUEST_TIMEOUT_SECONDS)
     thinking_mode: ThinkingMode = "provider_default"
     reasoning_effort: ReasoningEffort = "provider_default"
     completion_policy: Literal["draft", "reviewed_answer"] = "draft"
@@ -125,7 +131,9 @@ class RunCreate(Command):
     unknown_recovery: Literal["stop", "once"] = "stop"
     solver_controller: Literal["legacy", "bounded_search_v1", "continuous_research"] = "continuous_research"
     discussion: bool = True
-    research_deadline_seconds: int = Field(default=1800, ge=1, le=86400)
+    research_deadline_seconds: int = Field(default=86400, ge=1, le=MAX_RESEARCH_SECONDS)
+    max_researchers: int = Field(default=4, ge=1, le=16)
+    literature: bool = True
     search_config: SearchConfig = Field(default_factory=SearchConfig)
 
 

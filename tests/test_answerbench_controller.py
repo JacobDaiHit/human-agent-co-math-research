@@ -9,7 +9,9 @@ def test_default_solver_and_independent_discussion_instructions():
     assert limits.solver_controller == "continuous_research"
     assert limits.discussion is True
     text = instruction_for(limits)
-    assert "neutral research goal" in text and "not your candidate answer" in text
+    assert "neutral local goal" in text and "not your candidate answer" in text
+    assert "For targeted work" in text and "relevant material immediately" in text
+    assert "A short answer is optional" in text
     assert "not an approving authority" in text and "explicitly submit" in text
 
 
